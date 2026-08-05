@@ -1,16 +1,45 @@
-//! Headless wgpu rendering: upload an RGBA image, draw it through a
-//! textured fullscreen triangle into an offscreen target, read the
-//! result back to the CPU and hand back PNG bytes. No window, no
-//! surface -- this never touches Wayland at all.
+//! Headless wgpu rendering: composites a project's layers (bottom to
+//! top, alpha-blended) into an offscreen canvas and reads the result
+//! back to the CPU as raw, tightly-packed RGBA bytes. No window, no
+//! surface -- this never touches Wayland at all. PNG/BMP encoding
+//! happens in main.rs, not here.
 
-const SHADER: &str = include_str!("shader.wgsl");
+const IMAGE_SHADER: &str = include_str!("shader.wgsl");
+const XRAY_SHADER: &str = include_str!("xray.wgsl");
 
 pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    pipeline: wgpu::RenderPipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
+    image_pipeline: wgpu::RenderPipeline,
+    image_bind_group_layout: wgpu::BindGroupLayout,
+    xray_pipeline: wgpu::RenderPipeline,
+    xray_bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+}
+
+/// A single opaque texture drawn full-canvas -- backs both `Image` and
+/// `Gif` layers (a gif is just an image layer whose texture contents get
+/// replaced every tick as the animation advances).
+pub struct ImageLayer {
+    texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+}
+
+/// A base picture with a second picture ("overlay") only visible in a
+/// circle around the cursor.
+pub struct XrayLayer {
+    bind_group: wgpu::BindGroup,
+    uniform_buffer: wgpu::Buffer,
+    radius: f32,
+    // Kept alive only so the textures the bind group points at aren't
+    // dropped -- their contents are never read back on the Rust side.
+    _base_texture: wgpu::Texture,
+    _overlay_texture: wgpu::Texture,
+}
+
+pub enum DrawLayer<'a> {
+    Image(&'a ImageLayer),
+    Xray(&'a XrayLayer),
 }
 
 impl Renderer {
@@ -38,54 +67,63 @@ impl Renderer {
             .await
             .expect("failed to open device");
 
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("scene-bind-group-layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("scene-sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let image_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("image-bind-group-layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let image_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("image-shader"),
+            source: wgpu::ShaderSource::Wgsl(IMAGE_SHADER.into()),
         });
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("scene-shader"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
-        });
+        let image_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("image-pipeline-layout"),
+                bind_group_layouts: &[Some(&image_bind_group_layout)],
+                immediate_size: 0,
+            });
 
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("scene-pipeline-layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
-        });
-
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("scene-pipeline"),
-            layout: Some(&pipeline_layout),
+        let image_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("image-pipeline"),
+            layout: Some(&image_pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &shader,
+                module: &image_shader,
                 entry_point: Some("vs_main"),
                 buffers: &[],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
-                module: &shader,
+                module: &image_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: wgpu::TextureFormat::Rgba8Unorm,
-                    blend: Some(wgpu::BlendState::REPLACE),
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -97,45 +135,118 @@ impl Renderer {
             cache: None,
         });
 
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("scene-sampler"),
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
+        let xray_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("xray-bind-group-layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let xray_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("xray-shader"),
+            source: wgpu::ShaderSource::Wgsl(XRAY_SHADER.into()),
+        });
+
+        let xray_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("xray-pipeline-layout"),
+            bind_group_layouts: &[Some(&xray_bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        let xray_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("xray-pipeline"),
+            layout: Some(&xray_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &xray_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &xray_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
         });
 
         Self {
             device,
             queue,
-            pipeline,
-            bind_group_layout,
+            image_pipeline,
+            image_bind_group_layout,
+            xray_pipeline,
+            xray_bind_group_layout,
             sampler,
         }
     }
 
-    /// Renders `rgba` (tightly packed, `width * height * 4` bytes) through
-    /// the textured quad and returns PNG-encoded bytes of the result.
-    pub fn render_to_png(&self, rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
-        let size = wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        };
-
-        let source_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("source-image"),
-            size,
+    fn create_texture(&self, width: u32, height: u32) -> wgpu::Texture {
+        self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("layer-texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
-        });
+        })
+    }
 
+    fn write_texture(&self, texture: &wgpu::Texture, rgba: &[u8], width: u32, height: u32) {
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
-                texture: &source_texture,
+                texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -146,17 +257,25 @@ impl Renderer {
                 bytes_per_row: Some(4 * width),
                 rows_per_image: Some(height),
             },
-            size,
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
         );
+    }
 
-        let source_view = source_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    pub fn create_image_layer(&self, rgba: &[u8], width: u32, height: u32) -> ImageLayer {
+        let texture = self.create_texture(width, height);
+        self.write_texture(&texture, rgba, width, height);
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("scene-bind-group"),
-            layout: &self.bind_group_layout,
+            label: Some("image-layer-bind-group"),
+            layout: &self.image_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&source_view),
+                    resource: wgpu::BindingResource::TextureView(&view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -164,6 +283,94 @@ impl Renderer {
                 },
             ],
         });
+        ImageLayer { texture, bind_group }
+    }
+
+    /// Replaces an image layer's pixel contents in place (used to
+    /// advance gif frames) -- `width`/`height` must match what it was
+    /// created with.
+    pub fn update_image_layer(&self, layer: &ImageLayer, rgba: &[u8], width: u32, height: u32) {
+        self.write_texture(&layer.texture, rgba, width, height);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_xray_layer(
+        &self,
+        base_rgba: &[u8],
+        base_width: u32,
+        base_height: u32,
+        overlay_rgba: &[u8],
+        overlay_width: u32,
+        overlay_height: u32,
+        radius: f32,
+    ) -> XrayLayer {
+        let base_texture = self.create_texture(base_width, base_height);
+        self.write_texture(&base_texture, base_rgba, base_width, base_height);
+        let base_view = base_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let overlay_texture = self.create_texture(overlay_width, overlay_height);
+        self.write_texture(&overlay_texture, overlay_rgba, overlay_width, overlay_height);
+        let overlay_view = overlay_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let uniform_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("xray-params"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("xray-layer-bind-group"),
+            layout: &self.xray_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&base_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&overlay_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        XrayLayer {
+            bind_group,
+            uniform_buffer,
+            radius,
+            _base_texture: base_texture,
+            _overlay_texture: overlay_texture,
+        }
+    }
+
+    /// Updates the cursor position (in canvas pixel coordinates) used
+    /// for this xray layer's mask. Pass a far off-canvas value to fully
+    /// hide the overlay (e.g. when the pointer isn't over the
+    /// wallpaper).
+    pub fn update_xray_cursor(&self, layer: &XrayLayer, cursor_px: (f32, f32)) {
+        let mut bytes = [0u8; 16];
+        bytes[0..4].copy_from_slice(&cursor_px.0.to_le_bytes());
+        bytes[4..8].copy_from_slice(&cursor_px.1.to_le_bytes());
+        bytes[8..12].copy_from_slice(&layer.radius.to_le_bytes());
+        self.queue.write_buffer(&layer.uniform_buffer, 0, &bytes);
+    }
+
+    /// Composites all layers (bottom to top) into a `width`x`height`
+    /// canvas and reads the result back as tightly-packed RGBA bytes.
+    pub fn render_frame(&self, width: u32, height: u32, layers: &[DrawLayer]) -> Vec<u8> {
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
 
         let target_texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("render-target"),
@@ -182,7 +389,7 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("scene-pass"),
+                label: Some("composite-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &target_view,
                     depth_slice: None,
@@ -197,14 +404,26 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.draw(0..3, 0..1);
+
+            for layer in layers {
+                match layer {
+                    DrawLayer::Image(image) => {
+                        pass.set_pipeline(&self.image_pipeline);
+                        pass.set_bind_group(0, &image.bind_group, &[]);
+                        pass.draw(0..3, 0..1);
+                    }
+                    DrawLayer::Xray(xray) => {
+                        pass.set_pipeline(&self.xray_pipeline);
+                        pass.set_bind_group(0, &xray.bind_group, &[]);
+                        pass.draw(0..3, 0..1);
+                    }
+                }
+            }
         }
 
-        // Rows in a copy-to-buffer destination must be padded to a multiple
-        // of COPY_BYTES_PER_ROW_ALIGNMENT; the image itself has no such
-        // requirement, so we strip the padding back out below.
+        // Rows in a copy-to-buffer destination must be padded to a
+        // multiple of COPY_BYTES_PER_ROW_ALIGNMENT; the image itself has
+        // no such requirement, so we strip the padding back out below.
         let unpadded_bytes_per_row = 4 * width;
         let padding = (wgpu::COPY_BYTES_PER_ROW_ALIGNMENT
             - unpadded_bytes_per_row % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
@@ -262,19 +481,6 @@ impl Renderer {
         }
         readback_buffer.unmap();
 
-        let mut png_bytes = Vec::new();
-        {
-            let mut cursor = std::io::Cursor::new(&mut png_bytes);
-            image::write_buffer_with_format(
-                &mut cursor,
-                &pixels,
-                width,
-                height,
-                image::ExtendedColorType::Rgba8,
-                image::ImageFormat::Png,
-            )
-            .expect("PNG encoding failed");
-        }
-        png_bytes
+        pixels
     }
 }

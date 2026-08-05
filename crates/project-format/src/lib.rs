@@ -5,7 +5,7 @@
 
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -13,13 +13,34 @@ pub const MANIFEST_FILE_NAME: &str = "project.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
-    /// Path to the image, relative to the project directory.
-    pub image: String,
-    /// Whether the host should draw the cursor-following glow on top of
-    /// this scene. Purely a presentation flag for now -- the image itself
-    /// doesn't react to the cursor.
-    #[serde(default)]
-    pub cursor_glow: bool,
+    /// Layers, bottom to top -- rendered in this order and alpha-blended
+    /// on top of one another.
+    pub layers: Vec<Layer>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Layer {
+    /// A single static picture, relative path within the project dir.
+    Image { path: String },
+    /// A base picture with a second picture ("overlay") only visible in
+    /// a circle around the cursor -- e.g. a night-vision/x-ray effect.
+    Xray {
+        base: String,
+        overlay: String,
+        radius: f32,
+    },
+    /// A looping GIF animation, relative path within the project dir.
+    Gif { path: String },
+}
+
+impl Layer {
+    /// Whether this layer needs continuous re-rendering (as opposed to
+    /// being renderable once and left alone): anything that reacts to
+    /// the cursor or animates on its own.
+    pub fn is_dynamic(&self) -> bool {
+        matches!(self, Layer::Xray { .. } | Layer::Gif { .. })
+    }
 }
 
 #[derive(Debug)]
@@ -52,15 +73,14 @@ impl From<serde_json::Error> for LoadError {
 }
 
 impl Project {
-    /// Loads `project.json` from inside `project_dir` and resolves the
-    /// image path relative to it. Returns the manifest and the absolute
-    /// image path together, since callers always need both.
-    pub fn load(project_dir: &Path) -> Result<(Project, std::path::PathBuf), LoadError> {
+    /// Loads `project.json` from inside `project_dir`. Layer asset paths
+    /// inside the returned `Project` are still relative to `project_dir`
+    /// -- resolve them yourself via the returned directory path.
+    pub fn load(project_dir: &Path) -> Result<(Project, PathBuf), LoadError> {
         let manifest_path = project_dir.join(MANIFEST_FILE_NAME);
         let text = fs::read_to_string(&manifest_path)?;
         let project: Project = serde_json::from_str(&text)?;
-        let image_path = project_dir.join(&project.image);
-        Ok((project, image_path))
+        Ok((project, project_dir.to_path_buf()))
     }
 
     pub fn save(&self, project_dir: &Path) -> Result<(), LoadError> {

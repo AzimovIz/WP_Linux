@@ -36,21 +36,19 @@ WallpaperItem {
         color: "#0d1428"
 
         // Polls render-server (crates/render-server) for whether a scene is
-        // loaded and what it wants from the host -- right now just whether
-        // to draw the cursor glow on top.
+        // loaded, whether it needs cursor input (an xray layer), and a
+        // frame_id that bumps every time render-server produces a new
+        // composited frame -- static projects bump it once; projects with
+        // a gif/xray layer bump it continuously, capped at ~30fps.
         Item {
             id: sceneMeta
 
             property bool requestInFlight: false
             property bool ready: false
-            property bool cursorGlow: false
+            property bool needsCursor: false
+            property real frameId: -1
 
-            onReadyChanged: {
-                console.log("wplinux: sceneMeta.ready =", ready);
-                if (ready) {
-                    framePoll.refresh();
-                }
-            }
+            onFrameIdChanged: framePoll.refresh()
 
             function poll() {
                 if (requestInFlight) {
@@ -73,7 +71,8 @@ WallpaperItem {
                     try {
                         const meta = JSON.parse(xhr.responseText);
                         ready = !!meta.ready;
-                        cursorGlow = !!meta.cursor_glow;
+                        needsCursor = !!meta.needs_cursor;
+                        frameId = meta.frame_id;
                     } catch (e) {
                         ready = false;
                     }
@@ -91,8 +90,11 @@ WallpaperItem {
             }
         }
 
+        // Fast enough to keep up with render-server's ~30fps cap for
+        // dynamic (gif/xray) projects -- static projects just bump
+        // frame_id once and this settles into a cheap no-op poll.
         Timer {
-            interval: 1000
+            interval: 33
             running: root.hasProject
             repeat: true
             triggeredOnStart: true
@@ -100,11 +102,10 @@ WallpaperItem {
         }
 
         // Fetches the current rendered frame from render-server. Only
-        // re-fetched when the scene actually becomes ready (see
-        // sceneMeta.onReadyChanged above) -- NOT on a fixed timer. A 1080p
-        // PNG can take a while to decode, and re-requesting a fresh
-        // cache-busted URL every second was aborting the in-flight load
-        // before it ever reached Image.Ready, so the picture never showed.
+        // re-fetched when frame_id actually changes (see
+        // sceneMeta.onFrameIdChanged above) -- not on its own timer, so a
+        // slow-to-decode frame is never aborted mid-load by a fresher
+        // cache-busted request racing in behind it.
         Item {
             id: framePoll
 
@@ -122,23 +123,23 @@ WallpaperItem {
             asynchronous: true
             cache: false
             source: framePoll.url
-            onStatusChanged: console.log("wplinux: sceneImage.status =", status, "source =", source)
             visible: sceneMeta.ready && status === Image.Ready
         }
 
         // Folder View's icon layer sits above WallpaperItem and consumes
         // hover before it gets here, so a plain HoverHandler never fires
-        // while desktop icons are shown. Instead we poll a tiny local
-        // HTTP endpoint (crates/cursor-bridge) that a companion KWin
-        // script keeps updated with the real, compositor-level cursor
-        // position -- see kwin-script/package for the other half.
+        // while desktop icons are shown. Instead we poll a tiny local HTTP
+        // endpoint (crates/cursor-bridge) that a companion KWin script
+        // keeps updated with the real, compositor-level cursor position --
+        // see kwin-script/package for the other half. All the actual
+        // cursor-reactive rendering (xray mask, etc.) now happens in
+        // render-server; this only relays where the pointer is, in
+        // normalized item-local coordinates, since only QML knows this
+        // item's on-screen placement and size.
         Item {
-            id: cursorPoll
+            id: cursorRelay
 
             property bool requestInFlight: false
-            property bool haveCursor: false
-            property real localX: 0
-            property real localY: 0
 
             function poll() {
                 if (requestInFlight) {
@@ -154,47 +155,37 @@ WallpaperItem {
                     requestInFlight = false;
 
                     if (xhr.status !== 200) {
-                        haveCursor = false;
                         return;
                     }
 
                     try {
                         const pos = JSON.parse(xhr.responseText);
-                        localX = pos.x - Screen.virtualX;
-                        localY = pos.y - Screen.virtualY;
-                        haveCursor = true;
+                        const localX = pos.x - Screen.virtualX;
+                        const localY = pos.y - Screen.virtualY;
+                        const inside = localX >= 0 && localX <= background.width
+                                       && localY >= 0 && localY <= background.height;
+                        pushCursor(inside ? (localX / background.width) : null,
+                                   inside ? (localY / background.height) : null);
                     } catch (e) {
-                        haveCursor = false;
+                        // ignore, try again next tick
                     }
                 };
                 xhr.open("GET", "http://127.0.0.1:47823/cursor");
                 xhr.send();
             }
+
+            function pushCursor(u, v) {
+                const xhr = new XMLHttpRequest();
+                xhr.open("POST", "http://127.0.0.1:47824/cursor");
+                xhr.send(u === null ? "none" : (u + "," + v));
+            }
         }
 
         Timer {
             interval: 16
-            running: true
+            running: sceneMeta.needsCursor
             repeat: true
-            onTriggered: cursorPoll.poll()
-        }
-
-        Rectangle {
-            width: 220
-            height: 220
-            radius: width / 2
-            color: "#e8a23a"
-            x: cursorPoll.localX - width / 2
-            y: cursorPoll.localY - height / 2
-            opacity: (sceneMeta.cursorGlow
-                      && cursorPoll.haveCursor
-                      && cursorPoll.localX >= 0 && cursorPoll.localX <= background.width
-                      && cursorPoll.localY >= 0 && cursorPoll.localY <= background.height)
-                     ? 0.35 : 0.0
-
-            Behavior on opacity {
-                NumberAnimation { duration: 150 }
-            }
+            onTriggered: cursorRelay.poll()
         }
     }
 }

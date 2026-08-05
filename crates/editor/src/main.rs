@@ -1,6 +1,6 @@
-//! Minimal wallpaper project editor. Not a scene composer yet -- just
-//! enough to produce a `project.json` that render-server can load: pick
-//! an image, toggle the cursor glow, save as a project folder.
+//! Minimal wallpaper project editor: build a layer stack (picture,
+//! xray, gif animation), then save it as a project folder that
+//! render-server can load.
 
 use std::path::{Path, PathBuf};
 
@@ -13,10 +13,41 @@ fn main() -> eframe::Result {
     )
 }
 
+enum EditorLayer {
+    Image {
+        path: Option<PathBuf>,
+    },
+    Xray {
+        base: Option<PathBuf>,
+        overlay: Option<PathBuf>,
+        radius: f32,
+    },
+    Gif {
+        path: Option<PathBuf>,
+    },
+}
+
+impl EditorLayer {
+    fn label(&self) -> &'static str {
+        match self {
+            EditorLayer::Image { .. } => "Image",
+            EditorLayer::Xray { .. } => "Xray",
+            EditorLayer::Gif { .. } => "Gif",
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        match self {
+            EditorLayer::Image { path } => path.is_some(),
+            EditorLayer::Xray { base, overlay, .. } => base.is_some() && overlay.is_some(),
+            EditorLayer::Gif { path } => path.is_some(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct EditorApp {
-    image_path: Option<PathBuf>,
-    cursor_glow: bool,
+    layers: Vec<EditorLayer>,
     status: String,
 }
 
@@ -24,42 +55,99 @@ impl eframe::App for EditorApp {
     fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
         eframe::egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("New wallpaper project");
+            ui.label("Layers are drawn bottom to top -- the first one in the list is furthest back.");
             ui.add_space(8.0);
 
-            if ui.button("Choose image...").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Images", &["png", "jpg", "jpeg"])
-                    .pick_file()
-                {
-                    self.image_path = Some(path);
-                    self.status.clear();
+            ui.horizontal(|ui| {
+                if ui.button("+ Image").clicked() {
+                    self.layers.push(EditorLayer::Image { path: None });
                 }
-            }
-
-            match &self.image_path {
-                Some(path) => {
-                    ui.label(format!("Image: {}", path.display()));
+                if ui.button("+ Xray").clicked() {
+                    self.layers.push(EditorLayer::Xray {
+                        base: None,
+                        overlay: None,
+                        radius: 200.0,
+                    });
                 }
-                None => {
-                    ui.label("No image chosen yet.");
+                if ui.button("+ Gif").clicked() {
+                    self.layers.push(EditorLayer::Gif { path: None });
                 }
-            }
+            });
 
             ui.add_space(8.0);
-            ui.checkbox(&mut self.cursor_glow, "Show cursor glow");
+
+            let mut move_up = None;
+            let mut move_down = None;
+            let mut remove = None;
+
+            for (index, layer) in self.layers.iter_mut().enumerate() {
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong(format!("#{} {}", index + 1, layer.label()));
+                        if ui.small_button("up").clicked() {
+                            move_up = Some(index);
+                        }
+                        if ui.small_button("down").clicked() {
+                            move_down = Some(index);
+                        }
+                        if ui.small_button("remove").clicked() {
+                            remove = Some(index);
+                        }
+                    });
+
+                    match layer {
+                        EditorLayer::Image { path } => {
+                            path_picker(ui, "Picture", path, &["png", "jpg", "jpeg"]);
+                        }
+                        EditorLayer::Xray {
+                            base,
+                            overlay,
+                            radius,
+                        } => {
+                            path_picker(ui, "Base picture", base, &["png", "jpg", "jpeg"]);
+                            path_picker(
+                                ui,
+                                "Overlay picture (shown near cursor)",
+                                overlay,
+                                &["png", "jpg", "jpeg"],
+                            );
+                            ui.horizontal(|ui| {
+                                ui.label("Radius (px):");
+                                ui.add(eframe::egui::Slider::new(radius, 20.0..=800.0));
+                            });
+                        }
+                        EditorLayer::Gif { path } => {
+                            path_picker(ui, "Gif file", path, &["gif"]);
+                        }
+                    }
+                });
+            }
+
+            if let Some(index) = remove {
+                self.layers.remove(index);
+            }
+            if let Some(index) = move_up {
+                if index > 0 {
+                    self.layers.swap(index, index - 1);
+                }
+            }
+            if let Some(index) = move_down {
+                if index + 1 < self.layers.len() {
+                    self.layers.swap(index, index + 1);
+                }
+            }
 
             ui.add_space(16.0);
             ui.separator();
             ui.add_space(8.0);
 
-            let can_save = self.image_path.is_some();
+            let can_save = !self.layers.is_empty() && self.layers.iter().all(EditorLayer::is_complete);
             if ui
                 .add_enabled(can_save, eframe::egui::Button::new("Save project as..."))
                 .clicked()
             {
                 if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                    let image_path = self.image_path.clone().expect("button is disabled otherwise");
-                    self.status = match save_project(&dir, &image_path, self.cursor_glow) {
+                    self.status = match save_project(&dir, &self.layers) {
                         Ok(()) => format!("Saved to {}", dir.display()),
                         Err(e) => format!("Failed to save: {e}"),
                     };
@@ -74,19 +162,69 @@ impl eframe::App for EditorApp {
     }
 }
 
-fn save_project(project_dir: &Path, image_path: &Path, cursor_glow: bool) -> Result<(), String> {
+fn path_picker(ui: &mut eframe::egui::Ui, label: &str, path: &mut Option<PathBuf>, filter: &[&str]) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        match path {
+            Some(p) => ui.label(p.display().to_string()),
+            None => ui.label("not set"),
+        };
+        if ui.button("Browse...").clicked() {
+            if let Some(chosen) = rfd::FileDialog::new().add_filter("Files", filter).pick_file() {
+                *path = Some(chosen);
+            }
+        }
+    });
+}
+
+fn save_project(project_dir: &Path, layers: &[EditorLayer]) -> Result<(), String> {
     std::fs::create_dir_all(project_dir).map_err(|e| e.to_string())?;
 
-    let extension = image_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("png");
-    let image_file_name = format!("image.{extension}");
-    std::fs::copy(image_path, project_dir.join(&image_file_name)).map_err(|e| e.to_string())?;
+    let mut saved_layers = Vec::with_capacity(layers.len());
+    for (index, layer) in layers.iter().enumerate() {
+        let saved = match layer {
+            EditorLayer::Image { path } => {
+                let path = path.as_ref().expect("save is disabled until complete");
+                let file_name = copy_asset(project_dir, path, &format!("layer_{index}_image"))?;
+                project_format::Layer::Image { path: file_name }
+            }
+            EditorLayer::Xray {
+                base,
+                overlay,
+                radius,
+            } => {
+                let base = base.as_ref().expect("save is disabled until complete");
+                let overlay = overlay.as_ref().expect("save is disabled until complete");
+                let base_name = copy_asset(project_dir, base, &format!("layer_{index}_xray_base"))?;
+                let overlay_name =
+                    copy_asset(project_dir, overlay, &format!("layer_{index}_xray_overlay"))?;
+                project_format::Layer::Xray {
+                    base: base_name,
+                    overlay: overlay_name,
+                    radius: *radius,
+                }
+            }
+            EditorLayer::Gif { path } => {
+                let path = path.as_ref().expect("save is disabled until complete");
+                let file_name = copy_asset(project_dir, path, &format!("layer_{index}_anim"))?;
+                project_format::Layer::Gif { path: file_name }
+            }
+        };
+        saved_layers.push(saved);
+    }
 
     let project = project_format::Project {
-        image: image_file_name,
-        cursor_glow,
+        layers: saved_layers,
     };
     project.save(project_dir).map_err(|e| e.to_string())
+}
+
+/// Copies `source` into `project_dir` under `stem` plus `source`'s
+/// extension, returning the file name (relative to `project_dir`) that
+/// got written.
+fn copy_asset(project_dir: &Path, source: &Path, stem: &str) -> Result<String, String> {
+    let extension = source.extension().and_then(|e| e.to_str()).unwrap_or("png");
+    let file_name = format!("{stem}.{extension}");
+    std::fs::copy(source, project_dir.join(&file_name)).map_err(|e| e.to_string())?;
+    Ok(file_name)
 }
