@@ -106,24 +106,59 @@ WallpaperItem {
         // sceneMeta.onFrameIdChanged above) -- not on its own timer, so a
         // slow-to-decode frame is never aborted mid-load by a fresher
         // cache-busted request racing in behind it.
+        //
+        // Loaded into a hidden "back buffer" Image and only swapped in
+        // once fully decoded, using two Image elements ping-ponged via
+        // activeBuffer. Turns out Qt Quick does NOT keep the previous
+        // pixmap on screen while a new `source` decodes (confirmed via
+        // logging status transitions: it goes Ready -> Loading on every
+        // single frame) -- it briefly shows nothing, letting the
+        // background color flash through. A single reloading Image can't
+        // avoid that gap; two of them, swapped only when the new one is
+        // actually ready, can.
         Item {
             id: framePoll
 
-            property string url: ""
+            property int activeBuffer: 0
+            property string urlA: ""
+            property string urlB: ""
 
             function refresh() {
-                url = "http://127.0.0.1:47824/frame?t=" + Date.now();
+                const url = "http://127.0.0.1:47824/frame?t=" + Date.now();
+                if (activeBuffer === 0) {
+                    urlB = url;
+                } else {
+                    urlA = url;
+                }
             }
         }
 
         Image {
-            id: sceneImage
             anchors.fill: parent
             fillMode: Image.PreserveAspectCrop
             asynchronous: true
             cache: false
-            source: framePoll.url
-            visible: sceneMeta.ready && status === Image.Ready
+            source: framePoll.urlA
+            visible: sceneMeta.ready && framePoll.activeBuffer === 0
+            onStatusChanged: {
+                if (status === Image.Ready && framePoll.activeBuffer !== 0) {
+                    framePoll.activeBuffer = 0;
+                }
+            }
+        }
+
+        Image {
+            anchors.fill: parent
+            fillMode: Image.PreserveAspectCrop
+            asynchronous: true
+            cache: false
+            source: framePoll.urlB
+            visible: sceneMeta.ready && framePoll.activeBuffer === 1
+            onStatusChanged: {
+                if (status === Image.Ready && framePoll.activeBuffer !== 1) {
+                    framePoll.activeBuffer = 1;
+                }
+            }
         }
 
         // Folder View's icon layer sits above WallpaperItem and consumes

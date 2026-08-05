@@ -59,6 +59,24 @@ impl eframe::App for EditorApp {
             ui.add_space(8.0);
 
             ui.horizontal(|ui| {
+                if ui.button("Open project...").clicked() {
+                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                        match open_project(&dir) {
+                            Ok(layers) => {
+                                self.layers = layers;
+                                self.status = format!("Opened {}", dir.display());
+                            }
+                            Err(e) => {
+                                self.status = format!("Failed to open {}: {e}", dir.display());
+                            }
+                        }
+                    }
+                }
+            });
+
+            ui.add_space(8.0);
+
+            ui.horizontal(|ui| {
                 if ui.button("+ Image").clicked() {
                     self.layers.push(EditorLayer::Image { path: None });
                 }
@@ -177,6 +195,36 @@ fn path_picker(ui: &mut eframe::egui::Ui, label: &str, path: &mut Option<PathBuf
     });
 }
 
+/// Loads an existing project folder back into the editor's layer list,
+/// resolving each layer's relative asset paths to absolute ones so
+/// `path_picker` has something to display.
+fn open_project(project_dir: &Path) -> Result<Vec<EditorLayer>, String> {
+    let (project, project_dir) =
+        project_format::Project::load(project_dir).map_err(|e| e.to_string())?;
+
+    Ok(project
+        .layers
+        .into_iter()
+        .map(|layer| match layer {
+            project_format::Layer::Image { path } => EditorLayer::Image {
+                path: Some(project_dir.join(path)),
+            },
+            project_format::Layer::Xray {
+                base,
+                overlay,
+                radius,
+            } => EditorLayer::Xray {
+                base: Some(project_dir.join(base)),
+                overlay: Some(project_dir.join(overlay)),
+                radius,
+            },
+            project_format::Layer::Gif { path } => EditorLayer::Gif {
+                path: Some(project_dir.join(path)),
+            },
+        })
+        .collect())
+}
+
 fn save_project(project_dir: &Path, layers: &[EditorLayer]) -> Result<(), String> {
     std::fs::create_dir_all(project_dir).map_err(|e| e.to_string())?;
 
@@ -225,6 +273,20 @@ fn save_project(project_dir: &Path, layers: &[EditorLayer]) -> Result<(), String
 fn copy_asset(project_dir: &Path, source: &Path, stem: &str) -> Result<String, String> {
     let extension = source.extension().and_then(|e| e.to_str()).unwrap_or("png");
     let file_name = format!("{stem}.{extension}");
-    std::fs::copy(source, project_dir.join(&file_name)).map_err(|e| e.to_string())?;
+    let dest = project_dir.join(&file_name);
+
+    // If you opened a project and are saving back into the same folder,
+    // an untouched layer's source path already points at `dest` --
+    // fs::copy truncates the destination before it's done reading the
+    // source, so copying a file onto itself would zero it out.
+    let same_file = source
+        .canonicalize()
+        .ok()
+        .zip(dest.canonicalize().ok())
+        .is_some_and(|(a, b)| a == b);
+
+    if !same_file {
+        std::fs::copy(source, &dest).map_err(|e| e.to_string())?;
+    }
     Ok(file_name)
 }

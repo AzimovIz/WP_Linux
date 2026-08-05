@@ -16,6 +16,16 @@
 //! ~30fps, whose frames go out as uncompressed BMP -- on localhost,
 //! bandwidth is free but PNG's deflate compression is not, and BMP
 //! decode in Qt is essentially a memcpy.
+//!
+//! Loading a project and rendering every tick both happen exclusively on
+//! the dedicated render thread, which never holds a lock while doing GPU
+//! work -- HTTP handling only ever touches small, cheap-to-lock fields
+//! (`SharedState::output`/`cursor_uv`/`pending_project`). Sharing one
+//! mutex between "the render loop's GPU work" and "every HTTP response"
+//! was the earlier design's mistake: a render taking tens of
+//! milliseconds serialized every /meta, /frame and /cursor request
+//! behind it, since tiny_http handles requests one at a time on a single
+//! thread.
 
 mod renderer;
 
@@ -27,7 +37,7 @@ use std::time::Duration;
 
 use image::AnimationDecoder;
 use project_format::{Layer, Project};
-use renderer::{DrawLayer, ImageLayer, Renderer, XrayLayer};
+use renderer::{Canvas, DrawLayer, ImageLayer, Renderer, XrayLayer};
 use tiny_http::{Method, Response, Server};
 
 const HTTP_ADDR: &str = "127.0.0.1:47824";
@@ -53,6 +63,7 @@ enum LoadedLayer {
 
 struct LoadedProject {
     layers: Vec<LoadedLayer>,
+    canvas: Canvas,
     canvas_width: u32,
     canvas_height: u32,
     dynamic: bool,
@@ -60,15 +71,27 @@ struct LoadedProject {
 }
 
 #[derive(Default)]
-struct SharedState {
-    project: Option<LoadedProject>,
+struct FrameOutput {
+    ready: bool,
+    needs_cursor: bool,
     frame_bytes: Vec<u8>,
     frame_content_type: &'static str,
     frame_id: u64,
+}
+
+#[derive(Default)]
+struct SharedState {
+    /// Written by the render thread after every frame; read by
+    /// `/frame` and `/meta`. Never held while doing GPU work.
+    output: Mutex<FrameOutput>,
     /// Normalized (0..1) cursor position within the wallpaper item, as
     /// last reported by the QML side -- `None` means the pointer isn't
-    /// currently over it.
-    cursor_uv: Option<(f32, f32)>,
+    /// currently over it. Written by `/cursor`, read by the render
+    /// thread.
+    cursor_uv: Mutex<Option<(f32, f32)>>,
+    /// Set by `/project`, taken (and cleared) by the render thread on
+    /// its next tick.
+    pending_project: Mutex<Option<PathBuf>>,
 }
 
 fn main() {
@@ -77,7 +100,7 @@ fn main() {
     let renderer = Arc::new(Renderer::new());
     eprintln!("render-server: wgpu ready");
 
-    let state = Arc::new(Mutex::new(SharedState::default()));
+    let state = Arc::new(SharedState::default());
 
     {
         let renderer = Arc::clone(&renderer);
@@ -104,48 +127,24 @@ fn main() {
                         request.respond(text_response(400, &format!("bad request body: {e}")));
                     continue;
                 }
-                let project_dir = PathBuf::from(body.trim());
-                match load_project(&renderer, &project_dir) {
-                    Ok(mut loaded) => {
-                        eprintln!(
-                            "render-server: loaded project {:?} ({} layer(s), dynamic = {})",
-                            project_dir,
-                            loaded.layers.len(),
-                            loaded.dynamic
-                        );
-                        let mut state = state.lock().unwrap();
-                        let (frame_bytes, content_type) =
-                            compose_and_encode(&renderer, &mut loaded, None);
-                        state.project = Some(loaded);
-                        state.cursor_uv = None;
-                        state.frame_bytes = frame_bytes;
-                        state.frame_content_type = content_type;
-                        state.frame_id += 1;
-                        drop(state);
-                        let _ = request.respond(text_response(200, "ok"));
-                    }
-                    Err(e) => {
-                        eprintln!("render-server: failed to load project {project_dir:?}: {e}");
-                        let _ = request.respond(text_response(422, &e));
-                    }
-                }
+                *state.pending_project.lock().unwrap() = Some(PathBuf::from(body.trim()));
+                let _ = request.respond(text_response(200, "ok"));
             }
             (Method::Post, "/cursor") => {
                 let mut body = String::new();
                 let _ = request.as_reader().read_to_string(&mut body);
-                let mut state = state.lock().unwrap();
-                state.cursor_uv = parse_cursor(body.trim());
+                *state.cursor_uv.lock().unwrap() = parse_cursor(body.trim());
                 let _ = request.respond(text_response(200, "ok"));
             }
             (Method::Get, "/frame") => {
-                let state = state.lock().unwrap();
-                if state.frame_bytes.is_empty() {
+                let output = state.output.lock().unwrap();
+                if output.frame_bytes.is_empty() {
                     let _ = request.respond(text_response(404, "no project loaded"));
                 } else {
-                    let response = Response::from_data(state.frame_bytes.clone()).with_header(
+                    let response = Response::from_data(output.frame_bytes.clone()).with_header(
                         tiny_http::Header::from_bytes(
                             &b"Content-Type"[..],
-                            state.frame_content_type.as_bytes(),
+                            output.frame_content_type.as_bytes(),
                         )
                         .unwrap(),
                     );
@@ -153,12 +152,10 @@ fn main() {
                 }
             }
             (Method::Get, "/meta") => {
-                let state = state.lock().unwrap();
-                let ready = state.project.is_some();
-                let needs_cursor = state.project.as_ref().is_some_and(|p| p.needs_cursor);
+                let output = state.output.lock().unwrap();
                 let body = format!(
-                    "{{\"ready\":{ready},\"frame_id\":{},\"needs_cursor\":{needs_cursor}}}",
-                    state.frame_id
+                    "{{\"ready\":{},\"frame_id\":{},\"needs_cursor\":{}}}",
+                    output.ready, output.frame_id, output.needs_cursor
                 );
                 let response = Response::from_string(body).with_header(
                     tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
@@ -173,27 +170,59 @@ fn main() {
     }
 }
 
-/// Runs forever in its own thread, re-compositing dynamic projects (gif
-/// animation, xray cursor reaction) at a capped rate. Idles almost for
-/// free when nothing is loaded or the current project is fully static.
-fn render_tick_loop(renderer: &Renderer, state: &Mutex<SharedState>) {
+/// Runs forever in its own thread: picks up newly-posted project paths,
+/// re-composites dynamic projects (gif animation, xray cursor reaction)
+/// at a capped rate, and renders a static project exactly once. Idles
+/// almost for free when nothing is loaded or the current project is
+/// fully static. Never holds `state`'s locks while doing GPU work.
+fn render_tick_loop(renderer: &Renderer, state: &SharedState) {
+    let mut current: Option<LoadedProject> = None;
+    let mut needs_render = false;
+
     loop {
         std::thread::sleep(TICK_INTERVAL);
 
-        let mut state = state.lock().unwrap();
-        let cursor_uv = state.cursor_uv;
-        let Some(project) = state.project.as_mut() else {
+        if let Some(project_dir) = state.pending_project.lock().unwrap().take() {
+            match load_project(renderer, &project_dir) {
+                Ok(loaded) => {
+                    eprintln!(
+                        "render-server: loaded project {:?} ({} layer(s), dynamic = {})",
+                        project_dir,
+                        loaded.layers.len(),
+                        loaded.dynamic
+                    );
+                    *state.cursor_uv.lock().unwrap() = None;
+                    current = Some(loaded);
+                    needs_render = true;
+                }
+                Err(e) => {
+                    eprintln!("render-server: failed to load project {project_dir:?}: {e}");
+                }
+            }
+        }
+
+        let Some(project) = current.as_mut() else {
             continue;
         };
-        if !project.dynamic {
+        if !project.dynamic && !needs_render {
             continue;
         }
 
-        advance_gif_frames(renderer, project, TICK_INTERVAL.as_millis() as u64);
+        if project.dynamic {
+            advance_gif_frames(renderer, project, TICK_INTERVAL.as_millis() as u64);
+        }
+        let cursor_uv = *state.cursor_uv.lock().unwrap();
         let (frame_bytes, content_type) = compose_and_encode(renderer, project, cursor_uv);
-        state.frame_bytes = frame_bytes;
-        state.frame_content_type = content_type;
-        state.frame_id += 1;
+
+        let mut output = state.output.lock().unwrap();
+        output.ready = true;
+        output.needs_cursor = project.needs_cursor;
+        output.frame_bytes = frame_bytes;
+        output.frame_content_type = content_type;
+        output.frame_id += 1;
+        drop(output);
+
+        needs_render = false;
     }
 }
 
@@ -249,7 +278,7 @@ fn compose_and_encode(
         }
     }
 
-    let rgba = renderer.render_frame(project.canvas_width, project.canvas_height, &draw_layers);
+    let rgba = renderer.render_frame(&project.canvas, &draw_layers);
 
     if project.dynamic {
         (
@@ -334,9 +363,11 @@ fn load_project(renderer: &Renderer, project_dir: &Path) -> Result<LoadedProject
         .layers
         .iter()
         .any(|l| matches!(l, Layer::Xray { .. }));
+    let canvas = renderer.create_canvas(canvas_width, canvas_height);
 
     Ok(LoadedProject {
         layers: loaded_layers,
+        canvas,
         canvas_width,
         canvas_height,
         dynamic,

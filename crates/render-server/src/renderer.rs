@@ -62,6 +62,19 @@ impl Renderer {
             .await
             .expect("failed to find a suitable GPU adapter");
 
+        let info = adapter.get_info();
+        eprintln!(
+            "render-server: using adapter {:?} ({:?}, backend {:?})",
+            info.name, info.device_type, info.backend
+        );
+        if matches!(info.device_type, wgpu::DeviceType::Cpu) {
+            eprintln!(
+                "render-server: WARNING -- this is a software/CPU adapter, not a real GPU. \
+                 Rendering will be slow and will load the CPU heavily. If a real GPU is \
+                 available, this usually means Vulkan/EGL can't see it in this session."
+            );
+        }
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor::default())
             .await
@@ -363,9 +376,10 @@ impl Renderer {
         self.queue.write_buffer(&layer.uniform_buffer, 0, &bytes);
     }
 
-    /// Composites all layers (bottom to top) into a `width`x`height`
-    /// canvas and reads the result back as tightly-packed RGBA bytes.
-    pub fn render_frame(&self, width: u32, height: u32, layers: &[DrawLayer]) -> Vec<u8> {
+    /// Allocates the render target and readback buffer for a canvas of
+    /// this size, once, so a continuous render loop (gif/xray) isn't
+    /// churning fresh GPU allocations every single tick.
+    pub fn create_canvas(&self, width: u32, height: u32) -> Canvas {
         let size = wgpu::Extent3d {
             width,
             height,
@@ -384,6 +398,43 @@ impl Renderer {
         });
         let target_view = target_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+        // Rows in a copy-to-buffer destination must be padded to a
+        // multiple of COPY_BYTES_PER_ROW_ALIGNMENT; the image itself has
+        // no such requirement, so we strip the padding back out on
+        // readback.
+        let unpadded_bytes_per_row = 4 * width;
+        let padding = (wgpu::COPY_BYTES_PER_ROW_ALIGNMENT
+            - unpadded_bytes_per_row % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_bytes_per_row = unpadded_bytes_per_row + padding;
+
+        let readback_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: (padded_bytes_per_row * height) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        Canvas {
+            width,
+            height,
+            target_texture,
+            target_view,
+            readback_buffer,
+            padded_bytes_per_row,
+            unpadded_bytes_per_row,
+        }
+    }
+
+    /// Composites all layers (bottom to top) into `canvas` and reads the
+    /// result back as tightly-packed RGBA bytes.
+    pub fn render_frame(&self, canvas: &Canvas, layers: &[DrawLayer]) -> Vec<u8> {
+        let size = wgpu::Extent3d {
+            width: canvas.width,
+            height: canvas.height,
+            depth_or_array_layers: 1,
+        };
+
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -391,7 +442,7 @@ impl Renderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("composite-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &target_view,
+                    view: &canvas.target_view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -421,35 +472,19 @@ impl Renderer {
             }
         }
 
-        // Rows in a copy-to-buffer destination must be padded to a
-        // multiple of COPY_BYTES_PER_ROW_ALIGNMENT; the image itself has
-        // no such requirement, so we strip the padding back out below.
-        let unpadded_bytes_per_row = 4 * width;
-        let padding = (wgpu::COPY_BYTES_PER_ROW_ALIGNMENT
-            - unpadded_bytes_per_row % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
-            % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let padded_bytes_per_row = unpadded_bytes_per_row + padding;
-
-        let readback_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size: (padded_bytes_per_row * height) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &target_texture,
+                texture: &canvas.target_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyBufferInfo {
-                buffer: &readback_buffer,
+                buffer: &canvas.readback_buffer,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(padded_bytes_per_row),
-                    rows_per_image: Some(height),
+                    bytes_per_row: Some(canvas.padded_bytes_per_row),
+                    rows_per_image: Some(canvas.height),
                 },
             },
             size,
@@ -458,9 +493,11 @@ impl Renderer {
         self.queue.submit(Some(encoder.finish()));
 
         let (tx, rx) = std::sync::mpsc::channel();
-        readback_buffer.map_async(wgpu::MapMode::Read, .., move |result| {
-            let _ = tx.send(result);
-        });
+        canvas
+            .readback_buffer
+            .map_async(wgpu::MapMode::Read, .., move |result| {
+                let _ = tx.send(result);
+            });
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("device poll failed");
@@ -468,19 +505,34 @@ impl Renderer {
             .expect("map_async callback never fired")
             .expect("failed to map readback buffer");
 
-        let mut pixels = Vec::with_capacity((unpadded_bytes_per_row * height) as usize);
+        let mut pixels =
+            Vec::with_capacity((canvas.unpadded_bytes_per_row * canvas.height) as usize);
         {
-            let view = readback_buffer
+            let view = canvas
+                .readback_buffer
                 .get_mapped_range(..)
                 .expect("buffer not mapped");
-            for row in 0..height {
-                let start = (row * padded_bytes_per_row) as usize;
-                let end = start + unpadded_bytes_per_row as usize;
+            for row in 0..canvas.height {
+                let start = (row * canvas.padded_bytes_per_row) as usize;
+                let end = start + canvas.unpadded_bytes_per_row as usize;
                 pixels.extend_from_slice(&view[start..end]);
             }
         }
-        readback_buffer.unmap();
+        canvas.readback_buffer.unmap();
 
         pixels
     }
+}
+
+/// A reusable render target + readback buffer for one canvas size.
+/// Created once per loaded project and reused across every tick of a
+/// continuous (gif/xray) render loop.
+pub struct Canvas {
+    width: u32,
+    height: u32,
+    target_texture: wgpu::Texture,
+    target_view: wgpu::TextureView,
+    readback_buffer: wgpu::Buffer,
+    padded_bytes_per_row: u32,
+    unpadded_bytes_per_row: u32,
 }
