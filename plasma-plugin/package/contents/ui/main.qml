@@ -22,7 +22,7 @@ WallpaperItem {
         // HTTP endpoint (crates/cursor-bridge) that a companion KWin
         // script keeps updated with the real, compositor-level cursor
         // position -- see kwin-script/package for the other half.
-        QtObject {
+        Item {
             id: cursorPoll
 
             property bool requestInFlight: false

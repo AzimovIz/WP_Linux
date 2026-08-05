@@ -5,7 +5,10 @@
 // that's the whole reason this script exists instead of reading the
 // cursor from within the wallpaper's own QML.
 
+print("wplinux cursorbridge: script loaded");
+
 let lastSent = 0;
+let callCount = 0;
 const MIN_INTERVAL_MS = 8; // light throttle, ~120Hz cap
 
 function sendCursorPosition() {
@@ -16,14 +19,35 @@ function sendCursorPosition() {
     lastSent = now;
 
     const pos = workspace.cursorPos;
-    callDBus(
-        "dev.wplinux.CursorBridge",
-        "/dev/wplinux/CursorBridge",
-        "dev.wplinux.CursorBridge",
-        "SetCursorPosition",
-        pos.x,
-        pos.y
-    );
+    callCount++;
+    if (callCount % 30 === 0) {
+        // Don't flood the journal; one line every ~30 calls is enough to
+        // confirm the signal is actually firing.
+        print("wplinux cursorbridge: sending " + pos.x + "," + pos.y + " (call #" + callCount + ")");
+    }
+
+    try {
+        callDBus(
+            "dev.wplinux.CursorBridge",
+            "/dev/wplinux/CursorBridge",
+            "dev.wplinux.CursorBridge",
+            "SetCursorPosition",
+            pos.x,
+            pos.y,
+            function (...args) {
+                // zbus methods with no return value reply with zero
+                // arguments; if this never fires at all, the call itself
+                // is failing (wrong bus name/path/interface, or the
+                // service isn't running).
+                if (callCount % 30 === 0) {
+                    print("wplinux cursorbridge: callDBus reply " + JSON.stringify(args));
+                }
+            }
+        );
+    } catch (e) {
+        print("wplinux cursorbridge: callDBus threw: " + e);
+    }
 }
 
+print("wplinux cursorbridge: connecting to cursorPosChanged, initial pos = " + JSON.stringify(workspace.cursorPos));
 workspace.cursorPosChanged.connect(sendCursorPosition);
