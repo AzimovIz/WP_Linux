@@ -1,0 +1,11 @@
+[package]
+name = "render-server"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+pollster = "0.4"
+project-format = { path = "../project-format" }
+tiny_http = "0.12"
+wgpu = "30"

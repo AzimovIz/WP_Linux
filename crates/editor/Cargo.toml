@@ -1,0 +1,9 @@
+[package]
+name = "editor"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+eframe = "0.35"
+project-format = { path = "../project-format" }
+rfd = "0.17"

@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/player", "crates/cursor-bridge"]
+members = [
+    "crates/player",
+    "crates/cursor-bridge",
+    "crates/project-format",
+    "crates/render-server",
+    "crates/editor",
+]
 
 [workspace.package]
 edition = "2024"
