@@ -2,30 +2,39 @@
 //! composited result to the Plasma QML wallpaper plugin over a tiny
 //! local HTTP API:
 //!
-//!   POST /project   body = absolute path to a project directory -> loads it
-//!   POST /cursor     body = "x,y" (normalized 0..1) or "none" -> cursor position
+//!   POST /project    body = absolute path to a project directory -> loads it
+//!   POST /geometry   body = "virtualX,virtualY,width,height" -> the wallpaper
+//!                    item's placement on the virtual desktop, used to turn
+//!                    the global cursor position (see below) into local,
+//!                    normalized coordinates for xray layers
 //!   GET  /frame      -> current frame, PNG (static project) or BMP (dynamic)
-//!   GET  /meta       -> {"ready": bool, "frame_id": u64, "needs_cursor": bool}
+//!   GET  /meta       -> {"ready": bool, "frame_id": u64, "needs_cursor": bool, "fps": u32}
 //!
-//! Deliberately started by hand for now (see crates/cursor-bridge for the
-//! same "figure out autostart later" note).
+//! Cursor position itself does NOT come in over HTTP: this process also
+//! registers the `dev.wplinux.CursorBridge` D-Bus service (formerly a
+//! separate `cursor-bridge` binary) that a companion KWin script feeds
+//! with the true, compositor-level pointer position -- see
+//! kwin-script/package. Folding it in here means one less process to
+//! start by hand, and lets the render loop react to cursor movement
+//! without an HTTP round-trip through QML at all.
+//!
+//! Deliberately started by hand for now (autostart is still a TODO).
 //!
 //! Layers that don't react to the cursor or animate on their own (plain
 //! `Image`) are rendered once and left alone. Layers that do (`Xray`,
-//! `Gif`) put the server into a continuous render loop, capped at
-//! ~30fps, whose frames go out as uncompressed BMP -- on localhost,
-//! bandwidth is free but PNG's deflate compression is not, and BMP
-//! decode in Qt is essentially a memcpy.
+//! `Gif`) put the server into a continuous render loop, capped at the
+//! project's configured fps, whose frames go out as uncompressed BMP --
+//! on localhost, bandwidth is free but PNG's deflate compression is not,
+//! and BMP decode in Qt is essentially a memcpy.
 //!
 //! Loading a project and rendering every tick both happen exclusively on
 //! the dedicated render thread, which never holds a lock while doing GPU
 //! work -- HTTP handling only ever touches small, cheap-to-lock fields
-//! (`SharedState::output`/`cursor_uv`/`pending_project`). Sharing one
-//! mutex between "the render loop's GPU work" and "every HTTP response"
-//! was the earlier design's mistake: a render taking tens of
-//! milliseconds serialized every /meta, /frame and /cursor request
-//! behind it, since tiny_http handles requests one at a time on a single
-//! thread.
+//! (`SharedState::output`/`global_cursor`/`geometry`/`pending_project`).
+//! Sharing one mutex between "the render loop's GPU work" and "every
+//! HTTP response" was the earlier design's mistake: a render taking tens
+//! of milliseconds serialized every /meta and /frame request behind it,
+//! since tiny_http handles requests one at a time on a single thread.
 
 mod renderer;
 
@@ -39,6 +48,10 @@ use image::AnimationDecoder;
 use project_format::{Layer, Project};
 use renderer::{Canvas, DrawLayer, ImageLayer, Renderer, XrayLayer};
 use tiny_http::{Method, Response, Server};
+use zbus::blocking::connection;
+
+const CURSOR_BUS_NAME: &str = "dev.wplinux.CursorBridge";
+const CURSOR_OBJECT_PATH: &str = "/dev/wplinux/CursorBridge";
 
 const HTTP_ADDR: &str = "127.0.0.1:47824";
 /// Used only before any project has been loaded yet -- once a project
@@ -89,14 +102,145 @@ struct SharedState {
     /// Written by the render thread after every frame; read by
     /// `/frame` and `/meta`. Never held while doing GPU work.
     output: Mutex<FrameOutput>,
-    /// Normalized (0..1) cursor position within the wallpaper item, as
-    /// last reported by the QML side -- `None` means the pointer isn't
-    /// currently over it. Written by `/cursor`, read by the render
-    /// thread.
-    cursor_uv: Mutex<Option<(f32, f32)>>,
+    /// Global (virtual-desktop) cursor position in pixels, as last
+    /// reported by the KWin script over D-Bus. `None` until the first
+    /// report arrives.
+    global_cursor: Mutex<Option<(i32, i32)>>,
+    /// The wallpaper item's placement on the virtual desktop --
+    /// (virtualX, virtualY, width, height) -- as last pushed by QML via
+    /// `/geometry`. Needed to turn `global_cursor` into local,
+    /// normalized coordinates; only QML knows this, since render-server
+    /// has no Wayland/Qt connection of its own.
+    geometry: Mutex<Option<(f64, f64, f64, f64)>>,
     /// Set by `/project`, taken (and cleared) by the render thread on
     /// its next tick.
     pending_project: Mutex<Option<PathBuf>>,
+}
+
+/// D-Bus object backing `dev.wplinux.CursorBridge` -- the KWin script
+/// (kwin-script/package) calls `SetCursorPosition` on this every time
+/// `workspace.cursorPosChanged` fires.
+struct CursorDbusService {
+    state: Arc<SharedState>,
+}
+
+#[zbus::interface(name = "dev.wplinux.CursorBridge")]
+impl CursorDbusService {
+    #[zbus(name = "SetCursorPosition")]
+    fn set_cursor_position(&mut self, x: i32, y: i32) {
+        *self.state.global_cursor.lock().unwrap() = Some((x, y));
+    }
+}
+
+/// Registers the cursor D-Bus service and then parks forever, keeping
+/// the connection alive for the life of the process. Runs in its own
+/// thread so a D-Bus setup failure (e.g. another instance of this
+/// service already running) can't take down the HTTP server or the
+/// render loop -- it just means xray layers won't see cursor movement.
+fn run_cursor_dbus_service(state: Arc<SharedState>) {
+    let service = CursorDbusService { state };
+    let _conn = connection::Builder::session()
+        .expect("failed to connect to session D-Bus")
+        .name(CURSOR_BUS_NAME)
+        .expect(
+            "failed to request bus name -- is another instance of this service already running?",
+        )
+        .serve_at(CURSOR_OBJECT_PATH, service)
+        .expect("failed to register D-Bus object")
+        .build()
+        .expect("failed to build D-Bus connection");
+    eprintln!(
+        "render-server: registered {CURSOR_BUS_NAME}{CURSOR_OBJECT_PATH}, waiting for SetCursorPosition calls"
+    );
+    loop {
+        std::thread::park();
+    }
+}
+
+/// KWin scripts normally need installing as a KPackage
+/// (`kpackagetool6 --type=KWin/Script`) plus enabling in kwinrc. KWin
+/// also exposes `org.kde.kwin.Scripting` on `/Scripting`, meant for
+/// loading an unpackaged script file on the fly (this is how KWin's own
+/// scripting console and dev tools work) -- so we use that instead to
+/// load our companion script straight from the repo checkout, no
+/// packaging/installation step required. Best-effort: if this fails
+/// (e.g. a KWin version where the interface differs), the cursor script
+/// can still be installed the old way by hand.
+fn ensure_kwin_cursor_script_loaded() {
+    const PLUGIN_NAME: &str = "dev.wplinux.cursorbridge";
+    const SCRIPT_PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../kwin-script/package/contents/code/main.js"
+    );
+
+    if !std::path::Path::new(SCRIPT_PATH).exists() {
+        eprintln!(
+            "render-server: kwin cursor script not found at {SCRIPT_PATH}, skipping auto-load \
+             (install it by hand with kpackagetool6 if you moved this binary elsewhere)"
+        );
+        return;
+    }
+
+    let load = || -> zbus::Result<bool> {
+        let conn = zbus::blocking::Connection::session()?;
+
+        let already_loaded: bool = conn
+            .call_method(
+                Some("org.kde.KWin"),
+                "/Scripting",
+                Some("org.kde.kwin.Scripting"),
+                "isScriptLoaded",
+                &(PLUGIN_NAME,),
+            )?
+            .body()
+            .deserialize()?;
+        if already_loaded {
+            return Ok(false);
+        }
+
+        conn.call_method(
+            Some("org.kde.KWin"),
+            "/Scripting",
+            Some("org.kde.kwin.Scripting"),
+            "loadScript",
+            &(SCRIPT_PATH, PLUGIN_NAME),
+        )?;
+        conn.call_method(
+            Some("org.kde.KWin"),
+            "/Scripting",
+            Some("org.kde.kwin.Scripting"),
+            "start",
+            &(),
+        )?;
+        Ok(true)
+    };
+
+    match load() {
+        Ok(true) => eprintln!("render-server: loaded and started kwin cursor script from {SCRIPT_PATH}"),
+        Ok(false) => eprintln!("render-server: kwin cursor script already loaded"),
+        Err(e) => eprintln!(
+            "render-server: could not auto-load kwin cursor script ({e}) -- \
+             install it by hand: kpackagetool6 --type=KWin/Script --install kwin-script/package"
+        ),
+    }
+}
+
+/// Computes the current normalized (0..1) cursor position within the
+/// wallpaper item from the last-known global cursor position and the
+/// item's last-reported screen geometry. `None` if either piece is
+/// missing, or the cursor is outside the item's bounds.
+fn compute_cursor_uv(state: &SharedState) -> Option<(f32, f32)> {
+    let (gx, gy) = (*state.global_cursor.lock().unwrap())?;
+    let (vx, vy, w, h) = (*state.geometry.lock().unwrap())?;
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    let local_x = gx as f64 - vx;
+    let local_y = gy as f64 - vy;
+    if local_x < 0.0 || local_x > w || local_y < 0.0 || local_y > h {
+        return None;
+    }
+    Some(((local_x / w) as f32, (local_y / h) as f32))
 }
 
 fn main() {
@@ -112,6 +256,13 @@ fn main() {
         let state = Arc::clone(&state);
         std::thread::spawn(move || render_tick_loop(&renderer, &state));
     }
+
+    {
+        let state = Arc::clone(&state);
+        std::thread::spawn(move || run_cursor_dbus_service(state));
+    }
+
+    ensure_kwin_cursor_script_loaded();
 
     let server =
         Server::http(HTTP_ADDR).unwrap_or_else(|e| panic!("failed to bind {HTTP_ADDR}: {e}"));
@@ -135,10 +286,10 @@ fn main() {
                 *state.pending_project.lock().unwrap() = Some(PathBuf::from(body.trim()));
                 let _ = request.respond(text_response(200, "ok"));
             }
-            (Method::Post, "/cursor") => {
+            (Method::Post, "/geometry") => {
                 let mut body = String::new();
                 let _ = request.as_reader().read_to_string(&mut body);
-                *state.cursor_uv.lock().unwrap() = parse_cursor(body.trim());
+                *state.geometry.lock().unwrap() = parse_geometry(body.trim());
                 let _ = request.respond(text_response(200, "ok"));
             }
             (Method::Get, "/frame") => {
@@ -204,7 +355,6 @@ fn render_tick_loop(renderer: &Renderer, state: &SharedState) {
                         loaded.dynamic,
                         loaded.tick_interval,
                     );
-                    *state.cursor_uv.lock().unwrap() = None;
                     tick_interval = loaded.tick_interval;
                     current = Some(loaded);
                     needs_render = true;
@@ -229,7 +379,11 @@ fn render_tick_loop(renderer: &Renderer, state: &SharedState) {
             false
         };
 
-        let cursor_uv = *state.cursor_uv.lock().unwrap();
+        let cursor_uv = if project.needs_cursor {
+            compute_cursor_uv(state)
+        } else {
+            None
+        };
         let cursor_changed = project.needs_cursor && cursor_uv != last_rendered_cursor_uv;
 
         if !needs_render && !gif_changed && !cursor_changed {
@@ -450,12 +604,14 @@ fn decode_gif(path: &Path) -> Result<(Vec<GifFrame>, u32, u32), String> {
     Ok((gif_frames, width, height))
 }
 
-fn parse_cursor(body: &str) -> Option<(f32, f32)> {
-    if body == "none" || body.is_empty() {
-        return None;
-    }
-    let (x, y) = body.split_once(',')?;
-    Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+/// Parses "virtualX,virtualY,width,height" as pushed by the QML side.
+fn parse_geometry(body: &str) -> Option<(f64, f64, f64, f64)> {
+    let mut parts = body.split(',');
+    let vx = parts.next()?.trim().parse().ok()?;
+    let vy = parts.next()?.trim().parse().ok()?;
+    let w = parts.next()?.trim().parse().ok()?;
+    let h = parts.next()?.trim().parse().ok()?;
+    Some((vx, vy, w, h))
 }
 
 fn encode(rgba: &[u8], width: u32, height: u32, format: image::ImageFormat) -> Vec<u8> {

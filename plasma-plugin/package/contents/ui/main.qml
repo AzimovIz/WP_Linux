@@ -21,6 +21,19 @@ WallpaperItem {
         xhr.send(path);
     }
 
+    // Tells render-server where this wallpaper item actually sits on the
+    // virtual desktop. render-server gets the cursor's GLOBAL position
+    // directly over D-Bus (from the KWin script, see kwin-script/package
+    // -- no HTTP round-trip through QML needed for that anymore), but it
+    // has no Wayland/Qt connection of its own, so only QML can supply
+    // this piece: without it there'd be no way to turn a global position
+    // into "is the cursor over this monitor, and where."
+    function pushGeometry() {
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", "http://127.0.0.1:47824/geometry");
+        xhr.send(Screen.virtualX + "," + Screen.virtualY + "," + root.width + "," + root.height);
+    }
+
     Connections {
         target: root.configuration
         function onProjectPathChanged() {
@@ -28,7 +41,19 @@ WallpaperItem {
         }
     }
 
-    Component.onCompleted: root.pushProjectPath()
+    Connections {
+        target: Screen
+        function onVirtualXChanged() { root.pushGeometry(); }
+        function onVirtualYChanged() { root.pushGeometry(); }
+    }
+
+    onWidthChanged: root.pushGeometry()
+    onHeightChanged: root.pushGeometry()
+
+    Component.onCompleted: {
+        root.pushProjectPath();
+        root.pushGeometry();
+    }
 
     Rectangle {
         id: background
@@ -166,66 +191,13 @@ WallpaperItem {
             }
         }
 
-        // Folder View's icon layer sits above WallpaperItem and consumes
-        // hover before it gets here, so a plain HoverHandler never fires
-        // while desktop icons are shown. Instead we poll a tiny local HTTP
-        // endpoint (crates/cursor-bridge) that a companion KWin script
-        // keeps updated with the real, compositor-level cursor position --
-        // see kwin-script/package for the other half. All the actual
-        // cursor-reactive rendering (xray mask, etc.) now happens in
-        // render-server; this only relays where the pointer is, in
-        // normalized item-local coordinates, since only QML knows this
-        // item's on-screen placement and size.
-        Item {
-            id: cursorRelay
-
-            property bool requestInFlight: false
-
-            function poll() {
-                if (requestInFlight) {
-                    return;
-                }
-                requestInFlight = true;
-
-                const xhr = new XMLHttpRequest();
-                xhr.onreadystatechange = function () {
-                    if (xhr.readyState !== XMLHttpRequest.DONE) {
-                        return;
-                    }
-                    requestInFlight = false;
-
-                    if (xhr.status !== 200) {
-                        return;
-                    }
-
-                    try {
-                        const pos = JSON.parse(xhr.responseText);
-                        const localX = pos.x - Screen.virtualX;
-                        const localY = pos.y - Screen.virtualY;
-                        const inside = localX >= 0 && localX <= background.width
-                                       && localY >= 0 && localY <= background.height;
-                        pushCursor(inside ? (localX / background.width) : null,
-                                   inside ? (localY / background.height) : null);
-                    } catch (e) {
-                        // ignore, try again next tick
-                    }
-                };
-                xhr.open("GET", "http://127.0.0.1:47823/cursor");
-                xhr.send();
-            }
-
-            function pushCursor(u, v) {
-                const xhr = new XMLHttpRequest();
-                xhr.open("POST", "http://127.0.0.1:47824/cursor");
-                xhr.send(u === null ? "none" : (u + "," + v));
-            }
-        }
-
-        Timer {
-            interval: 16
-            running: sceneMeta.needsCursor
-            repeat: true
-            onTriggered: cursorRelay.poll()
-        }
+        // Cursor-reactive rendering (xray mask, etc.) happens entirely in
+        // render-server now: it gets the true, compositor-level pointer
+        // position directly from a KWin script over D-Bus (see
+        // kwin-script/package), and this item's placement via
+        // root.pushGeometry() above. Folder View's icon layer sits above
+        // WallpaperItem and would consume hover before it reached any
+        // QML-side cursor tracking here anyway -- that's the whole
+        // reason cursor handling doesn't live in this file.
     }
 }

@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "crates/player",
-    "crates/cursor-bridge",
     "crates/project-format",
     "crates/render-server",
     "crates/editor",

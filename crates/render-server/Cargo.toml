@@ -9,3 +9,4 @@ pollster = "0.4"
 project-format = { path = "../project-format" }
 tiny_http = "0.12"
 wgpu = "30"
+zbus = "5"
