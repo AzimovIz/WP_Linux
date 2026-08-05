@@ -1,0 +1,18 @@
+{
+    "KPlugin": {
+        "Name": "WP Linux Cursor Bridge",
+        "Description": "Forwards the global cursor position to the wp-linux cursor-bridge D-Bus service.",
+        "Icon": "input-mouse",
+        "Authors": [
+            {
+                "Name": "WP Linux"
+            }
+        ],
+        "Id": "dev.wplinux.cursorbridge",
+        "Version": "0.1.0",
+        "License": "MIT"
+    },
+    "X-Plasma-API": "javascript",
+    "X-Plasma-MainScript": "code/main.js",
+    "KPackageStructure": "KWin/Script"
+}

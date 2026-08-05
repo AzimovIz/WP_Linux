@@ -1,0 +1,21 @@
+{
+    "KPackageStructure": "Plasma/Wallpaper",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "WP Linux"
+            }
+        ],
+        "Category": "",
+        "Description": "Spike: does a Plasma wallpaper plugin keep desktop icons on top?",
+        "Icon": "preferences-desktop-wallpaper",
+        "Id": "dev.wplinux.hellowallpaper",
+        "License": "MIT",
+        "Name": "WP Linux Hello"
+    },
+    "Keywords": [
+        "wallpaper"
+    ],
+    "X-KDE-ParentApp": "org.kde.plasmashell",
+    "X-Plasma-API-Minimum-Version": "6.0"
+}
