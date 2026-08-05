@@ -42,7 +42,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use image::AnimationDecoder;
 use project_format::{Layer, Project};
@@ -283,7 +283,9 @@ fn main() {
                         request.respond(text_response(400, &format!("bad request body: {e}")));
                     continue;
                 }
-                *state.pending_project.lock().unwrap() = Some(PathBuf::from(body.trim()));
+                let project_dir = PathBuf::from(body.trim());
+                eprintln!("render-server: received /project {project_dir:?}");
+                *state.pending_project.lock().unwrap() = Some(project_dir);
                 let _ = request.respond(text_response(200, "ok"));
             }
             (Method::Post, "/geometry") => {
@@ -343,7 +345,14 @@ fn render_tick_loop(renderer: &Renderer, state: &SharedState) {
     let mut tick_interval = IDLE_TICK_INTERVAL;
 
     loop {
-        std::thread::sleep(tick_interval);
+        // Timed from here, not from the end of the previous sleep -- the
+        // work below (GPU render, encode) is not instant, and sleeping
+        // the full tick_interval regardless of how long that work took
+        // would make the real cycle length tick_interval + work_time
+        // instead of tick_interval, silently undershooting the
+        // project's configured fps by however long a frame takes to
+        // produce.
+        let cycle_start = Instant::now();
 
         if let Some(project_dir) = state.pending_project.lock().unwrap().take() {
             match load_project(renderer, &project_dir) {
@@ -366,43 +375,39 @@ fn render_tick_loop(renderer: &Renderer, state: &SharedState) {
             }
         }
 
-        let Some(project) = current.as_mut() else {
-            continue;
-        };
-        if !project.dynamic && !needs_render {
-            continue;
+        if let Some(project) = current.as_mut() {
+            let gif_changed = if project.dynamic {
+                advance_gif_frames(renderer, project, tick_interval.as_millis() as u64)
+            } else {
+                false
+            };
+
+            let cursor_uv = if project.needs_cursor {
+                compute_cursor_uv(state)
+            } else {
+                None
+            };
+            let cursor_changed = project.needs_cursor && cursor_uv != last_rendered_cursor_uv;
+
+            if needs_render || gif_changed || cursor_changed {
+                last_rendered_cursor_uv = cursor_uv;
+
+                let (frame_bytes, content_type) = compose_and_encode(renderer, project, cursor_uv);
+
+                let mut output = state.output.lock().unwrap();
+                output.ready = true;
+                output.needs_cursor = project.needs_cursor;
+                output.fps = project.fps;
+                output.frame_bytes = frame_bytes;
+                output.frame_content_type = content_type;
+                output.frame_id += 1;
+                drop(output);
+
+                needs_render = false;
+            }
         }
 
-        let gif_changed = if project.dynamic {
-            advance_gif_frames(renderer, project, tick_interval.as_millis() as u64)
-        } else {
-            false
-        };
-
-        let cursor_uv = if project.needs_cursor {
-            compute_cursor_uv(state)
-        } else {
-            None
-        };
-        let cursor_changed = project.needs_cursor && cursor_uv != last_rendered_cursor_uv;
-
-        if !needs_render && !gif_changed && !cursor_changed {
-            continue;
-        }
-        last_rendered_cursor_uv = cursor_uv;
-
-        let (frame_bytes, content_type) = compose_and_encode(renderer, project, cursor_uv);
-
-        let mut output = state.output.lock().unwrap();
-        output.ready = true;
-        output.needs_cursor = project.needs_cursor;
-        output.fps = project.fps;
-        output.frame_bytes = frame_bytes;
-        output.frame_content_type = content_type;
-        output.frame_id += 1;
-        drop(output);
-
-        needs_render = false;
+        std::thread::sleep(tick_interval.saturating_sub(cycle_start.elapsed()));
     }
 }
 
@@ -468,22 +473,12 @@ fn compose_and_encode(
 
     if project.dynamic {
         (
-            encode(
-                &rgba,
-                project.canvas_width,
-                project.canvas_height,
-                image::ImageFormat::Bmp,
-            ),
+            encode_bmp(&rgba, project.canvas_width, project.canvas_height),
             "image/bmp",
         )
     } else {
         (
-            encode(
-                &rgba,
-                project.canvas_width,
-                project.canvas_height,
-                image::ImageFormat::Png,
-            ),
+            encode_png(&rgba, project.canvas_width, project.canvas_height),
             "image/png",
         )
     }
@@ -614,7 +609,7 @@ fn parse_geometry(body: &str) -> Option<(f64, f64, f64, f64)> {
     Some((vx, vy, w, h))
 }
 
-fn encode(rgba: &[u8], width: u32, height: u32, format: image::ImageFormat) -> Vec<u8> {
+fn encode_png(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
     let mut bytes = Vec::new();
     let mut cursor = std::io::Cursor::new(&mut bytes);
     image::write_buffer_with_format(
@@ -623,12 +618,104 @@ fn encode(rgba: &[u8], width: u32, height: u32, format: image::ImageFormat) -> V
         width,
         height,
         image::ExtendedColorType::Rgba8,
-        format,
+        image::ImageFormat::Png,
     )
     .expect("frame encoding failed");
     bytes
 }
 
+/// Hand-rolled BMP encoder for dynamic (gif/xray) frames. `image`'s own
+/// BMP encoder writes every pixel through a separate `write_all` call
+/// (byte-swapping RGBA into BGRA one pixel at a time), which dominated
+/// frame time even in release builds. BMP's BITMAPV4HEADER lets you
+/// declare arbitrary per-channel bitmasks instead of assuming BGRA, so
+/// we point the masks straight at our buffer's actual R/G/B/A byte
+/// layout and copy each row wholesale -- no per-pixel work at all.
+fn encode_bmp(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
+    const FILE_HEADER_SIZE: u32 = 14;
+    const DIB_HEADER_SIZE: u32 = 108; // BITMAPV4HEADER
+    const LCS_SRGB: u32 = 0x7352_4742;
+
+    let row_bytes = width as usize * 4;
+    let pixel_data_size = row_bytes * height as usize;
+    let pixel_data_offset = FILE_HEADER_SIZE + DIB_HEADER_SIZE;
+    let file_size = pixel_data_offset + pixel_data_size as u32;
+
+    let mut out = Vec::with_capacity(pixel_data_offset as usize + pixel_data_size);
+
+    // BITMAPFILEHEADER
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&file_size.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes()); // reserved
+    out.extend_from_slice(&0u16.to_le_bytes()); // reserved
+    out.extend_from_slice(&pixel_data_offset.to_le_bytes());
+
+    // BITMAPV4HEADER
+    out.extend_from_slice(&DIB_HEADER_SIZE.to_le_bytes());
+    out.extend_from_slice(&(width as i32).to_le_bytes());
+    out.extend_from_slice(&(height as i32).to_le_bytes()); // positive => bottom-up rows
+    out.extend_from_slice(&1u16.to_le_bytes()); // color planes
+    out.extend_from_slice(&32u16.to_le_bytes()); // bits per pixel
+    out.extend_from_slice(&3u32.to_le_bytes()); // BI_BITFIELDS -- use the masks below
+    out.extend_from_slice(&(pixel_data_size as u32).to_le_bytes());
+    out.extend_from_slice(&0i32.to_le_bytes()); // x pixels/meter
+    out.extend_from_slice(&0i32.to_le_bytes()); // y pixels/meter
+    out.extend_from_slice(&0u32.to_le_bytes()); // colors used
+    out.extend_from_slice(&0u32.to_le_bytes()); // important colors
+    out.extend_from_slice(&0x0000_00FFu32.to_le_bytes()); // red   = byte 0
+    out.extend_from_slice(&0x0000_FF00u32.to_le_bytes()); // green = byte 1
+    out.extend_from_slice(&0x00FF_0000u32.to_le_bytes()); // blue  = byte 2
+    out.extend_from_slice(&0xFF00_0000u32.to_le_bytes()); // alpha = byte 3
+    out.extend_from_slice(&LCS_SRGB.to_le_bytes());
+    out.extend_from_slice(&[0u8; 36]); // CIEXYZTRIPLE endpoints, unused for sRGB
+    out.extend_from_slice(&[0u8; 12]); // gamma red/green/blue, unused for sRGB
+
+    debug_assert_eq!(out.len(), pixel_data_offset as usize);
+
+    // BMP rows are stored bottom-up; our buffer is top-down, so walk the
+    // source rows in reverse. Each row's bytes already match our chosen
+    // masks exactly, so this is a straight copy, no per-pixel work.
+    for row in (0..height as usize).rev() {
+        let start = row * row_bytes;
+        out.extend_from_slice(&rgba[start..start + row_bytes]);
+    }
+
+    out
+}
+
 fn text_response(code: u16, body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     Response::from_string(body).with_status_code(tiny_http::StatusCode(code))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_bmp;
+
+    /// Round-trips a small, non-uniform RGBA buffer through our BMP
+    /// encoder and `image`'s own BMP decoder (a completely independent
+    /// implementation) to catch any mistake in the header/mask/row-order
+    /// hand-rolling -- the encoder produces byte-for-byte pixel identity
+    /// with the source, or this fails.
+    #[test]
+    fn encode_bmp_round_trips_through_image_crate() {
+        let width = 3u32;
+        let height = 2u32;
+        // Distinct, non-symmetric R/G/B/A per pixel so a channel-order or
+        // row-order bug can't accidentally still pass.
+        let rgba: Vec<u8> = (0..(width * height))
+            .flat_map(|i| {
+                let i = i as u8;
+                [i, i.wrapping_add(50), i.wrapping_add(100), i.wrapping_add(150)]
+            })
+            .collect();
+
+        let bmp_bytes = encode_bmp(&rgba, width, height);
+
+        let decoded = image::load_from_memory_with_format(&bmp_bytes, image::ImageFormat::Bmp)
+            .expect("image crate failed to decode our BMP output")
+            .into_rgba8();
+
+        assert_eq!(decoded.dimensions(), (width, height));
+        assert_eq!(decoded.into_raw(), rgba);
+    }
 }

@@ -10,12 +10,21 @@ WallpaperItem {
     // refused" (render-server may not even be running yet) and gives a
     // clean, obviously-unconfigured state instead.
     readonly property bool hasProject: root.configuration.ProjectPath !== ""
+    // Path we last actually POSTed to render-server. Compared against
+    // the live config every tick (see the Timer below) instead of
+    // relying solely on onProjectPathChanged firing -- clicking Apply in
+    // the wallpaper settings dialog can replace `configuration` itself,
+    // and a Connections target re-binding to a new object can miss the
+    // one signal that mattered. Polling the actual value is slower by
+    // at most one tick, but can't miss a change.
+    property string lastPushedProjectPath: ""
 
     function pushProjectPath() {
         const path = root.configuration.ProjectPath;
         if (!path) {
             return;
         }
+        root.lastPushedProjectPath = path;
         const xhr = new XMLHttpRequest();
         xhr.open("POST", "http://127.0.0.1:47824/project");
         xhr.send(path);
@@ -128,7 +137,12 @@ WallpaperItem {
             running: root.hasProject
             repeat: true
             triggeredOnStart: true
-            onTriggered: sceneMeta.poll()
+            onTriggered: {
+                if (root.configuration.ProjectPath !== root.lastPushedProjectPath) {
+                    root.pushProjectPath();
+                }
+                sceneMeta.poll();
+            }
         }
 
         // Fetches the current rendered frame from render-server. Only
