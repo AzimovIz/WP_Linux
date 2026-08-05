@@ -45,10 +45,20 @@ impl EditorLayer {
     }
 }
 
-#[derive(Default)]
 struct EditorApp {
     layers: Vec<EditorLayer>,
+    fps: u32,
     status: String,
+}
+
+impl Default for EditorApp {
+    fn default() -> Self {
+        Self {
+            layers: Vec::new(),
+            fps: 30,
+            status: String::new(),
+        }
+    }
 }
 
 impl eframe::App for EditorApp {
@@ -62,8 +72,9 @@ impl eframe::App for EditorApp {
                 if ui.button("Open project...").clicked() {
                     if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                         match open_project(&dir) {
-                            Ok(layers) => {
+                            Ok((layers, fps)) => {
                                 self.layers = layers;
+                                self.fps = fps;
                                 self.status = format!("Opened {}", dir.display());
                             }
                             Err(e) => {
@@ -72,6 +83,13 @@ impl eframe::App for EditorApp {
                         }
                     }
                 }
+            });
+
+            ui.add_space(8.0);
+
+            ui.horizontal(|ui| {
+                ui.label("Target FPS (animated/cursor layers only):");
+                ui.add(eframe::egui::Slider::new(&mut self.fps, 1..=60));
             });
 
             ui.add_space(8.0);
@@ -165,7 +183,7 @@ impl eframe::App for EditorApp {
                 .clicked()
             {
                 if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                    self.status = match save_project(&dir, &self.layers) {
+                    self.status = match save_project(&dir, &self.layers, self.fps) {
                         Ok(()) => format!("Saved to {}", dir.display()),
                         Err(e) => format!("Failed to save: {e}"),
                     };
@@ -198,11 +216,11 @@ fn path_picker(ui: &mut eframe::egui::Ui, label: &str, path: &mut Option<PathBuf
 /// Loads an existing project folder back into the editor's layer list,
 /// resolving each layer's relative asset paths to absolute ones so
 /// `path_picker` has something to display.
-fn open_project(project_dir: &Path) -> Result<Vec<EditorLayer>, String> {
+fn open_project(project_dir: &Path) -> Result<(Vec<EditorLayer>, u32), String> {
     let (project, project_dir) =
         project_format::Project::load(project_dir).map_err(|e| e.to_string())?;
 
-    Ok(project
+    let layers = project
         .layers
         .into_iter()
         .map(|layer| match layer {
@@ -222,10 +240,12 @@ fn open_project(project_dir: &Path) -> Result<Vec<EditorLayer>, String> {
                 path: Some(project_dir.join(path)),
             },
         })
-        .collect())
+        .collect();
+
+    Ok((layers, project.fps))
 }
 
-fn save_project(project_dir: &Path, layers: &[EditorLayer]) -> Result<(), String> {
+fn save_project(project_dir: &Path, layers: &[EditorLayer], fps: u32) -> Result<(), String> {
     std::fs::create_dir_all(project_dir).map_err(|e| e.to_string())?;
 
     let mut saved_layers = Vec::with_capacity(layers.len());
@@ -263,6 +283,7 @@ fn save_project(project_dir: &Path, layers: &[EditorLayer]) -> Result<(), String
 
     let project = project_format::Project {
         layers: saved_layers,
+        fps,
     };
     project.save(project_dir).map_err(|e| e.to_string())
 }

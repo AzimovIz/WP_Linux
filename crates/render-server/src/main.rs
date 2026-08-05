@@ -41,7 +41,9 @@ use renderer::{Canvas, DrawLayer, ImageLayer, Renderer, XrayLayer};
 use tiny_http::{Method, Response, Server};
 
 const HTTP_ADDR: &str = "127.0.0.1:47824";
-const TICK_INTERVAL: Duration = Duration::from_millis(33);
+/// Used only before any project has been loaded yet -- once a project
+/// loads, its own `fps` field (see project-format) drives the tick rate.
+const IDLE_TICK_INTERVAL: Duration = Duration::from_millis(33);
 
 struct GifFrame {
     rgba: Vec<u8>,
@@ -68,12 +70,15 @@ struct LoadedProject {
     canvas_height: u32,
     dynamic: bool,
     needs_cursor: bool,
+    fps: u32,
+    tick_interval: Duration,
 }
 
 #[derive(Default)]
 struct FrameOutput {
     ready: bool,
     needs_cursor: bool,
+    fps: u32,
     frame_bytes: Vec<u8>,
     frame_content_type: &'static str,
     frame_id: u64,
@@ -154,8 +159,8 @@ fn main() {
             (Method::Get, "/meta") => {
                 let output = state.output.lock().unwrap();
                 let body = format!(
-                    "{{\"ready\":{},\"frame_id\":{},\"needs_cursor\":{}}}",
-                    output.ready, output.frame_id, output.needs_cursor
+                    "{{\"ready\":{},\"frame_id\":{},\"needs_cursor\":{},\"fps\":{}}}",
+                    output.ready, output.frame_id, output.needs_cursor, output.fps
                 );
                 let response = Response::from_string(body).with_header(
                     tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
@@ -178,22 +183,32 @@ fn main() {
 fn render_tick_loop(renderer: &Renderer, state: &SharedState) {
     let mut current: Option<LoadedProject> = None;
     let mut needs_render = false;
+    // Last cursor position we actually rendered with -- lets us skip a
+    // tick entirely (no GPU work, no encode, no output update) when
+    // nothing that could change the picture actually changed, e.g. an
+    // xray layer with a stationary cursor, or a gif sitting inside a
+    // multi-second inter-frame delay.
+    let mut last_rendered_cursor_uv: Option<(f32, f32)> = None;
+    let mut tick_interval = IDLE_TICK_INTERVAL;
 
     loop {
-        std::thread::sleep(TICK_INTERVAL);
+        std::thread::sleep(tick_interval);
 
         if let Some(project_dir) = state.pending_project.lock().unwrap().take() {
             match load_project(renderer, &project_dir) {
                 Ok(loaded) => {
                     eprintln!(
-                        "render-server: loaded project {:?} ({} layer(s), dynamic = {})",
+                        "render-server: loaded project {:?} ({} layer(s), dynamic = {}, fps target {:?})",
                         project_dir,
                         loaded.layers.len(),
-                        loaded.dynamic
+                        loaded.dynamic,
+                        loaded.tick_interval,
                     );
                     *state.cursor_uv.lock().unwrap() = None;
+                    tick_interval = loaded.tick_interval;
                     current = Some(loaded);
                     needs_render = true;
+                    last_rendered_cursor_uv = None;
                 }
                 Err(e) => {
                     eprintln!("render-server: failed to load project {project_dir:?}: {e}");
@@ -208,15 +223,26 @@ fn render_tick_loop(renderer: &Renderer, state: &SharedState) {
             continue;
         }
 
-        if project.dynamic {
-            advance_gif_frames(renderer, project, TICK_INTERVAL.as_millis() as u64);
-        }
+        let gif_changed = if project.dynamic {
+            advance_gif_frames(renderer, project, tick_interval.as_millis() as u64)
+        } else {
+            false
+        };
+
         let cursor_uv = *state.cursor_uv.lock().unwrap();
+        let cursor_changed = project.needs_cursor && cursor_uv != last_rendered_cursor_uv;
+
+        if !needs_render && !gif_changed && !cursor_changed {
+            continue;
+        }
+        last_rendered_cursor_uv = cursor_uv;
+
         let (frame_bytes, content_type) = compose_and_encode(renderer, project, cursor_uv);
 
         let mut output = state.output.lock().unwrap();
         output.ready = true;
         output.needs_cursor = project.needs_cursor;
+        output.fps = project.fps;
         output.frame_bytes = frame_bytes;
         output.frame_content_type = content_type;
         output.frame_id += 1;
@@ -226,7 +252,11 @@ fn render_tick_loop(renderer: &Renderer, state: &SharedState) {
     }
 }
 
-fn advance_gif_frames(renderer: &Renderer, project: &mut LoadedProject, elapsed_ms: u64) {
+/// Advances any gif layers by `elapsed_ms` and returns whether any of
+/// them actually landed on a new frame (as opposed to still being inside
+/// their current frame's delay).
+fn advance_gif_frames(renderer: &Renderer, project: &mut LoadedProject, elapsed_ms: u64) -> bool {
+    let mut any_changed = false;
     for layer in &mut project.layers {
         if let LoadedLayer::Gif {
             image,
@@ -246,9 +276,11 @@ fn advance_gif_frames(renderer: &Renderer, project: &mut LoadedProject, elapsed_
             }
             if changed {
                 renderer.update_image_layer(image, &frames[*current].rgba, *width, *height);
+                any_changed = true;
             }
         }
     }
+    any_changed
 }
 
 fn compose_and_encode(
@@ -364,6 +396,8 @@ fn load_project(renderer: &Renderer, project_dir: &Path) -> Result<LoadedProject
         .iter()
         .any(|l| matches!(l, Layer::Xray { .. }));
     let canvas = renderer.create_canvas(canvas_width, canvas_height);
+    let fps = project.fps.clamp(1, 60);
+    let tick_interval = Duration::from_millis(1000 / u64::from(fps));
 
     Ok(LoadedProject {
         layers: loaded_layers,
@@ -372,6 +406,8 @@ fn load_project(renderer: &Renderer, project_dir: &Path) -> Result<LoadedProject
         canvas_height,
         dynamic,
         needs_cursor,
+        fps,
+        tick_interval,
     })
 }
 

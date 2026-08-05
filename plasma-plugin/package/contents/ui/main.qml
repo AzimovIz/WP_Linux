@@ -47,6 +47,7 @@ WallpaperItem {
             property bool ready: false
             property bool needsCursor: false
             property real frameId: -1
+            property int fps: 30
 
             onFrameIdChanged: framePoll.refresh()
 
@@ -73,6 +74,9 @@ WallpaperItem {
                         ready = !!meta.ready;
                         needsCursor = !!meta.needs_cursor;
                         frameId = meta.frame_id;
+                        if (meta.fps) {
+                            fps = meta.fps;
+                        }
                     } catch (e) {
                         ready = false;
                     }
@@ -90,11 +94,12 @@ WallpaperItem {
             }
         }
 
-        // Fast enough to keep up with render-server's ~30fps cap for
-        // dynamic (gif/xray) projects -- static projects just bump
-        // frame_id once and this settles into a cheap no-op poll.
+        // Matches render-server's per-project target fps (configured in
+        // the editor) so it can keep up with frame_id changes -- static
+        // projects just bump frame_id once and this settles into a
+        // cheap no-op poll regardless of the interval.
         Timer {
-            interval: 33
+            interval: Math.max(8, Math.round(1000 / sceneMeta.fps))
             running: root.hasProject
             repeat: true
             triggeredOnStart: true

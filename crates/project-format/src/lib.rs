@@ -16,6 +16,15 @@ pub struct Project {
     /// Layers, bottom to top -- rendered in this order and alpha-blended
     /// on top of one another.
     pub layers: Vec<Layer>,
+    /// Target render rate for animated/cursor-reactive layers (xray,
+    /// gif). Irrelevant for a project made only of `Image` layers, which
+    /// always render exactly once regardless of this value.
+    #[serde(default = "default_fps")]
+    pub fps: u32,
+}
+
+fn default_fps() -> u32 {
+    30
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
