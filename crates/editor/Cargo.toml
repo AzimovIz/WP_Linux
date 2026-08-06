@@ -5,5 +5,6 @@ edition.workspace = true
 
 [dependencies]
 eframe = "0.35"
+player = { path = "../player" }
 project-format = { path = "../project-format" }
 rfd = "0.17"

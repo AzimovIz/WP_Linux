@@ -5,8 +5,8 @@ edition.workspace = true
 
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp"] }
+player = { path = "../player" }
 pollster = "0.4"
 project-format = { path = "../project-format" }
 tiny_http = "0.12"
-wgpu = "30"
 zbus = "5"

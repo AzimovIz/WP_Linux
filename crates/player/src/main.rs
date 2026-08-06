@@ -1,17 +1,44 @@
-//! Spike: does a wlr-layer-shell surface on the `background` layer actually
-//! render behind KDE Plasma's desktop icons, and can we get pointer input
-//! over the empty desktop? This is not the real player yet -- just enough
-//! to answer those two questions on a real KWin/Wayland session.
+//! Test prototype for the "render straight to the compositor" fix: loads
+//! one wallpaper project (path given on the command line) and draws its
+//! layers -- Image, Gif, Xray -- directly into a wlr-layer-shell surface
+//! via `wgpu::Surface::present()`. No CPU readback, no PNG/BMP encode, no
+//! HTTP, no Qt image decode -- unlike the render-server + plasma-plugin
+//! pipeline this exists to compare against.
 //!
-//! One layer surface per connected output, all sharing a single wgpu
-//! device. Each surface shows an animated gradient with a glow that
-//! follows the mouse, so both "does animation play" and "does input reach
-//! us" are visible at a glance.
+//! The actual compositing (pipelines, layer loading, gif timing, xray
+//! cursor handling) lives in this crate's own `lib.rs`, shared with
+//! render-server and editor -- see its module doc comment. This file is
+//! just the wlr-layer-shell/Wayland-specific glue: opening a surface per
+//! output, driving redraws off frame callbacks, and pointer input.
+//!
+//! Not wired into Plasma settings or autostart -- run by hand, pointed at
+//! a project directory containing a project.json (see project-format).
+//! One layer surface per connected output, all sharing a single
+//! `SceneRenderer`; the loaded layers (textures, bind groups) are created
+//! once and drawn on every output.
+//!
+//! Cursor-follow for Xray layers uses this process's own Wayland pointer
+//! input (surface-local coordinates from `wl_pointer`) rather than the
+//! D-Bus `CursorBridge` render-server relies on -- simpler for a
+//! throughput test, but it means the cursor appears to "stop" wherever
+//! something above this background layer (desktop icons, windows) steals
+//! pointer focus. Good enough to measure frame rate, not production
+//! cursor behavior.
+//!
+//! Also simplified versus render-server: layers are stretched to fill
+//! each output's surface with no aspect-ratio correction, and with
+//! multiple monitors every output shares the exact same cursor pixel
+//! coordinates for Xray (render-server already only ever drives one
+//! shared canvas for every screen, so this isn't a new limitation).
 
 use std::num::NonZeroU32;
+use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::time::Instant;
 
+use player::wgpu;
+use player::{LoadedLayer, SceneRenderer};
+use project_format::Project;
 use raw_window_handle::{
     RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
 };
@@ -39,35 +66,15 @@ use wayland_client::{
     Connection, Proxy, QueueHandle,
 };
 
-const SHADER: &str = include_str!("wallpaper.wgsl");
-
-#[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct Uniforms {
-    resolution: [f32; 2],
-    mouse: [f32; 2],
-    time: f32,
-    _pad: [f32; 3],
-}
+const SURFACE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
 
 struct OutputSurface {
     wl_output: wl_output::WlOutput,
     layer: LayerSurface,
     surface: wgpu::Surface<'static>,
-    uniform_buffer: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
     width: u32,
     height: u32,
-    mouse: (f32, f32),
     configured: bool,
-}
-
-struct Gpu {
-    adapter: wgpu::Adapter,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    pipeline: wgpu::RenderPipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
 }
 
 struct App {
@@ -79,15 +86,38 @@ struct App {
     layer_shell: LayerShell,
 
     instance: wgpu::Instance,
-    gpu: Option<Gpu>,
+    renderer: Option<SceneRenderer>,
     outputs: Vec<OutputSurface>,
     pointer: Option<wl_pointer::WlPointer>,
     start: Instant,
     exit: bool,
+
+    project: Project,
+    project_dir: PathBuf,
+    // Empty until the first output shows up and a SceneRenderer exists to
+    // build GPU-side resources on.
+    layers: Vec<LoadedLayer>,
+    // Surface-local pixel coordinates of the pointer, shared by every
+    // output (see module doc comment) -- pushed far off-canvas while the
+    // pointer isn't over any of our surfaces so Xray masks hide fully.
+    cursor: (f32, f32),
 }
 
 fn main() {
     env_logger::init();
+
+    let Some(requested_dir) = std::env::args_os().nth(1).map(PathBuf::from) else {
+        eprintln!("usage: player <project-dir>");
+        std::process::exit(1);
+    };
+    let (project, project_dir) = Project::load(&requested_dir).unwrap_or_else(|e| {
+        eprintln!("player: failed to load project {requested_dir:?}: {e}");
+        std::process::exit(1);
+    });
+    if project.layers.is_empty() {
+        eprintln!("player: project {project_dir:?} has no layers");
+        std::process::exit(1);
+    }
 
     let conn = Connection::connect_to_env().expect("failed to connect to Wayland compositor");
     let (globals, mut event_queue) = registry_queue_init(&conn).expect("failed to init registry");
@@ -110,11 +140,15 @@ fn main() {
         compositor,
         layer_shell,
         instance,
-        gpu: None,
+        renderer: None,
         outputs: Vec::new(),
         pointer: None,
         start: Instant::now(),
         exit: false,
+        project,
+        project_dir,
+        layers: Vec::new(),
+        cursor: (f32::MIN / 2.0, f32::MIN / 2.0),
     };
 
     // Populate OutputState and fire `new_output` for every already-present
@@ -125,7 +159,12 @@ fn main() {
         panic!("no outputs were reported by the compositor");
     }
 
-    log::info!("running on {} output(s)", app.outputs.len());
+    log::info!(
+        "running on {} output(s), {} layer(s) loaded from {:?}",
+        app.outputs.len(),
+        app.layers.len(),
+        app.project_dir
+    );
 
     while !app.exit {
         event_queue.blocking_dispatch(&mut app).unwrap();
@@ -139,7 +178,7 @@ impl App {
             qh,
             surface,
             Layer::Background,
-            Some("wpe-hello-triangle"),
+            Some("wplinux-player"),
             Some(&wl_output),
         );
         layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
@@ -164,42 +203,30 @@ impl App {
                 .expect("failed to create wgpu surface for output")
         };
 
-        if self.gpu.is_none() {
-            self.gpu = Some(pollster::block_on(Gpu::new(&self.instance, &wgpu_surface)));
+        if self.renderer.is_none() {
+            let renderer = pollster::block_on(SceneRenderer::new_with_surface(
+                &self.instance,
+                &wgpu_surface,
+                SURFACE_FORMAT,
+            ));
+            self.layers = renderer
+                .load_scene(&self.project_dir, &self.project)
+                .unwrap_or_else(|e| panic!("failed to load project layers: {e}"));
+            self.renderer = Some(renderer);
         }
-        let gpu = self.gpu.as_ref().unwrap();
-
-        let uniform_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("wallpaper-uniforms"),
-            size: std::mem::size_of::<Uniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("wallpaper-bind-group"),
-            layout: &gpu.bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
-        });
 
         self.outputs.push(OutputSurface {
             wl_output,
             layer,
             surface: wgpu_surface,
-            uniform_buffer,
-            bind_group,
             width: 0,
             height: 0,
-            mouse: (0.0, 0.0),
             configured: false,
         });
     }
 
     fn draw(&mut self, wl_surface: &wl_surface::WlSurface, qh: &QueueHandle<Self>) {
-        let Some(gpu) = &self.gpu else { return };
+        let Some(renderer) = &self.renderer else { return };
         let Some(out) = self
             .outputs
             .iter_mut()
@@ -211,14 +238,9 @@ impl App {
             return;
         }
 
-        let uniforms = Uniforms {
-            resolution: [out.width as f32, out.height as f32],
-            mouse: [out.mouse.0, out.mouse.1],
-            time: self.start.elapsed().as_secs_f32(),
-            _pad: [0.0; 3],
-        };
-        gpu.queue
-            .write_buffer(&out.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+        let elapsed_ms = self.start.elapsed().as_millis() as u64;
+        renderer.advance_gifs(&mut self.layers, elapsed_ms);
+        renderer.update_xray_cursors(&self.layers, self.cursor);
 
         let frame = match out.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(tex)
@@ -228,114 +250,15 @@ impl App {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("wallpaper-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&gpu.pipeline);
-            pass.set_bind_group(0, &out.bind_group, &[]);
-            pass.draw(0..3, 0..1);
-        }
+
+        renderer.render_to_texture(&view, &self.layers, wgpu::Color::BLACK);
 
         // Ask for the next frame before presenting this one.
         out.layer
             .wl_surface()
             .frame(qh, FrameCallbackData(out.layer.wl_surface().clone()));
 
-        gpu.queue.submit(Some(encoder.finish()));
-        gpu.queue.present(frame);
-    }
-}
-
-impl Gpu {
-    async fn new(instance: &wgpu::Instance, compatible_surface: &wgpu::Surface<'_>) -> Self {
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                compatible_surface: Some(compatible_surface),
-                ..Default::default()
-            })
-            .await
-            .expect("failed to find a suitable GPU adapter");
-
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
-            .await
-            .expect("failed to open device");
-
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("wallpaper-bind-group-layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("wallpaper-shader"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
-        });
-
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("wallpaper-pipeline-layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
-        });
-
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("wallpaper-pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Bgra8UnormSrgb,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        Self {
-            adapter,
-            device,
-            queue,
-            pipeline,
-            bind_group_layout,
-        }
+        frame.present();
     }
 }
 
@@ -430,7 +353,7 @@ impl LayerShellHandler for App {
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
-        let Some(gpu) = &self.gpu else { return };
+        let Some(renderer) = &self.renderer else { return };
         let Some(out) = self.outputs.iter_mut().find(|o| &o.layer == layer) else {
             return;
         };
@@ -441,13 +364,12 @@ impl LayerShellHandler for App {
             return;
         }
 
-        let caps = out.surface.get_capabilities(&gpu.adapter);
+        let caps = out.surface.get_capabilities(&renderer.adapter);
         out.surface.configure(
-            &gpu.device,
+            &renderer.device,
             &wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                format: wgpu::TextureFormat::Bgra8UnormSrgb,
-                color_space: wgpu::SurfaceColorSpace::Auto,
+                format: SURFACE_FORMAT,
                 width: out.width,
                 height: out.height,
                 present_mode: wgpu::PresentMode::Mailbox,
@@ -508,21 +430,14 @@ impl PointerHandler for App {
         events: &[PointerEvent],
     ) {
         for event in events {
-            let Some(out) = self
-                .outputs
-                .iter_mut()
-                .find(|o| o.layer.wl_surface() == &event.surface)
-            else {
-                continue;
-            };
             match event.kind {
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
-                    out.mouse = (event.position.0 as f32, event.position.1 as f32);
+                    self.cursor = (event.position.0 as f32, event.position.1 as f32);
                 }
                 PointerEventKind::Leave { .. } => {
-                    // Push the glow far off-canvas so it fades out instead of
+                    // Push the mask far off-canvas so it fades out instead of
                     // sticking to the last known position.
-                    out.mouse = (f32::MIN / 2.0, f32::MIN / 2.0);
+                    self.cursor = (f32::MIN / 2.0, f32::MIN / 2.0);
                 }
                 _ => {}
             }

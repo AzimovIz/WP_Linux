@@ -4,11 +4,12 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
-bytemuck = { version = "1", features = ["derive"] }
 env_logger = "0.11"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
 log = "0.4"
 pollster = "0.4"
+project-format = { path = "../project-format" }
 raw-window-handle = "0.6"
 smithay-client-toolkit = { version = "0.21", default-features = false, features = ["system"] }
 wayland-client = "0.31"
-wgpu = "30"
+wgpu = "29"

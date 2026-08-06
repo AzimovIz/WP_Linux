@@ -1,11 +1,36 @@
-//! Minimal wallpaper project editor: build a layer stack (picture,
-//! xray, gif animation), then save it as a project folder that
-//! render-server can load.
+//! Wallpaper project editor: build a layer stack (picture, xray, gif
+//! animation), see it composited live, then save it as a project folder
+//! that render-server can load.
+//!
+//! The preview on the left uses the exact same GPU compositor as
+//! render-server/player -- `player::SceneRenderer` -- drawn straight into
+//! a small offscreen texture registered directly with egui-wgpu's
+//! renderer (`register_native_texture`). No CPU readback: the preview
+//! panel just points egui at a texture this crate keeps drawing into, so
+//! what you see here is produced by the same pipelines/shaders
+//! render-server uses, not a separate reimplementation that could drift
+//! out of sync with what actually ships.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use player::wgpu;
+use player::{LoadedLayer, SceneRenderer};
+
+/// The offscreen texture itself stays modest -- it's an authoring aid,
+/// not a full-resolution look at the wallpaper (that's what running the
+/// real player/render-server is for), and keeping the render cheap
+/// matters more than sharpness here. The panel it's *displayed* in can
+/// still be as large as the user likes -- see `show_preview`, which
+/// stretches this texture to fill the available space rather than
+/// showing it at native size.
+const PREVIEW_MAX_WIDTH: u32 = 480;
 
 fn main() -> eframe::Result {
-    let native_options = eframe::NativeOptions::default();
+    let native_options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default().with_inner_size([1200.0, 600.0]),
+        ..Default::default()
+    };
     eframe::run_native(
         "WP Linux Editor",
         native_options,
@@ -45,10 +70,246 @@ impl EditorLayer {
     }
 }
 
+/// What a `Preview` was last built from -- resolved asset paths only, not
+/// radius (see `Preview::sync_radii`) or fps (gif timing is derived from
+/// each gif's own per-frame delays, never from the project's target fps --
+/// see project-format's `Project::fps` doc comment). Compared each frame
+/// so a rebuild (re-decoding images, re-uploading GPU textures) only
+/// happens on an actual structural change, not every frame of, say, a
+/// slider drag.
+#[derive(Clone, PartialEq, Eq)]
+enum LayerSignature {
+    Image(PathBuf),
+    Xray(PathBuf, PathBuf),
+    Gif(PathBuf),
+}
+
+/// Live GPU preview of the current layer stack.
+struct Preview {
+    renderer: SceneRenderer,
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    texture_id: eframe::egui::TextureId,
+    width: u32,
+    height: u32,
+    layers: Vec<LoadedLayer>,
+    loaded_at: Instant,
+    signature: Option<Vec<LayerSignature>>,
+}
+
+impl Preview {
+    fn new(render_state: &eframe::egui_wgpu::RenderState) -> Self {
+        let renderer = SceneRenderer::from_existing(
+            render_state.device.clone(),
+            render_state.queue.clone(),
+            render_state.adapter.clone(),
+            player::OFFSCREEN_FORMAT,
+        );
+        let (width, height) = (PREVIEW_MAX_WIDTH, PREVIEW_MAX_WIDTH * 9 / 16);
+        let (texture, view) = create_preview_texture(&renderer, width, height);
+        let texture_id = render_state.renderer.write().register_native_texture(
+            &renderer.device,
+            &view,
+            wgpu::FilterMode::Linear,
+        );
+        Self {
+            renderer,
+            texture,
+            view,
+            texture_id,
+            width,
+            height,
+            layers: Vec::new(),
+            loaded_at: Instant::now(),
+            signature: None,
+        }
+    }
+
+    /// Reloads the GPU scene if `editor_layers` changed since the last
+    /// call (see `LayerSignature`). Resizes (and re-points the already
+    /// registered `texture_id` at) the preview texture if the new scene's
+    /// canvas aspect ratio differs from the current one.
+    fn ensure_scene(
+        &mut self,
+        render_state: &eframe::egui_wgpu::RenderState,
+        editor_layers: &[EditorLayer],
+    ) -> Result<(), String> {
+        let Some(project) = build_preview_project(editor_layers) else {
+            self.layers.clear();
+            self.signature = None;
+            return Ok(());
+        };
+        let signature = build_signature(editor_layers);
+        if self.signature.as_ref() == Some(&signature) {
+            return Ok(());
+        }
+
+        let layers = self.renderer.load_scene(Path::new(""), &project)?;
+        let (natural_width, natural_height) =
+            layers.first().map(LoadedLayer::size).unwrap_or((16, 9));
+        let (width, height) = preview_size(natural_width, natural_height);
+        if width != self.width || height != self.height {
+            let (texture, view) = create_preview_texture(&self.renderer, width, height);
+            render_state.renderer.write().update_egui_texture_from_wgpu_texture(
+                &self.renderer.device,
+                &view,
+                wgpu::FilterMode::Linear,
+                self.texture_id,
+            );
+            self.texture = texture;
+            self.view = view;
+            self.width = width;
+            self.height = height;
+        }
+
+        self.layers = layers;
+        self.loaded_at = Instant::now();
+        self.signature = Some(signature);
+        Ok(())
+    }
+
+    /// Applies each Xray layer's *current* (possibly still-being-dragged)
+    /// radius, scaled down to this preview's resolution -- radii in
+    /// project.json are tuned against the layer's native resolution, so
+    /// using them unscaled against a much smaller preview canvas would
+    /// draw a wildly oversized mask.
+    fn sync_radii(&mut self, editor_layers: &[EditorLayer]) {
+        if self.layers.is_empty() {
+            return;
+        }
+        let (natural_width, _) = self.layers.first().map(LoadedLayer::size).unwrap_or((1, 1));
+        let scale = self.width as f32 / natural_width.max(1) as f32;
+        for (loaded, editor_layer) in self.layers.iter_mut().zip(editor_layers) {
+            if let EditorLayer::Xray { radius, .. } = editor_layer {
+                loaded.set_xray_radius(*radius * scale);
+            }
+        }
+    }
+
+    /// Advances gif frames, updates the xray cursor, and redraws into the
+    /// preview texture. `cursor_local` is in preview-texture pixel
+    /// coordinates (i.e. already scaled -- see the caller). Returns
+    /// whether the scene has any layer that needs continuous repainting.
+    fn redraw(&mut self, cursor_local: Option<(f32, f32)>) -> bool {
+        let elapsed_ms = self.loaded_at.elapsed().as_millis() as u64;
+        self.renderer.advance_gifs(&mut self.layers, elapsed_ms);
+        let cursor_px = cursor_local.unwrap_or((-1.0e6, -1.0e6));
+        self.renderer.update_xray_cursors(&self.layers, cursor_px);
+        self.renderer.render_to_texture(&self.view, &self.layers, wgpu::Color::TRANSPARENT);
+
+        self.layers
+            .iter()
+            .any(|l| matches!(l, LoadedLayer::Gif { .. } | LoadedLayer::Xray(_)))
+    }
+}
+
+fn create_preview_texture(renderer: &SceneRenderer, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("editor-preview"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: player::OFFSCREEN_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+/// Caps width at `PREVIEW_MAX_WIDTH` (and at the source's own resolution,
+/// no point upscaling a preview past native size) and derives height to
+/// preserve aspect ratio.
+fn preview_size(natural_width: u32, natural_height: u32) -> (u32, u32) {
+    if natural_width == 0 || natural_height == 0 {
+        return (PREVIEW_MAX_WIDTH, PREVIEW_MAX_WIDTH * 9 / 16);
+    }
+    let width = PREVIEW_MAX_WIDTH.min(natural_width).max(1);
+    let height = ((width as u64 * natural_height as u64) / natural_width as u64).max(1) as u32;
+    (width, height)
+}
+
+/// `None` if there's nothing sensible to preview yet (no layers, or one
+/// still missing a file) -- mirrors the same completeness check that
+/// gates the "Save project as..." button.
+fn build_preview_project(layers: &[EditorLayer]) -> Option<project_format::Project> {
+    if layers.is_empty() || !layers.iter().all(EditorLayer::is_complete) {
+        return None;
+    }
+    let converted = layers
+        .iter()
+        .map(|layer| match layer {
+            // Paths here are absolute (straight from the file picker, no
+            // project directory exists until the project is saved) --
+            // `SceneRenderer::load_scene` joins them onto a base
+            // directory, and `Path::join` with an absolute right-hand
+            // side just returns that absolute path unchanged, so passing
+            // `Path::new("")` as the base works out.
+            EditorLayer::Image { path } => project_format::Layer::Image {
+                path: path.as_ref().expect("checked complete above").display().to_string(),
+            },
+            EditorLayer::Xray { base, overlay, radius } => project_format::Layer::Xray {
+                base: base.as_ref().expect("checked complete above").display().to_string(),
+                overlay: overlay
+                    .as_ref()
+                    .expect("checked complete above")
+                    .display()
+                    .to_string(),
+                radius: *radius,
+            },
+            EditorLayer::Gif { path } => project_format::Layer::Gif {
+                path: path.as_ref().expect("checked complete above").display().to_string(),
+            },
+        })
+        .collect();
+    Some(project_format::Project {
+        layers: converted,
+        // Irrelevant to the preview itself (see `PREVIEW_REPAINT_INTERVAL`)
+        // -- this `Project` only exists to hand to `load_scene`, which
+        // never reads `fps` at all, so any value would do.
+        fps: 30,
+    })
+}
+
+fn build_signature(layers: &[EditorLayer]) -> Vec<LayerSignature> {
+    layers
+        .iter()
+        .map(|layer| match layer {
+            EditorLayer::Image { path } => {
+                LayerSignature::Image(path.clone().expect("checked complete by caller"))
+            }
+            EditorLayer::Xray { base, overlay, .. } => LayerSignature::Xray(
+                base.clone().expect("checked complete by caller"),
+                overlay.clone().expect("checked complete by caller"),
+            ),
+            EditorLayer::Gif { path } => {
+                LayerSignature::Gif(path.clone().expect("checked complete by caller"))
+            }
+        })
+        .collect()
+}
+
+/// How often the *editor's own preview* redraws itself -- fixed,
+/// independent of the project's `fps` field (the slider below, saved
+/// into project.json and used by render-server to throttle its own
+/// re-rendering; see `Project::fps`'s doc comment). The two are
+/// unrelated: gif timing comes from each gif's own per-frame delays and
+/// xray reacts to real cursor input, so nothing about how the preview
+/// actually looks depends on the project's configured fps -- dragging
+/// that slider has no effect on preview smoothness, by design.
+const PREVIEW_REPAINT_INTERVAL: Duration = Duration::from_millis(1000 / 30);
+
 struct EditorApp {
     layers: Vec<EditorLayer>,
     fps: u32,
     status: String,
+    preview: Option<Preview>,
+    preview_error: Option<String>,
 }
 
 impl Default for EditorApp {
@@ -57,12 +318,24 @@ impl Default for EditorApp {
             layers: Vec::new(),
             fps: 30,
             status: String::new(),
+            preview: None,
+            preview_error: None,
         }
     }
 }
 
 impl eframe::App for EditorApp {
-    fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut eframe::egui::Ui, frame: &mut eframe::Frame) {
+        let render_state = frame.wgpu_render_state().cloned();
+
+        eframe::egui::Panel::left("preview_panel")
+            .resizable(true)
+            .default_size(760.0)
+            .size_range(320.0..=980.0)
+            .show(ui, |ui| {
+                self.show_preview(ui, render_state.as_ref());
+            });
+
         eframe::egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("New wallpaper project");
             ui.label("Layers are drawn bottom to top -- the first one in the list is furthest back.");
@@ -88,7 +361,8 @@ impl eframe::App for EditorApp {
             ui.add_space(8.0);
 
             ui.horizontal(|ui| {
-                ui.label("Target FPS (animated/cursor layers only):");
+                ui.label("Target FPS (animated/cursor layers only):")
+                    .on_hover_text("Used by render-server once this project is loaded there -- doesn't affect the preview on the left, which always redraws at a fixed rate.");
                 ui.add(eframe::egui::Slider::new(&mut self.fps, 1..=60));
             });
 
@@ -118,6 +392,12 @@ impl eframe::App for EditorApp {
 
             for (index, layer) in self.layers.iter_mut().enumerate() {
                 ui.group(|ui| {
+                    // Match the group to whatever width the (resizable)
+                    // panel actually has instead of sizing to content --
+                    // otherwise a group can only ever grow to fit its
+                    // widest child and never shrinks back down when the
+                    // window is narrowed.
+                    ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
                         ui.strong(format!("#{} {}", index + 1, layer.label()));
                         if ui.small_button("up").clicked() {
@@ -198,17 +478,91 @@ impl eframe::App for EditorApp {
     }
 }
 
+impl EditorApp {
+    fn show_preview(&mut self, ui: &mut eframe::egui::Ui, render_state: Option<&eframe::egui_wgpu::RenderState>) {
+        ui.heading("Preview");
+        ui.add_space(4.0);
+
+        let Some(render_state) = render_state else {
+            ui.label("GPU preview unavailable (eframe isn't running on wgpu).");
+            return;
+        };
+
+        let preview = self.preview.get_or_insert_with(|| Preview::new(render_state));
+
+        match preview.ensure_scene(render_state, &self.layers) {
+            Ok(()) => self.preview_error = None,
+            Err(e) => self.preview_error = Some(e),
+        }
+
+        if preview.layers.is_empty() {
+            ui.label("Add layers with files set to see a preview.");
+        } else {
+            preview.sync_radii(&self.layers);
+
+            // Fit the texture into whatever space the (resizable) panel
+            // gives us, preserving aspect ratio -- the texture itself
+            // stays small and cheap to render (see `PREVIEW_MAX_WIDTH`),
+            // the GPU just upscales it for display like any other image.
+            let available = ui.available_size();
+            let aspect = preview.width as f32 / preview.height as f32;
+            let display_size = if available.x / aspect <= available.y {
+                eframe::egui::vec2(available.x, available.x / aspect)
+            } else {
+                eframe::egui::vec2(available.y * aspect, available.y)
+            };
+            let response = ui.add(eframe::egui::Image::from_texture((preview.texture_id, display_size)));
+
+            // Displayed size and actual texture size differ (the image is
+            // stretched to fill the panel), so a hover position in screen
+            // space needs rescaling back down to texture pixel space --
+            // that's the coordinate system the xray shader's cursor
+            // uniform and `sync_radii`'s scaling both operate in.
+            let cursor_local = response.hover_pos().map(|pos| {
+                let local = pos - response.rect.min;
+                let scale_x = preview.width as f32 / response.rect.width().max(1.0);
+                let scale_y = preview.height as f32 / response.rect.height().max(1.0);
+                (local.x * scale_x, local.y * scale_y)
+            });
+
+            let has_dynamic = preview.redraw(cursor_local);
+            if has_dynamic {
+                ui.ctx().request_repaint_after(PREVIEW_REPAINT_INTERVAL);
+            }
+        }
+
+        if let Some(err) = &self.preview_error {
+            ui.add_space(4.0);
+            ui.colored_label(eframe::egui::Color32::RED, err);
+        }
+    }
+}
+
+/// Shows `label`, a Browse button, and the chosen file's name -- full
+/// absolute paths (what's actually stored) can easily run past 500px and
+/// are why layer rows used to force the whole window wider than it
+/// should be. The button is placed before the path text specifically so
+/// the path's `.truncate()` sees accurate remaining space (it eats
+/// whatever's left in the row instead of its own unbounded natural
+/// width) and elides with "..." instead of pushing the row wider; the
+/// full path is still available as a tooltip on hover.
 fn path_picker(ui: &mut eframe::egui::Ui, label: &str, path: &mut Option<PathBuf>, filter: &[&str]) {
     ui.horizontal(|ui| {
         ui.label(label);
-        match path {
-            Some(p) => ui.label(p.display().to_string()),
-            None => ui.label("not set"),
-        };
         if ui.button("Browse...").clicked() {
             if let Some(chosen) = rfd::FileDialog::new().add_filter("Files", filter).pick_file() {
                 *path = Some(chosen);
             }
+        }
+        let name = path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| "not set".to_string());
+        let response = ui.add(eframe::egui::Label::new(name).truncate());
+        if let Some(p) = path {
+            response.on_hover_text(p.display().to_string());
         }
     });
 }
