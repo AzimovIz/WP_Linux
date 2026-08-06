@@ -9,8 +9,6 @@ GPU-accelerated editor, then run it as your desktop wallpaper.
 
 Early stage, single-platform: **KDE Plasma 6 + KWin/Wayland only**. Nothing
 else (X11, GNOME, other compositors) is supported or planned right now.
-`render-server` has no autostart integration yet -- it's started by hand for
-the time being.
 
 ## Features
 
@@ -41,8 +39,9 @@ the time being.
 | `crates/player` | Shared GPU compositor library (`SceneRenderer`) used by everything below, plus its own standalone Wayland/layer-shell test binary. |
 | `crates/render-server` | The actual runtime renderer: a headless wgpu process that serves composited frames to the Plasma plugin over local HTTP, receives the cursor position over D-Bus, and watches the power profile. |
 | `crates/editor` | Desktop app (egui) for building and editing wallpaper projects, with the live preview. |
-| `plasma-plugin/` | The Plasma "Wallpaper" plugin you pick in System Settings; talks to `render-server`. |
-| `kwin-script/` | KWin script forwarding the true global cursor position to `render-server` over D-Bus. |
+| `plasma/plasma-plugin` | The Plasma "Wallpaper" plugin you pick in System Settings; talks to `render-server`. |
+| `plasma/kwin-script` | KWin script forwarding the true global cursor position to `render-server` over D-Bus. |
+| `systemd/` | User-service unit that keeps `render-server` running in the background. |
 
 ## Requirements
 
@@ -55,31 +54,35 @@ the time being.
 
 ## Installation
 
-### Option A: prebuilt release
+### Option A: install script (any distro)
 
-Grab the latest release from
-[Releases](https://github.com/AzimovIz/WP_Linux/releases):
-`render-server`, `player`, `editor`, `wp-linux-plasma-plugin.zip`,
-`wp-linux-kwin-script.zip`.
-
-```sh
-chmod +x render-server player editor
-```
-
-Install the two KDE packages:
+Downloads the latest release archive and sets everything up under
+`$HOME` -- binaries in `~/.local/bin`, the two KDE packages via
+`kpackagetool6`, the KWin script enabled, and `render-server` installed
+as a `systemd --user` service (`~/.config/systemd/user/`) so it starts
+automatically with your graphical session.
 
 ```sh
-kpackagetool6 --type=Plasma/Wallpaper --install wp-linux-plasma-plugin.zip
-kpackagetool6 --type=KWin/Script --install wp-linux-kwin-script.zip
+curl -fsSL https://github.com/AzimovIz/WP_Linux/releases/latest/download/install.sh | bash
 ```
 
-Then enable the script in **System Settings -> Window Management -> KWin
-Scripts** (tick "WP Linux Cursor Bridge"). `render-server` also tries to
-load it automatically on startup, but that only works when it's run
-straight from a source checkout -- for a downloaded release binary this
-manual step is required for Xray layers to react to the cursor.
+To remove everything it installed later:
 
-### Option B: build from source
+```sh
+curl -fsSL https://github.com/AzimovIz/WP_Linux/releases/latest/download/uninstall.sh | bash
+```
+
+(Your saved wallpaper projects aren't touched by either script.)
+
+### Option B: Arch Linux / AUR
+
+`packaging/archlinux/PKGBUILD` packages the same release archive for a
+system-wide `pacman` install (binaries in `/usr/bin`, KDE packages under
+`/usr/share`). After installing, finish the per-user setup steps printed
+by the package (enabling the KWin script and the `render-server` user
+service) -- these can't happen automatically from a root install step.
+
+### Option C: build from source
 
 ```sh
 git clone https://github.com/AzimovIz/WP_Linux.git
@@ -87,12 +90,12 @@ cd WP_Linux
 cargo build --release --workspace
 ```
 
-Binaries land in `target/release/`. Install the KDE packages the same way
-as above, pointing at the directories directly:
+Binaries land in `target/release/`. Install the KDE packages by pointing
+`kpackagetool6` at the directories directly:
 
 ```sh
-kpackagetool6 --type=Plasma/Wallpaper --install plasma-plugin/package
-kpackagetool6 --type=KWin/Script --install kwin-script/package
+kpackagetool6 --type=Plasma/Wallpaper --install plasma/plasma-plugin/package
+kpackagetool6 --type=KWin/Script --install plasma/kwin-script/package
 ```
 
 (Run from a source checkout, `render-server` can also auto-load the KWin
@@ -103,14 +106,14 @@ more robust option either way.)
 
 1. Run `editor`, build a layer stack (Image / Gif / Xray), and save it as a
    project folder.
-2. Run `render-server` (from a terminal -- no autostart yet).
+2. Make sure `render-server` is running (the install script sets it up as
+   a background service; from a source build, run it by hand).
 3. Right-click the desktop -> **Configure Desktop and Wallpaper** (or
    **System Settings -> Appearance -> Wallpaper**), choose **WP Linux
    Wallpaper**, then point it at the project folder you saved.
 
 ## Known limitations
 
-- No autostart for `render-server` yet -- start it by hand each session.
 - One shared canvas and cursor position across every monitor -- the same
   wallpaper renders identically on all screens.
 - `player`'s standalone Wayland renderer stretches layers to fill the

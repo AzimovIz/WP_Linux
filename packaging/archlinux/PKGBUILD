@@ -1,0 +1,39 @@
+# Maintainer: AzimovIz
+#
+# Packages the prebuilt release archive rather than building from source
+# -- bump pkgver to a release tag (YYYY.MM.DD), then run `updpkgsums` to
+# fill in sha256sums before uploading to the AUR.
+pkgname=wp-linux
+pkgver=2026.08.06
+pkgrel=1
+pkgdesc="Animated, interactive wallpaper engine for KDE Plasma 6 on Wayland"
+arch=('x86_64')
+url="https://github.com/AzimovIz/WP_Linux"
+license=('MIT')
+depends=('plasma-workspace' 'kwin')
+optdepends=('power-profiles-daemon: pause rendering automatically in power-saver mode')
+install="${pkgname}.install"
+source=("https://github.com/AzimovIz/WP_Linux/releases/download/${pkgver}/wp-linux-linux-x86_64.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+    cd "${srcdir}/wp-linux"
+
+    install -Dm755 bin/render-server "${pkgdir}/usr/bin/render-server"
+    install -Dm755 bin/player "${pkgdir}/usr/bin/player"
+    install -Dm755 bin/editor "${pkgdir}/usr/bin/editor"
+
+    # Plasma/KWin auto-discover packages under these system share dirs --
+    # no kpackagetool6 install step needed at package-install time.
+    install -d "${pkgdir}/usr/share/plasma/wallpapers/dev.wplinux.wallpaper"
+    cp -r plasma/plasma-plugin/package/. "${pkgdir}/usr/share/plasma/wallpapers/dev.wplinux.wallpaper/"
+
+    install -d "${pkgdir}/usr/share/kwin/scripts/dev.wplinux.cursorbridge"
+    cp -r plasma/kwin-script/package/. "${pkgdir}/usr/share/kwin/scripts/dev.wplinux.cursorbridge/"
+
+    # The shipped unit targets ~/.local/bin (matches install.sh); this
+    # package puts the binaries in /usr/bin instead, so repoint it.
+    install -Dm644 systemd/render-server.service "${pkgdir}/usr/lib/systemd/user/render-server.service"
+    sed -i 's|%h/.local/bin/render-server|/usr/bin/render-server|' \
+        "${pkgdir}/usr/lib/systemd/user/render-server.service"
+}

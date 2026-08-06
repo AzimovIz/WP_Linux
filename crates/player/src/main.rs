@@ -2,7 +2,7 @@
 //! one wallpaper project (path given on the command line) and draws its
 //! layers -- Image, Gif, Xray -- directly into a wlr-layer-shell surface
 //! via `wgpu::Surface::present()`. No CPU readback, no PNG/BMP encode, no
-//! HTTP, no Qt image decode -- unlike the render-server + plasma-plugin
+//! HTTP, no Qt image decode -- unlike the render-server + plasma/plasma-plugin
 //! pipeline this exists to compare against.
 //!
 //! The actual compositing (pipelines, layer loading, gif timing, xray

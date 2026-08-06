@@ -42,30 +42,23 @@ jobs:
             echo "tag=$(date -u +%Y.%m.%d)" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Stage binaries
+      # Single archive, laid out the way install.sh/PKGBUILD expect:
+      #   bin/{render-server,player,editor}
+      #   plasma/{plasma-plugin,kwin-script}/package  (kpackagetool6-ready)
+      #   systemd/render-server.service
+      # tar, not zip, so the executable bit on bin/* survives extraction.
+      # Fixed filename (no tag in it) so install.sh can pull it via
+      # GitHub's stable releases/latest/download/<name> URL without
+      # calling the API to resolve the current tag.
+      - name: Stage release archive
         run: |
-          mkdir -p dist
-          cp target/release/render-server dist/
-          cp target/release/player dist/
-          cp target/release/editor dist/
-
-      # kpackagetool6 installs straight from a zip -- metadata.json must
-      # sit at the zip root, not inside a nested "package/" folder, which
-      # is what zipping from *inside* package/ (rather than the dir
-      # itself) gets you.
-      - name: Package Plasma wallpaper plugin
-        working-directory: plasma-plugin/package
-        run: zip -r "$GITHUB_WORKSPACE/dist/wp-linux-plasma-plugin.zip" .
-
-      # render-server tries to auto-load this from a path baked in at
-      # *build* time (CARGO_MANIFEST_DIR of wherever it was compiled --
-      # this CI checkout, not wherever the user unpacks the release), so
-      # for anyone running the released binary rather than building from
-      # source that auto-load will always miss and this needs installing
-      # by hand via kpackagetool6. Bundled for exactly that reason.
-      - name: Package KWin cursor-bridge script
-        working-directory: kwin-script/package
-        run: zip -r "$GITHUB_WORKSPACE/dist/wp-linux-kwin-script.zip" .
+          set -eu
+          root=dist/wp-linux
+          mkdir -p "$root/bin"
+          cp target/release/render-server target/release/player target/release/editor "$root/bin/"
+          cp -r plasma "$root/plasma"
+          cp -r systemd "$root/systemd"
+          tar czf dist/wp-linux-linux-x86_64.tar.gz -C dist wp-linux
 
       - name: Create release
         uses: softprops/action-gh-release@v2
@@ -73,8 +66,6 @@ jobs:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: ${{ steps.tag.outputs.tag }}
           files: |
-            dist/render-server
-            dist/player
-            dist/editor
-            dist/wp-linux-plasma-plugin.zip
-            dist/wp-linux-kwin-script.zip
+            dist/wp-linux-linux-x86_64.tar.gz
+            install.sh
+            uninstall.sh

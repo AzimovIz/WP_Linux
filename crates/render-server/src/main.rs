@@ -14,7 +14,7 @@
 //! registers the `dev.wplinux.CursorBridge` D-Bus service (formerly a
 //! separate `cursor-bridge` binary) that a companion KWin script feeds
 //! with the true, compositor-level pointer position -- see
-//! kwin-script/package. Folding it in here means one less process to
+//! plasma/kwin-script/package. Folding it in here means one less process to
 //! start by hand, and lets the render loop react to cursor movement
 //! without an HTTP round-trip through QML at all.
 //!
@@ -131,7 +131,7 @@ struct SharedState {
 }
 
 /// D-Bus object backing `dev.wplinux.CursorBridge` -- the KWin script
-/// (kwin-script/package) calls `SetCursorPosition` on this every time
+/// (plasma/kwin-script/package) calls `SetCursorPosition` on this every time
 /// `workspace.cursorPosChanged` fires.
 struct CursorDbusService {
     state: Arc<SharedState>,
@@ -239,7 +239,7 @@ fn ensure_kwin_cursor_script_loaded() {
     const PLUGIN_NAME: &str = "dev.wplinux.cursorbridge";
     const SCRIPT_PATH: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../kwin-script/package/contents/code/main.js"
+        "/../../plasma/kwin-script/package/contents/code/main.js"
     );
 
     if !std::path::Path::new(SCRIPT_PATH).exists() {
@@ -289,7 +289,7 @@ fn ensure_kwin_cursor_script_loaded() {
         Ok(false) => eprintln!("render-server: kwin cursor script already loaded"),
         Err(e) => eprintln!(
             "render-server: could not auto-load kwin cursor script ({e}) -- \
-             install it by hand: kpackagetool6 --type=KWin/Script --install kwin-script/package"
+             install it by hand: kpackagetool6 --type=KWin/Script --install plasma/kwin-script/package"
         ),
     }
 }
