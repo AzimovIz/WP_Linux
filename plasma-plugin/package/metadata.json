@@ -7,11 +7,12 @@
             }
         ],
         "Category": "",
-        "Description": "Spike: does a Plasma wallpaper plugin keep desktop icons on top?",
+        "Description": "Displays an animated or cursor-reactive wallpaper project (built with the WP Linux editor) rendered by render-server, behind desktop icons.",
         "Icon": "preferences-desktop-wallpaper",
-        "Id": "dev.wplinux.hellowallpaper",
+        "Id": "dev.wplinux.wallpaper",
         "License": "MIT",
-        "Name": "WP Linux Hello"
+        "Name": "WP Linux Wallpaper",
+        "Version": "0.1.0"
     },
     "Keywords": [
         "wallpaper"

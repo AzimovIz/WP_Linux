@@ -9,3 +9,6 @@ members = [
 
 [workspace.package]
 edition = "2024"
+
+[profile.release]
+strip = true

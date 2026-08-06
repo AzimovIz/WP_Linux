@@ -2,6 +2,7 @@
 name = "project-format"
 version = "0.1.0"
 edition.workspace = true
+publish = false
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

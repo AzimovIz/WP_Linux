@@ -1,0 +1,80 @@
+name: Release
+
+# Manual only -- no push/schedule trigger. Tag defaults to today's date
+# (YYYY.MM.DD); override via the "tag" input if you need to build more
+# than once in a day or re-cut a specific date.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (default: today's date, YYYY.MM.DD)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo/target
+        uses: Swatinem/rust-cache@v2
+
+      # Everything Wayland/Vulkan/D-Bus-related is dlopen'd at runtime,
+      # not linked at build time (see `ldd` on any built binary) -- no
+      # apt packages needed here, just the Rust toolchain.
+      - name: Build release binaries
+        run: cargo build --release --workspace
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=$(date -u +%Y.%m.%d)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Stage binaries
+        run: |
+          mkdir -p dist
+          cp target/release/render-server dist/
+          cp target/release/player dist/
+          cp target/release/editor dist/
+
+      # kpackagetool6 installs straight from a zip -- metadata.json must
+      # sit at the zip root, not inside a nested "package/" folder, which
+      # is what zipping from *inside* package/ (rather than the dir
+      # itself) gets you.
+      - name: Package Plasma wallpaper plugin
+        working-directory: plasma-plugin/package
+        run: zip -r "$GITHUB_WORKSPACE/dist/wp-linux-plasma-plugin.zip" .
+
+      # render-server tries to auto-load this from a path baked in at
+      # *build* time (CARGO_MANIFEST_DIR of wherever it was compiled --
+      # this CI checkout, not wherever the user unpacks the release), so
+      # for anyone running the released binary rather than building from
+      # source that auto-load will always miss and this needs installing
+      # by hand via kpackagetool6. Bundled for exactly that reason.
+      - name: Package KWin cursor-bridge script
+        working-directory: kwin-script/package
+        run: zip -r "$GITHUB_WORKSPACE/dist/wp-linux-kwin-script.zip" .
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          files: |
+            dist/render-server
+            dist/player
+            dist/editor
+            dist/wp-linux-plasma-plugin.zip
+            dist/wp-linux-kwin-script.zip
