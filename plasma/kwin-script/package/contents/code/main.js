@@ -11,6 +11,20 @@ let lastSent = 0;
 let callCount = 0;
 const MIN_INTERVAL_MS = 8; // light throttle, ~120Hz cap
 
+// Reused across every call instead of a fresh closure per cursor move
+// (this fires up to ~120Hz): if cursor-bridge is down and replies never
+// arrive, a per-call closure would mean a new function object pinned
+// alive by each still-pending call, piling up for as long as the service
+// stays unreachable. One shared function has no such per-call cost.
+function onCursorBridgeReply(...args) {
+    // zbus methods with no return value reply with zero arguments; if
+    // this never fires at all, the call itself is failing (wrong bus
+    // name/path/interface, or the service isn't running).
+    if (callCount % 30 === 0) {
+        print("wplinux cursorbridge: callDBus reply " + JSON.stringify(args));
+    }
+}
+
 function sendCursorPosition() {
     const now = Date.now();
     if (now - lastSent < MIN_INTERVAL_MS) {
@@ -34,15 +48,7 @@ function sendCursorPosition() {
             "SetCursorPosition",
             pos.x,
             pos.y,
-            function (...args) {
-                // zbus methods with no return value reply with zero
-                // arguments; if this never fires at all, the call itself
-                // is failing (wrong bus name/path/interface, or the
-                // service isn't running).
-                if (callCount % 30 === 0) {
-                    print("wplinux cursorbridge: callDBus reply " + JSON.stringify(args));
-                }
-            }
+            onCursorBridgeReply
         );
     } catch (e) {
         print("wplinux cursorbridge: callDBus threw: " + e);

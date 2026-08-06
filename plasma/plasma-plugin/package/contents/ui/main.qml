@@ -82,8 +82,22 @@ WallpaperItem {
             property bool needsCursor: false
             property real frameId: -1
             property int fps: 30
+            property var activeXhr: null
 
             onFrameIdChanged: framePoll.refresh()
+
+            // Aborts a still-in-flight /meta request rather than letting it
+            // finish on its own time: if this item is torn down mid-request
+            // (screen reconfig, wallpaper type switched away), the response
+            // would otherwise arrive later and run its callback against a
+            // scope whose properties are gone, keeping the underlying
+            // network reply alive for no reason in the meantime.
+            Component.onDestruction: {
+                if (activeXhr) {
+                    activeXhr.abort();
+                    activeXhr = null;
+                }
+            }
 
             function poll() {
                 if (requestInFlight) {
@@ -92,11 +106,13 @@ WallpaperItem {
                 requestInFlight = true;
 
                 const xhr = new XMLHttpRequest();
+                activeXhr = xhr;
                 xhr.onreadystatechange = function () {
                     if (xhr.readyState !== XMLHttpRequest.DONE) {
                         return;
                     }
                     requestInFlight = false;
+                    activeXhr = null;
 
                     if (xhr.status !== 200) {
                         ready = false;
@@ -167,17 +183,35 @@ WallpaperItem {
             property string urlA: ""
             property string urlB: ""
 
+            // Guards against piling up frame requests faster than they can
+            // be fetched+decoded. Without this, a frame_id that bumps
+            // faster than the HTTP GET + decode of the previous frame
+            // completes (easy at fps 30 with a full-size frame) kept
+            // overwriting the target Image's source mid-load, forcing Qt's
+            // pixmap loader to abort-and-restart on every single tick --
+            // under sustained load that churn backs up inside plasmashell's
+            // native pixmap loader queue and is only ever reclaimed by
+            // killing the process. Dropping a refresh when the target
+            // buffer is still mid-load just means the next poll tick offers
+            // the (by-then-newer) frame again -- nothing is lost but a
+            // couple of stale intermediate frames.
             function refresh() {
-                const url = "http://127.0.0.1:47824/frame?t=" + Date.now();
                 if (activeBuffer === 0) {
-                    urlB = url;
+                    if (imgB.status === Image.Loading) {
+                        return;
+                    }
+                    urlB = "http://127.0.0.1:47824/frame?t=" + Date.now();
                 } else {
-                    urlA = url;
+                    if (imgA.status === Image.Loading) {
+                        return;
+                    }
+                    urlA = "http://127.0.0.1:47824/frame?t=" + Date.now();
                 }
             }
         }
 
         Image {
+            id: imgA
             anchors.fill: parent
             fillMode: Image.PreserveAspectCrop
             asynchronous: true
@@ -192,6 +226,7 @@ WallpaperItem {
         }
 
         Image {
+            id: imgB
             anchors.fill: parent
             fillMode: Image.PreserveAspectCrop
             asynchronous: true
