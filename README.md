@@ -1,9 +1,35 @@
 # WP Linux
 
+<p align="center">
+  <img src="assets/wp_linux_logo.svg" alt="WP Linux logo" width="140">
+</p>
+
 An animated, interactive wallpaper engine for Linux -- a Wallpaper Engine-style
 alternative for **KDE Plasma 6 on Wayland (KWin)**. Build a layer stack
-(static pictures, looping GIFs, cursor-reactive "xray" overlays) in a small
-GPU-accelerated editor, then run it as your desktop wallpaper.
+(static pictures, looping GIFs, cursor-reactive "xray"/parallax overlays) in a
+small GPU-accelerated editor, then run it as your desktop wallpaper.
+
+## Screenshots
+
+<p align="center">
+  <img src="assets/editor.png" alt="Building a layer stack in the WP Linux editor, with the live GPU preview on the left" width="49%">
+  <img src="assets/KDE_settings.png" alt="Picking WP Linux Wallpaper in KDE System Settings" width="49%">
+</p>
+
+Parallax layer in action, reacting to the cursor on the real desktop:
+
+<p align="center">
+  <video src="assets/paralax_preview.webm" controls width="720">
+    Your viewer doesn't support inline video --
+    <a href="assets/paralax_preview.webm">download the clip</a> instead.
+  </video>
+</p>
+
+<p align="center"><sub>
+Artwork in the parallax demo above is from the
+<a href="https://webflow.com/made-in-webflow/website/parallax-template-cloneable">Webflow parallax template</a>,
+used here for demonstration only -- not original work, all rights remain with its creators.
+</sub></p>
 
 ## Status
 
@@ -19,6 +45,10 @@ else (X11, GNOME, other compositors) is supported or planned right now.
   circle around the cursor, using the compositor's true global cursor
   position (works correctly even under desktop icons, which would otherwise
   swallow mouse hover from a normal window).
+- **Parallax** layers -- a picture that pans opposite the cursor to fake
+  depth; stack several with increasing strength for a full parallax effect.
+  Auto-zoomed just enough that no edge is ever exposed, regardless of the
+  source picture's own size.
 - Layers composite bottom to top with alpha blending on the GPU (wgpu,
   Vulkan or GL).
 - Rendering automatically freezes on the last frame when the system's power
@@ -104,8 +134,8 @@ more robust option either way.)
 
 ## Usage
 
-1. Run `editor`, build a layer stack (Image / Gif / Xray), and save it as a
-   project folder.
+1. Run `editor`, build a layer stack (Image / Gif / Xray / Parallax), and
+   save it as a project folder.
 2. Make sure `render-server` is running (the install script sets it up as
    a background service; from a source build, run it by hand).
 3. Right-click the desktop -> **Configure Desktop and Wallpaper** (or
