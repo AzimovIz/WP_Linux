@@ -1,5 +1,7 @@
 # WP Linux
 
+*[Читать на русском](README_RU.md)*
+
 <p align="center">
   <img src="assets/wp_linux_logo.svg" alt="WP Linux logo" width="140">
 </p>
