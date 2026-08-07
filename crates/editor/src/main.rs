@@ -663,78 +663,166 @@ fn open_project(project_dir: &Path) -> Result<(Vec<EditorLayer>, u32), String> {
     Ok((layers, project.fps))
 }
 
+/// Saves in two passes -- stage every source asset into a scratch
+/// directory first, then move the staged files into their final
+/// `layer_N_*` names only once every source has been read.
+///
+/// A single pass that copies straight into final names isn't safe:
+/// those names are derived from each layer's *current* position in
+/// `layers`, so reordering layers and saving back into the *same*
+/// project directory can make one layer's final name equal another,
+/// not-yet-processed layer's source path (an existing file inside this
+/// same project). Copying layer-by-layer would then overwrite that
+/// source with unrelated content before it's ever read -- silently
+/// losing that layer's picture. Staging first means every source is
+/// safely read into the scratch directory before any final name is
+/// touched, so the order layers happen to be processed in can't matter.
 fn save_project(project_dir: &Path, layers: &[EditorLayer], fps: u32) -> Result<(), String> {
     std::fs::create_dir_all(project_dir).map_err(|e| e.to_string())?;
 
-    let mut saved_layers = Vec::with_capacity(layers.len());
-    for (index, layer) in layers.iter().enumerate() {
-        let saved = match layer {
-            EditorLayer::Image { path } => {
-                let path = path.as_ref().expect("save is disabled until complete");
-                let file_name = copy_asset(project_dir, path, &format!("layer_{index}_image"))?;
-                project_format::Layer::Image { path: file_name }
-            }
-            EditorLayer::Xray {
-                base,
-                overlay,
-                radius,
-            } => {
-                let base = base.as_ref().expect("save is disabled until complete");
-                let overlay = overlay.as_ref().expect("save is disabled until complete");
-                let base_name = copy_asset(project_dir, base, &format!("layer_{index}_xray_base"))?;
-                let overlay_name =
-                    copy_asset(project_dir, overlay, &format!("layer_{index}_xray_overlay"))?;
-                project_format::Layer::Xray {
-                    base: base_name,
-                    overlay: overlay_name,
-                    radius: *radius,
-                }
-            }
-            EditorLayer::Gif { path } => {
-                let path = path.as_ref().expect("save is disabled until complete");
-                let file_name = copy_asset(project_dir, path, &format!("layer_{index}_anim"))?;
-                project_format::Layer::Gif { path: file_name }
-            }
-            EditorLayer::Parallax { path, strength, smoothing } => {
-                let path = path.as_ref().expect("save is disabled until complete");
-                let file_name = copy_asset(project_dir, path, &format!("layer_{index}_parallax"))?;
-                project_format::Layer::Parallax {
-                    path: file_name,
-                    strength: *strength,
-                    smoothing: *smoothing,
-                }
-            }
-        };
-        saved_layers.push(saved);
-    }
+    let staging_dir = project_dir.join(".wplinux-staging");
+    std::fs::create_dir_all(&staging_dir).map_err(|e| e.to_string())?;
 
-    let project = project_format::Project {
-        layers: saved_layers,
-        fps,
-    };
-    project.save(project_dir).map_err(|e| e.to_string())
+    let result = (|| {
+        let mut saved_layers = Vec::with_capacity(layers.len());
+        let mut staged_names = Vec::new();
+        for (index, layer) in layers.iter().enumerate() {
+            let mut stage = |source: &Path, stem: &str| -> Result<String, String> {
+                let file_name = stage_asset(&staging_dir, source, stem)?;
+                staged_names.push(file_name.clone());
+                Ok(file_name)
+            };
+
+            let saved = match layer {
+                EditorLayer::Image { path } => {
+                    let path = path.as_ref().expect("save is disabled until complete");
+                    let file_name = stage(path, &format!("layer_{index}_image"))?;
+                    project_format::Layer::Image { path: file_name }
+                }
+                EditorLayer::Xray {
+                    base,
+                    overlay,
+                    radius,
+                } => {
+                    let base = base.as_ref().expect("save is disabled until complete");
+                    let overlay = overlay.as_ref().expect("save is disabled until complete");
+                    let base_name = stage(base, &format!("layer_{index}_xray_base"))?;
+                    let overlay_name = stage(overlay, &format!("layer_{index}_xray_overlay"))?;
+                    project_format::Layer::Xray {
+                        base: base_name,
+                        overlay: overlay_name,
+                        radius: *radius,
+                    }
+                }
+                EditorLayer::Gif { path } => {
+                    let path = path.as_ref().expect("save is disabled until complete");
+                    let file_name = stage(path, &format!("layer_{index}_anim"))?;
+                    project_format::Layer::Gif { path: file_name }
+                }
+                EditorLayer::Parallax { path, strength, smoothing } => {
+                    let path = path.as_ref().expect("save is disabled until complete");
+                    let file_name = stage(path, &format!("layer_{index}_parallax"))?;
+                    project_format::Layer::Parallax {
+                        path: file_name,
+                        strength: *strength,
+                        smoothing: *smoothing,
+                    }
+                }
+            };
+            saved_layers.push(saved);
+        }
+
+        // Every source has been read into the staging directory now --
+        // safe to promote the staged files into their final names, even
+        // where a reorder made one layer's final name equal another
+        // layer's original source path.
+        for name in &staged_names {
+            std::fs::rename(staging_dir.join(name), project_dir.join(name)).map_err(|e| e.to_string())?;
+        }
+
+        let project = project_format::Project {
+            layers: saved_layers,
+            fps,
+        };
+        project.save(project_dir).map_err(|e| e.to_string())
+    })();
+
+    let _ = std::fs::remove_dir_all(&staging_dir);
+    result
 }
 
-/// Copies `source` into `project_dir` under `stem` plus `source`'s
-/// extension, returning the file name (relative to `project_dir`) that
-/// got written.
-fn copy_asset(project_dir: &Path, source: &Path, stem: &str) -> Result<String, String> {
+/// Copies `source` into `staging_dir` under `stem` plus `source`'s
+/// extension, returning the file name (shared between the staging
+/// directory and, once `save_project` promotes it, the project
+/// directory) that got written.
+fn stage_asset(staging_dir: &Path, source: &Path, stem: &str) -> Result<String, String> {
     let extension = source.extension().and_then(|e| e.to_str()).unwrap_or("png");
     let file_name = format!("{stem}.{extension}");
-    let dest = project_dir.join(&file_name);
-
-    // If you opened a project and are saving back into the same folder,
-    // an untouched layer's source path already points at `dest` --
-    // fs::copy truncates the destination before it's done reading the
-    // source, so copying a file onto itself would zero it out.
-    let same_file = source
-        .canonicalize()
-        .ok()
-        .zip(dest.canonicalize().ok())
-        .is_some_and(|(a, b)| a == b);
-
-    if !same_file {
-        std::fs::copy(source, &dest).map_err(|e| e.to_string())?;
-    }
+    std::fs::copy(source, staging_dir.join(&file_name)).map_err(|e| e.to_string())?;
     Ok(file_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn unique_temp_dir() -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "wplinux-editor-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Reproduces the bug report: open a 3-layer project (as `open_project`
+    /// would leave it -- each layer's `path` already pointing inside
+    /// `project_dir`, all sharing the same extension so reordering makes
+    /// their final names collide with each other's *original* names
+    /// too), reorder the layers, and save back into the *same* directory.
+    /// A single-pass copy-straight-into-final-name save corrupts this:
+    /// the layer that lands on index 0 gets copied into `layer_0_image.*`
+    /// before the layer that used to *be* index 0 (and still has
+    /// `layer_0_image.*` as its source path) has been read, silently
+    /// replacing its picture with the wrong one -- and the next step
+    /// reads that already-corrupted file, cascading the corruption
+    /// through the rest of the layers.
+    #[test]
+    fn save_survives_reorder_into_same_directory() {
+        let project_dir = unique_temp_dir();
+
+        // Three distinct "pictures" at their `open_project`-assigned
+        // paths. Plain marker bytes are enough -- the save path never
+        // decodes them, only copies bytes.
+        let originals: [&[u8]; 3] = [b"AAAA", b"BBBB", b"CCCC"];
+        for (index, bytes) in originals.iter().enumerate() {
+            std::fs::write(project_dir.join(format!("layer_{index}_image.png")), bytes).unwrap();
+        }
+
+        // Rotate: what was layer 2 moves to index 0, layer 0 moves to
+        // index 1, layer 1 moves to index 2.
+        let reordered = vec![
+            EditorLayer::Image { path: Some(project_dir.join("layer_2_image.png")) },
+            EditorLayer::Image { path: Some(project_dir.join("layer_0_image.png")) },
+            EditorLayer::Image { path: Some(project_dir.join("layer_1_image.png")) },
+        ];
+
+        save_project(&project_dir, &reordered, 30).expect("save_project failed");
+
+        // Each index's *new* final name should hold whatever that layer's
+        // source actually was, not whatever the earlier single-pass copy
+        // happened to leave behind.
+        assert_eq!(std::fs::read(project_dir.join("layer_0_image.png")).unwrap(), b"CCCC");
+        assert_eq!(std::fs::read(project_dir.join("layer_1_image.png")).unwrap(), b"AAAA");
+        assert_eq!(std::fs::read(project_dir.join("layer_2_image.png")).unwrap(), b"BBBB");
+
+        std::fs::remove_dir_all(&project_dir).ok();
+    }
 }
