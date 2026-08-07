@@ -10,7 +10,7 @@ pkgdesc="Animated, interactive wallpaper engine for KDE Plasma 6 on Wayland"
 arch=('x86_64')
 url="https://github.com/AzimovIz/WP_Linux"
 license=('MIT')
-depends=('plasma-workspace' 'kwin')
+depends=('plasma-workspace' 'kwin' 'hicolor-icon-theme')
 optdepends=('power-profiles-daemon: pause rendering automatically in power-saver mode')
 install="${pkgname}.install"
 source=("https://github.com/AzimovIz/WP_Linux/releases/download/${pkgver}/wp-linux-linux-x86_64.tar.gz")
@@ -36,4 +36,21 @@ package() {
     install -Dm644 systemd/render-server.service "${pkgdir}/usr/lib/systemd/user/render-server.service"
     sed -i 's|%h/.local/bin/render-server|/usr/bin/render-server|' \
         "${pkgdir}/usr/lib/systemd/user/render-server.service"
+
+    # Application menu entry. Same @EDITOR_BIN@ placeholder trick as the
+    # systemd unit above, pointed at the /usr/bin editor installed here
+    # instead of install.sh's ~/.local/bin/editor.
+    install -d "${pkgdir}/usr/share/applications"
+    sed 's|@EDITOR_BIN@|/usr/bin/editor|' dev.wplinux.editor.desktop \
+        > "${pkgdir}/usr/share/applications/dev.wplinux.editor.desktop"
+    chmod 644 "${pkgdir}/usr/share/applications/dev.wplinux.editor.desktop"
+
+    # hicolor-icon-theme's pacman hook refreshes the icon cache on
+    # install/upgrade, no manual gtk-update-icon-cache call needed here.
+    install -Dm644 assets/wp_linux_editor_128.png \
+        "${pkgdir}/usr/share/icons/hicolor/128x128/apps/dev.wplinux.editor.png"
+    install -Dm644 assets/wp_linux_editor_256.png \
+        "${pkgdir}/usr/share/icons/hicolor/256x256/apps/dev.wplinux.editor.png"
+    install -Dm644 assets/wp_linux_editor.svg \
+        "${pkgdir}/usr/share/icons/hicolor/scalable/apps/dev.wplinux.editor.svg"
 }

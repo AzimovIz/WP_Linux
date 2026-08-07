@@ -8,8 +8,11 @@ set -uo pipefail
 
 BIN_DIR="${HOME}/.local/bin"
 SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
+APPLICATIONS_DIR="${HOME}/.local/share/applications"
+ICON_THEME_DIR="${HOME}/.local/share/icons/hicolor"
 PLASMA_PLUGIN_ID="dev.wplinux.wallpaper"
 KWIN_SCRIPT_ID="dev.wplinux.cursorbridge"
+DESKTOP_FILE_ID="dev.wplinux.editor"
 
 log()  { echo "uninstall.sh: $*"; }
 warn() { echo "uninstall.sh: warning: $*" >&2; }
@@ -38,5 +41,18 @@ fi
 
 log "removing binaries from ${BIN_DIR}"
 rm -f "${BIN_DIR}/render-server" "${BIN_DIR}/player" "${BIN_DIR}/editor"
+
+log "removing application menu entry and icons"
+rm -f "${APPLICATIONS_DIR}/${DESKTOP_FILE_ID}.desktop"
+rm -f "${ICON_THEME_DIR}/128x128/apps/${DESKTOP_FILE_ID}.png" \
+      "${ICON_THEME_DIR}/256x256/apps/${DESKTOP_FILE_ID}.png" \
+      "${ICON_THEME_DIR}/scalable/apps/${DESKTOP_FILE_ID}.svg"
+
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$APPLICATIONS_DIR" >/dev/null 2>&1 || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -q -t -f "$ICON_THEME_DIR" >/dev/null 2>&1 || true
+fi
 
 log "done. Your saved wallpaper projects were not touched."

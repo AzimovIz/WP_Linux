@@ -14,8 +14,11 @@ REPO="AzimovIz/WP_Linux"
 ARCHIVE_URL="https://github.com/${REPO}/releases/latest/download/wp-linux-linux-x86_64.tar.gz"
 BIN_DIR="${HOME}/.local/bin"
 SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
+APPLICATIONS_DIR="${HOME}/.local/share/applications"
+ICON_THEME_DIR="${HOME}/.local/share/icons/hicolor"
 PLASMA_PLUGIN_ID="dev.wplinux.wallpaper"
 KWIN_SCRIPT_ID="dev.wplinux.cursorbridge"
+DESKTOP_FILE_ID="dev.wplinux.editor"
 
 log()  { echo "install.sh: $*"; }
 warn() { echo "install.sh: warning: $*" >&2; }
@@ -42,6 +45,23 @@ pkgroot="$tmpdir/wp-linux"
 log "installing binaries to ${BIN_DIR}"
 mkdir -p "$BIN_DIR"
 install -m755 "$pkgroot/bin/render-server" "$pkgroot/bin/player" "$pkgroot/bin/editor" "$BIN_DIR/"
+
+log "installing application menu entry for the editor"
+mkdir -p "$APPLICATIONS_DIR"
+sed "s|@EDITOR_BIN@|${BIN_DIR}/editor|" "$pkgroot/dev.wplinux.editor.desktop" \
+    > "$APPLICATIONS_DIR/${DESKTOP_FILE_ID}.desktop"
+
+mkdir -p "$ICON_THEME_DIR/128x128/apps" "$ICON_THEME_DIR/256x256/apps" "$ICON_THEME_DIR/scalable/apps"
+install -m644 "$pkgroot/assets/wp_linux_editor_128.png" "$ICON_THEME_DIR/128x128/apps/${DESKTOP_FILE_ID}.png"
+install -m644 "$pkgroot/assets/wp_linux_editor_256.png" "$ICON_THEME_DIR/256x256/apps/${DESKTOP_FILE_ID}.png"
+install -m644 "$pkgroot/assets/wp_linux_editor.svg" "$ICON_THEME_DIR/scalable/apps/${DESKTOP_FILE_ID}.svg"
+
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$APPLICATIONS_DIR" >/dev/null 2>&1 || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -q -t -f "$ICON_THEME_DIR" >/dev/null 2>&1 || true
+fi
 
 install_kpackage() {
     local type="$1" id="$2" path="$3"
@@ -84,10 +104,13 @@ else
     warn "systemctl not found -- start render-server by hand: ${BIN_DIR}/render-server"
 fi
 
-case ":${PATH}:" in
-    *":${BIN_DIR}:"*) ;;
-    *) warn "${BIN_DIR} is not on your PATH -- add it to run 'editor'/'player' by name." ;;
-esac
+if ! command -v editor >/dev/null 2>&1; then
+    warn "'editor' was not found on your PATH (${BIN_DIR} isn't in it)."
+    warn "the menu entry launches it fine either way, but to run 'editor'/'player' by"
+    warn "name from a terminal, add this to your shell profile (~/.bashrc, ~/.zshrc, ...):"
+    warn "    export PATH=\"\${HOME}/.local/bin:\$PATH\""
+fi
 
-log "done. Run 'editor' to build a project, then pick 'WP Linux Wallpaper' in"
-log "System Settings > Appearance > Wallpaper and point it at the saved project folder."
+log "done. Run 'editor' (or launch 'WP Linux Editor' from the application menu) to"
+log "build a project, then pick 'WP Linux Wallpaper' in System Settings > Appearance"
+log "> Wallpaper and point it at the saved project folder."

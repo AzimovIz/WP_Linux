@@ -46,6 +46,9 @@ jobs:
       #   bin/{render-server,player,editor}
       #   plasma/{plasma-plugin,kwin-script}/package  (kpackagetool6-ready)
       #   systemd/render-server.service
+      #   dev.wplinux.editor.desktop  (Exec= has an @EDITOR_BIN@ placeholder,
+      #                                 filled in by install.sh/PKGBUILD)
+      #   assets/{wp_linux_editor_128.png,wp_linux_editor_256.png,wp_linux_editor.svg}
       # tar, not zip, so the executable bit on bin/* survives extraction.
       # Fixed filename (no tag in it) so install.sh can pull it via
       # GitHub's stable releases/latest/download/<name> URL without
@@ -58,6 +61,8 @@ jobs:
           cp target/release/render-server target/release/player target/release/editor "$root/bin/"
           cp -r plasma "$root/plasma"
           cp -r systemd "$root/systemd"
+          cp packaging/dev.wplinux.editor.desktop "$root/"
+          cp -r assets "$root/assets"
           tar czf dist/wp-linux-linux-x86_64.tar.gz -C dist wp-linux
 
       - name: Create release
