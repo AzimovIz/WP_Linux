@@ -135,15 +135,19 @@ more robust option either way.)
    a background service; from a source build, run it by hand).
 3. Right-click the desktop -> **Configure Desktop and Wallpaper** (or
    **System Settings -> Appearance -> Wallpaper**), choose **WP Linux
-   Wallpaper**, then point it at the project folder you saved.
+   Wallpaper**, then point it at the project folder you saved. Each
+   monitor has its own wallpaper config in Plasma, so different screens
+   can point at entirely different projects (e.g. parallax on one,
+   xray on another).
 
 ## Known limitations
 
-- One shared canvas and cursor position across every monitor -- the same
-  wallpaper renders identically on all screens.
 - `player`'s standalone Wayland renderer stretches layers to fill the
   screen with no aspect-ratio-correct cropping, unlike `render-server`
-  (what the Plasma plugin actually uses for display).
+  (what the Plasma plugin actually uses for display). It also still
+  shares one cursor position across every output it draws to, unlike
+  `render-server` which tracks each monitor's project and cursor
+  independently.
 
 ## License
 

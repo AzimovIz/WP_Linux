@@ -10,6 +10,13 @@ WallpaperItem {
     // refused" (render-server may not even be running yet) and gives a
     // clean, obviously-unconfigured state instead.
     readonly property bool hasProject: root.configuration.ProjectPath !== ""
+    // render-server now tracks one independently-loaded project per
+    // monitor rather than one shared by the whole desktop (see its own
+    // module doc comment), so every request needs to say which monitor
+    // it's for. `Screen.name` is resolved per wallpaper-item-instance
+    // already -- it's the same attached property `Screen.virtualX`/
+    // `Screen.virtualY` below already read correctly per screen.
+    readonly property string monitorId: Screen.name || ""
     // Path we last actually POSTed to render-server. Compared against
     // the live config every tick (see the Timer below) instead of
     // relying solely on onProjectPathChanged firing -- clicking Apply in
@@ -19,14 +26,29 @@ WallpaperItem {
     // at most one tick, but can't miss a change.
     property string lastPushedProjectPath: ""
 
+    // Appends this item's monitor id (as `?monitor=` or `&monitor=`,
+    // whichever `url` still needs) to a render-server URL -- every route
+    // takes one now, see main.rs's module doc comment. Centralized here
+    // so a missing `monitorId` (Screen not resolved yet) is a single
+    // guard instead of one per call site. Returns "" when there's no
+    // monitor id yet, which every call site treats as "don't send".
+    function withMonitorParam(url) {
+        if (!root.monitorId) {
+            return "";
+        }
+        const separator = url.indexOf("?") === -1 ? "?" : "&";
+        return url + separator + "monitor=" + encodeURIComponent(root.monitorId);
+    }
+
     function pushProjectPath() {
         const path = root.configuration.ProjectPath;
-        if (!path) {
+        const url = root.withMonitorParam("http://127.0.0.1:47824/project");
+        if (!path || !url) {
             return;
         }
         root.lastPushedProjectPath = path;
         const xhr = new XMLHttpRequest();
-        xhr.open("POST", "http://127.0.0.1:47824/project");
+        xhr.open("POST", url);
         xhr.send(path);
     }
 
@@ -38,8 +60,12 @@ WallpaperItem {
     // this piece: without it there'd be no way to turn a global position
     // into "is the cursor over this monitor, and where."
     function pushGeometry() {
+        const url = root.withMonitorParam("http://127.0.0.1:47824/geometry");
+        if (!url) {
+            return;
+        }
         const xhr = new XMLHttpRequest();
-        xhr.open("POST", "http://127.0.0.1:47824/geometry");
+        xhr.open("POST", url);
         xhr.send(Screen.virtualX + "," + Screen.virtualY + "," + root.width + "," + root.height);
     }
 
@@ -54,6 +80,14 @@ WallpaperItem {
         target: Screen
         function onVirtualXChanged() { root.pushGeometry(); }
         function onVirtualYChanged() { root.pushGeometry(); }
+        // A screen can be (re-)identified by the compositor after this
+        // item already existed (e.g. hotplug/reconfiguration) -- resend
+        // both once `monitorId` actually has a value to key on, same as
+        // Component.onCompleted does for the normal startup case.
+        function onNameChanged() {
+            root.pushProjectPath();
+            root.pushGeometry();
+        }
     }
 
     onWidthChanged: root.pushGeometry()
@@ -100,7 +134,7 @@ WallpaperItem {
             }
 
             function poll() {
-                if (requestInFlight) {
+                if (requestInFlight || !root.monitorId) {
                     return;
                 }
                 requestInFlight = true;
@@ -139,7 +173,7 @@ WallpaperItem {
                         root.pushProjectPath();
                     }
                 };
-                xhr.open("GET", "http://127.0.0.1:47824/meta");
+                xhr.open("GET", root.withMonitorParam("http://127.0.0.1:47824/meta"));
                 xhr.send();
             }
         }
@@ -150,7 +184,7 @@ WallpaperItem {
         // cheap no-op poll regardless of the interval.
         Timer {
             interval: Math.max(8, Math.round(1000 / sceneMeta.fps))
-            running: root.hasProject
+            running: root.hasProject && root.monitorId !== ""
             repeat: true
             triggeredOnStart: true
             onTriggered: {
@@ -196,16 +230,20 @@ WallpaperItem {
             // the (by-then-newer) frame again -- nothing is lost but a
             // couple of stale intermediate frames.
             function refresh() {
+                const url = root.withMonitorParam("http://127.0.0.1:47824/frame?t=" + Date.now());
+                if (!url) {
+                    return;
+                }
                 if (activeBuffer === 0) {
                     if (imgB.status === Image.Loading) {
                         return;
                     }
-                    urlB = "http://127.0.0.1:47824/frame?t=" + Date.now();
+                    urlB = url;
                 } else {
                     if (imgA.status === Image.Loading) {
                         return;
                     }
-                    urlA = "http://127.0.0.1:47824/frame?t=" + Date.now();
+                    urlA = url;
                 }
             }
         }

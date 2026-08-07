@@ -1,14 +1,18 @@
-//! Renders a wallpaper project's layer stack with wgpu and serves the
-//! composited result to the Plasma QML wallpaper plugin over a tiny
-//! local HTTP API:
+//! Renders each monitor's own wallpaper project's layer stack with wgpu
+//! and serves the composited result to the Plasma QML wallpaper plugin
+//! over a tiny local HTTP API. Every route takes a `?monitor=<id>` query
+//! parameter (the QML side sends `Screen.name`) identifying which
+//! monitor the request is for -- one process still runs, but it now
+//! tracks one independently-loaded project per monitor instead of a
+//! single project shared by the whole desktop:
 //!
-//!   POST /project    body = absolute path to a project directory -> loads it
-//!   POST /geometry   body = "virtualX,virtualY,width,height" -> the wallpaper
-//!                    item's placement on the virtual desktop, used to turn
-//!                    the global cursor position (see below) into local,
-//!                    normalized coordinates for xray/parallax layers
-//!   GET  /frame      -> current frame, PNG (static project) or BMP (dynamic)
-//!   GET  /meta       -> {"ready": bool, "frame_id": u64, "needs_cursor": bool, "fps": u32}
+//!   POST /project?monitor=ID    body = absolute path to a project directory -> loads it
+//!   POST /geometry?monitor=ID   body = "virtualX,virtualY,width,height" -> that
+//!                    monitor's wallpaper item placement on the virtual desktop,
+//!                    used to turn the global cursor position (see below) into
+//!                    local, normalized coordinates for xray/parallax layers
+//!   GET  /frame?monitor=ID      -> current frame, PNG (static project) or BMP (dynamic)
+//!   GET  /meta?monitor=ID       -> {"ready": bool, "frame_id": u64, "needs_cursor": bool, "fps": u32}
 //!
 //! Cursor position itself does NOT come in over HTTP: this process also
 //! registers the `dev.wplinux.CursorBridge` D-Bus service (formerly a
@@ -38,6 +42,7 @@
 
 mod renderer;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -95,6 +100,20 @@ struct LoadedProject {
     // `SceneRenderer::update_parallax`) -- this is `loaded_at.elapsed()`
     // as of the last tick that actually called it.
     last_parallax_update_ms: u64,
+    // Set on load, cleared once the first frame goes out -- makes sure a
+    // freshly (re)loaded monitor gets one frame out immediately instead
+    // of waiting for a gif/cursor change to trigger it. Was a loop-local
+    // variable back when there was only ever one project; now one project
+    // can finish loading mid-cycle while others are already rendering, so
+    // it has to travel with its own `LoadedProject`.
+    needs_render: bool,
+    // Cursor UV this monitor's own last emitted frame was actually
+    // rendered with -- lets the render loop skip a monitor's tick
+    // entirely (no GPU work, no encode) when nothing that could change
+    // its picture changed, e.g. an xray layer with a stationary cursor.
+    // Same reasoning as `needs_render` for why this moved from a
+    // loop-local into per-monitor state.
+    last_rendered_cursor_uv: Option<(f32, f32)>,
 }
 
 #[derive(Default)]
@@ -110,21 +129,29 @@ struct FrameOutput {
 #[derive(Default)]
 struct SharedState {
     /// Written by the render thread after every frame; read by
-    /// `/frame` and `/meta`. Never held while doing GPU work.
-    output: Mutex<FrameOutput>,
+    /// `/frame` and `/meta`. Never held while doing GPU work. Keyed by
+    /// monitor id (the `Screen.name` QML sends as `?monitor=`) -- each
+    /// monitor gets its own independently loaded project now instead of
+    /// the whole desktop sharing one.
+    output: Mutex<HashMap<String, FrameOutput>>,
     /// Global (virtual-desktop) cursor position in pixels, as last
     /// reported by the KWin script over D-Bus. `None` until the first
-    /// report arrives.
+    /// report arrives. There is exactly one physical pointer for the
+    /// whole desktop, so unlike `output`/`geometry` this stays a single
+    /// value rather than being keyed by monitor.
     global_cursor: Mutex<Option<(i32, i32)>>,
-    /// The wallpaper item's placement on the virtual desktop --
+    /// Each wallpaper item's placement on the virtual desktop --
     /// (virtualX, virtualY, width, height) -- as last pushed by QML via
-    /// `/geometry`. Needed to turn `global_cursor` into local,
-    /// normalized coordinates; only QML knows this, since render-server
-    /// has no Wayland/Qt connection of its own.
-    geometry: Mutex<Option<(f64, f64, f64, f64)>>,
+    /// `/geometry`, keyed by monitor id. Needed to turn `global_cursor`
+    /// into local, normalized coordinates for that specific monitor;
+    /// only QML knows this, since render-server has no Wayland/Qt
+    /// connection of its own.
+    geometry: Mutex<HashMap<String, (f64, f64, f64, f64)>>,
     /// Set by `/project`, taken (and cleared) by the render thread on
-    /// its next tick.
-    pending_project: Mutex<Option<PathBuf>>,
+    /// its next tick. Keyed by monitor id -- the latest POST for a given
+    /// monitor wins, same as the old single-project behavior, just
+    /// per-monitor instead of process-wide.
+    pending_project: Mutex<HashMap<String, PathBuf>>,
     /// Mirrors whether power-profiles-daemon currently reports the
     /// "power-saver" profile, as last polled by
     /// `run_power_profile_watcher`. While set, the render loop skips all
@@ -298,13 +325,14 @@ fn ensure_kwin_cursor_script_loaded() {
     }
 }
 
-/// Computes the current normalized (0..1) cursor position within the
-/// wallpaper item from the last-known global cursor position and the
-/// item's last-reported screen geometry. `None` if either piece is
-/// missing, or the cursor is outside the item's bounds.
-fn compute_cursor_uv(state: &SharedState) -> Option<(f32, f32)> {
+/// Computes the current normalized (0..1) cursor position within one
+/// specific monitor's wallpaper item, from the last-known global cursor
+/// position and that monitor's last-reported screen geometry. `None` if
+/// either piece is missing, that monitor has no geometry on file yet, or
+/// the cursor is outside the item's bounds.
+fn compute_cursor_uv(state: &SharedState, monitor_id: &str) -> Option<(f32, f32)> {
     let (gx, gy) = (*state.global_cursor.lock().unwrap())?;
-    let (vx, vy, w, h) = (*state.geometry.lock().unwrap())?;
+    let (vx, vy, w, h) = *state.geometry.lock().unwrap().get(monitor_id)?;
     if w <= 0.0 || h <= 0.0 {
         return None;
     }
@@ -349,12 +377,19 @@ fn main() {
     for mut request in server.incoming_requests() {
         let method = request.method().clone();
         // request.url() is the raw request-target and includes the query
-        // string (e.g. "/frame?t=123"); strip it before matching routes.
+        // string (e.g. "/frame?t=123&monitor=DP-1"); split path (for
+        // routing) from query (for the monitor id) instead of discarding
+        // the latter.
         let full_url = request.url().to_string();
-        let path = full_url.split('?').next().unwrap_or(&full_url).to_string();
+        let (path, query) = full_url.split_once('?').unwrap_or((full_url.as_str(), ""));
+        let monitor_id = query_param(query, "monitor");
 
-        match (&method, path.as_str()) {
+        match (&method, path) {
             (Method::Post, "/project") => {
+                let Some(monitor_id) = monitor_id else {
+                    let _ = request.respond(missing_monitor_response());
+                    continue;
+                };
                 let mut body = String::new();
                 if let Err(e) = request.as_reader().read_to_string(&mut body) {
                     let _ =
@@ -362,36 +397,84 @@ fn main() {
                     continue;
                 }
                 let project_dir = PathBuf::from(body.trim());
-                eprintln!("render-server: received /project {project_dir:?}");
-                *state.pending_project.lock().unwrap() = Some(project_dir);
+                eprintln!("render-server: received /project {project_dir:?} for monitor {monitor_id:?}");
+                state
+                    .pending_project
+                    .lock()
+                    .unwrap()
+                    .insert(monitor_id.to_string(), project_dir);
                 let _ = request.respond(text_response(200, "ok"));
             }
             (Method::Post, "/geometry") => {
+                let Some(monitor_id) = monitor_id else {
+                    let _ = request.respond(missing_monitor_response());
+                    continue;
+                };
                 let mut body = String::new();
                 let _ = request.as_reader().read_to_string(&mut body);
-                *state.geometry.lock().unwrap() = parse_geometry(body.trim());
-                let _ = request.respond(text_response(200, "ok"));
+                match parse_geometry(body.trim()) {
+                    // Only overwrite this monitor's geometry on a
+                    // successfully parsed body -- a malformed POST
+                    // (shouldn't happen, but was previously handled by
+                    // silently blanking geometry to `None`) now just
+                    // leaves whatever geometry this monitor already had,
+                    // so a bad request can't regress a working cursor.
+                    Some(geometry) => {
+                        state
+                            .geometry
+                            .lock()
+                            .unwrap()
+                            .insert(monitor_id.to_string(), geometry);
+                        let _ = request.respond(text_response(200, "ok"));
+                    }
+                    None => {
+                        let _ = request.respond(text_response(400, "bad geometry body"));
+                    }
+                }
             }
             (Method::Get, "/frame") => {
+                let Some(monitor_id) = monitor_id else {
+                    let _ = request.respond(missing_monitor_response());
+                    continue;
+                };
                 let output = state.output.lock().unwrap();
-                if output.frame_bytes.is_empty() {
-                    let _ = request.respond(text_response(404, "no project loaded"));
-                } else {
-                    let response = Response::from_data(output.frame_bytes.clone()).with_header(
-                        tiny_http::Header::from_bytes(
-                            &b"Content-Type"[..],
-                            output.frame_content_type.as_bytes(),
-                        )
-                        .unwrap(),
-                    );
-                    let _ = request.respond(response);
+                match output.get(monitor_id) {
+                    Some(output) if !output.frame_bytes.is_empty() => {
+                        let response =
+                            Response::from_data(output.frame_bytes.clone()).with_header(
+                                tiny_http::Header::from_bytes(
+                                    &b"Content-Type"[..],
+                                    output.frame_content_type.as_bytes(),
+                                )
+                                .unwrap(),
+                            );
+                        let _ = request.respond(response);
+                    }
+                    _ => {
+                        let _ = request
+                            .respond(text_response(404, "no project loaded for this monitor"));
+                    }
                 }
             }
             (Method::Get, "/meta") => {
+                let Some(monitor_id) = monitor_id else {
+                    let _ = request.respond(missing_monitor_response());
+                    continue;
+                };
                 let output = state.output.lock().unwrap();
+                // No entry yet (monitor never loaded / render-server was
+                // restarted) reports the same all-defaults "not ready"
+                // shape a fresh `FrameOutput::default()` always did --
+                // still a 200, not a 404, so QML's "resend the project
+                // path until it sticks" retry in `sceneMeta.poll()` keeps
+                // working exactly as it did for the single-project case.
+                let entry = output.get(monitor_id);
                 let body = format!(
                     "{{\"ready\":{},\"frame_id\":{},\"needs_cursor\":{},\"fps\":{}}}",
-                    output.ready, output.frame_id, output.needs_cursor, output.fps
+                    entry.is_some_and(|o| o.ready),
+                    entry.map_or(0, |o| o.frame_id),
+                    entry.is_some_and(|o| o.needs_cursor),
+                    entry.map_or(0, |o| o.fps),
                 );
                 let response = Response::from_string(body).with_header(
                     tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
@@ -406,64 +489,95 @@ fn main() {
     }
 }
 
-/// Runs forever in its own thread: picks up newly-posted project paths,
-/// re-composites dynamic projects (gif animation, xray/parallax cursor
-/// reaction) at a capped rate, and renders a static project exactly
-/// once. Idles
-/// almost for free when nothing is loaded or the current project is
-/// fully static. Never holds `state`'s locks while doing GPU work.
+/// Extracts the value of `key` from a raw query string
+/// ("t=123&monitor=DP-1"), the same hand-rolled-parser style as
+/// `parse_geometry` below -- monitor ids (`DP-1`, `eDP-1`, `HDMI-A-1`,
+/// ...) are plain ASCII, so there's nothing a real URL-decoding crate
+/// would buy here.
+fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == key).then_some(v)
+    })
+}
+
+fn missing_monitor_response() -> Response<std::io::Cursor<Vec<u8>>> {
+    text_response(400, "missing ?monitor=<id> query parameter")
+}
+
+/// Runs forever in its own thread: picks up newly-posted project paths
+/// for any monitor, re-composites each dynamic monitor's project (gif
+/// animation, xray/parallax cursor reaction) at a capped rate, and
+/// renders a static project exactly once. Idles almost for free when
+/// nothing is loaded or every loaded monitor is fully static. Never
+/// holds `state`'s locks while doing GPU work.
+///
+/// Deliberately one thread iterating over every monitor each cycle,
+/// not one thread per monitor: `renderer::render_frame` does a
+/// blocking `device.poll(wait_indefinitely())` per call, so N threads
+/// hitting the same shared `wgpu::Device` concurrently would just
+/// serialize on the device anyway -- a single loop gets the same
+/// throughput with none of the added synchronization risk.
 fn render_tick_loop(renderer: &SceneRenderer, state: &SharedState) {
-    let mut current: Option<LoadedProject> = None;
-    let mut needs_render = false;
-    // Last cursor position we actually rendered with -- lets us skip a
-    // tick entirely (no GPU work, no encode, no output update) when
-    // nothing that could change the picture actually changed, e.g. an
-    // xray layer with a stationary cursor, or a gif sitting inside a
-    // multi-second inter-frame delay.
-    let mut last_rendered_cursor_uv: Option<(f32, f32)> = None;
-    let mut tick_interval = IDLE_TICK_INTERVAL;
+    let mut monitors: HashMap<String, LoadedProject> = HashMap::new();
 
     loop {
         // Timed from here, not from the end of the previous sleep -- the
         // work below (GPU render, encode) is not instant, and sleeping
         // the full tick_interval regardless of how long that work took
         // would make the real cycle length tick_interval + work_time
-        // instead of tick_interval, silently undershooting the
-        // project's configured fps by however long a frame takes to
-        // produce.
+        // instead of tick_interval, silently undershooting the fastest
+        // loaded monitor's configured fps by however long a cycle takes
+        // to run.
         let cycle_start = Instant::now();
 
-        if let Some(project_dir) = state.pending_project.lock().unwrap().take() {
+        for (monitor_id, project_dir) in state.pending_project.lock().unwrap().drain() {
             match load_project(renderer, &project_dir) {
                 Ok(loaded) => {
                     eprintln!(
-                        "render-server: loaded project {:?} ({} layer(s), dynamic = {}, fps target {:?})",
+                        "render-server: loaded project {:?} for monitor {monitor_id:?} \
+                         ({} layer(s), dynamic = {}, fps target {:?})",
                         project_dir,
                         loaded.layers.len(),
                         loaded.dynamic,
                         loaded.tick_interval,
                     );
-                    tick_interval = loaded.tick_interval;
-                    current = Some(loaded);
-                    needs_render = true;
-                    last_rendered_cursor_uv = None;
+                    monitors.insert(monitor_id, loaded);
                 }
                 Err(e) => {
-                    eprintln!("render-server: failed to load project {project_dir:?}: {e}");
+                    eprintln!(
+                        "render-server: failed to load project {project_dir:?} for monitor \
+                         {monitor_id:?}: {e}"
+                    );
                 }
             }
         }
 
-        // While the system is in the power-saver profile, treat this
-        // exactly like a static project: don't advance gifs, don't react
-        // to the cursor, don't push anything to the GPU. `needs_render`
-        // (set on load) still gets one frame out below, so a freshly
-        // loaded project isn't left blank -- it just freezes on that
-        // frame instead of animating, same as a plain `Image` layer
-        // always has. See `run_power_profile_watcher`.
+        // While the system is in the power-saver profile, treat every
+        // monitor exactly like a static project: don't advance gifs,
+        // don't react to the cursor, don't push anything to the GPU.
+        // `needs_render` (set on load) still gets one frame out below,
+        // so a freshly loaded monitor isn't left blank -- it just
+        // freezes on that frame instead of animating, same as a plain
+        // `Image` layer always has. See `run_power_profile_watcher`.
         let power_saving = state.power_saver.load(Ordering::Relaxed);
 
-        if let Some(project) = current.as_mut() {
+        // Recomputed every cycle from whichever monitors are currently
+        // loaded and dynamic -- e.g. a 60fps gif on one monitor must not
+        // get throttled to a 5fps xray monitor's rate or vice versa.
+        // Every monitor is still visited every cycle regardless (see the
+        // loop below); this only controls how eagerly the *next* cycle
+        // starts, and `advance_gifs`/`update_parallax` are cheap no-ops
+        // when called more often than a given monitor actually needs, so
+        // visiting a slow monitor at a fast monitor's rate costs a little
+        // extra bookkeeping, not extra GPU work or over-fast animation.
+        let mut next_tick_interval = IDLE_TICK_INTERVAL;
+
+        for (monitor_id, project) in monitors.iter_mut() {
+            if project.dynamic && !power_saving {
+                next_tick_interval = next_tick_interval.min(project.tick_interval);
+            }
+
             let gif_changed = if project.dynamic && !power_saving {
                 let elapsed_ms = project.loaded_at.elapsed().as_millis() as u64;
                 renderer.advance_gifs(&mut project.layers, elapsed_ms)
@@ -472,12 +586,13 @@ fn render_tick_loop(renderer: &SceneRenderer, state: &SharedState) {
             };
 
             let cursor_uv = if project.needs_cursor && !power_saving {
-                compute_cursor_uv(state)
+                compute_cursor_uv(state, monitor_id)
             } else {
                 None
             };
-            let cursor_changed =
-                project.needs_cursor && !power_saving && cursor_uv != last_rendered_cursor_uv;
+            let cursor_changed = project.needs_cursor
+                && !power_saving
+                && cursor_uv != project.last_rendered_cursor_uv;
 
             // Unlike xray, parallax has state that eases towards a
             // target over several ticks -- it can still be moving after
@@ -495,31 +610,33 @@ fn render_tick_loop(renderer: &SceneRenderer, state: &SharedState) {
                 false
             };
 
-            if needs_render || gif_changed || cursor_changed || parallax_changed {
-                last_rendered_cursor_uv = cursor_uv;
+            if project.needs_render || gif_changed || cursor_changed || parallax_changed {
+                project.last_rendered_cursor_uv = cursor_uv;
 
                 let (frame_bytes, content_type) = compose_and_encode(renderer, project, cursor_uv);
 
                 let mut output = state.output.lock().unwrap();
-                output.ready = true;
-                output.needs_cursor = project.needs_cursor;
-                output.fps = project.fps;
-                output.frame_bytes = frame_bytes;
-                output.frame_content_type = content_type;
-                output.frame_id += 1;
+                let entry = output.entry(monitor_id.clone()).or_default();
+                entry.ready = true;
+                entry.needs_cursor = project.needs_cursor;
+                entry.fps = project.fps;
+                entry.frame_bytes = frame_bytes;
+                entry.frame_content_type = content_type;
+                entry.frame_id += 1;
                 drop(output);
 
-                needs_render = false;
+                project.needs_render = false;
             }
         }
 
-        // No point waking up at the project's animation fps just to find
-        // power_saver still set and do nothing -- but still check often
-        // enough that leaving power-saver mode resumes animation quickly.
+        // No point waking up at the fastest loaded monitor's animation
+        // fps just to find power_saver still set and do nothing -- but
+        // still check often enough that leaving power-saver mode resumes
+        // animation quickly.
         let sleep_interval = if power_saving {
             POWER_PROFILE_POLL_INTERVAL
         } else {
-            tick_interval
+            next_tick_interval
         };
         std::thread::sleep(sleep_interval.saturating_sub(cycle_start.elapsed()));
     }
@@ -597,6 +714,8 @@ fn load_project(renderer: &SceneRenderer, project_dir: &Path) -> Result<LoadedPr
         tick_interval,
         loaded_at: Instant::now(),
         last_parallax_update_ms: 0,
+        needs_render: true,
+        last_rendered_cursor_uv: None,
     })
 }
 
