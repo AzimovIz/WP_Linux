@@ -10,8 +10,9 @@
 //!    with egui-wgpu's renderer, for a live project preview.
 //!
 //! This exists so the actual compositing logic -- pipelines, shaders,
-//! layer loading, gif timing, xray cursor handling -- lives in exactly
-//! one place instead of three copies that would drift out of sync.
+//! layer loading, gif timing, xray cursor handling, parallax panning --
+//! lives in exactly one place instead of three copies that would drift
+//! out of sync.
 //!
 //! This crate owns the workspace's only direct `wgpu` dependency and
 //! re-exports it as [`wgpu`] so every consumer resolves to the exact same
@@ -41,6 +42,7 @@ use project_format::{Layer, Project};
 
 const IMAGE_SHADER: &str = include_str!("shader.wgsl");
 const XRAY_SHADER: &str = include_str!("xray.wgsl");
+const PARALLAX_SHADER: &str = include_str!("parallax.wgsl");
 
 pub struct GifFrame {
     rgba: Vec<u8>,
@@ -71,6 +73,25 @@ pub struct XrayLayer {
     _overlay_texture: wgpu::Texture,
 }
 
+/// A single picture panned opposite the cursor to fake depth -- see
+/// [`Layer::Parallax`](project_format::Layer::Parallax).
+pub struct ParallaxLayer {
+    bind_group: wgpu::BindGroup,
+    uniform_buffer: wgpu::Buffer,
+    strength: f32,
+    smoothing: f32,
+    // Eased pan target, in the same `[-strength, strength]` UV units as
+    // what ends up in the uniform buffer -- kept here (not just written
+    // straight through) so `update_parallax` can ease towards a new
+    // cursor position frame over frame instead of snapping to it.
+    current_offset: (f32, f32),
+    pub width: u32,
+    pub height: u32,
+    // Kept alive only so the texture the bind group points at isn't
+    // dropped -- its contents are never read back on the Rust side.
+    _texture: wgpu::Texture,
+}
+
 pub enum LoadedLayer {
     Image(ImageLayer),
     Gif {
@@ -88,11 +109,13 @@ pub enum LoadedLayer {
         height: u32,
     },
     Xray(XrayLayer),
+    Parallax(ParallaxLayer),
 }
 
 pub enum DrawLayer<'a> {
     Image(&'a ImageLayer),
     Xray(&'a XrayLayer),
+    Parallax(&'a ParallaxLayer),
 }
 
 impl LoadedLayer {
@@ -106,6 +129,7 @@ impl LoadedLayer {
             LoadedLayer::Image(image) => (image.width, image.height),
             LoadedLayer::Gif { width, height, .. } => (*width, *height),
             LoadedLayer::Xray(xray) => (xray.width, xray.height),
+            LoadedLayer::Parallax(parallax) => (parallax.width, parallax.height),
         }
     }
 
@@ -118,6 +142,17 @@ impl LoadedLayer {
     pub fn set_xray_radius(&mut self, radius: f32) {
         if let LoadedLayer::Xray(xray) = self {
             xray.radius = radius;
+        }
+    }
+
+    /// Changes an already-loaded Parallax layer's strength/smoothing in
+    /// place, same rationale as [`LoadedLayer::set_xray_radius`] -- lets a
+    /// caller like editor keep sliders feeling live without reloading the
+    /// picture. No-op on any other layer kind.
+    pub fn set_parallax_params(&mut self, strength: f32, smoothing: f32) {
+        if let LoadedLayer::Parallax(parallax) = self {
+            parallax.strength = strength;
+            parallax.smoothing = smoothing;
         }
     }
 }
@@ -133,6 +168,8 @@ pub struct SceneRenderer {
     image_bind_group_layout: wgpu::BindGroupLayout,
     xray_pipeline: wgpu::RenderPipeline,
     xray_bind_group_layout: wgpu::BindGroupLayout,
+    parallax_pipeline: wgpu::RenderPipeline,
+    parallax_bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
 }
 
@@ -343,6 +380,77 @@ impl SceneRenderer {
             cache: None,
         });
 
+        let parallax_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("parallax-bind-group-layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let parallax_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("parallax-shader"),
+            source: wgpu::ShaderSource::Wgsl(PARALLAX_SHADER.into()),
+        });
+
+        let parallax_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("parallax-pipeline-layout"),
+                bind_group_layouts: &[Some(&parallax_bind_group_layout)],
+                immediate_size: 0,
+            });
+
+        let parallax_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("parallax-pipeline"),
+            layout: Some(&parallax_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &parallax_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &parallax_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         Self {
             adapter,
             device,
@@ -351,6 +459,8 @@ impl SceneRenderer {
             image_bind_group_layout,
             xray_pipeline,
             xray_bind_group_layout,
+            parallax_pipeline,
+            parallax_bind_group_layout,
             sampler,
         }
     }
@@ -487,6 +597,56 @@ impl SceneRenderer {
         }
     }
 
+    fn create_parallax_layer(
+        &self,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+        strength: f32,
+        smoothing: f32,
+    ) -> ParallaxLayer {
+        let texture = self.create_texture(width, height);
+        self.write_texture(&texture, rgba, width, height);
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let uniform_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("parallax-params"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("parallax-layer-bind-group"),
+            layout: &self.parallax_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        ParallaxLayer {
+            bind_group,
+            uniform_buffer,
+            strength,
+            smoothing,
+            current_offset: (0.0, 0.0),
+            width,
+            height,
+            _texture: texture,
+        }
+    }
+
     /// Loads every layer of `project` onto the GPU, ready to draw. Asset
     /// paths in `project` are resolved relative to `project_dir`.
     pub fn load_scene(
@@ -532,6 +692,16 @@ impl SceneRenderer {
                         overlay_width,
                         overlay_height,
                         *radius,
+                    )));
+                }
+                Layer::Parallax {
+                    path,
+                    strength,
+                    smoothing,
+                } => {
+                    let (rgba, width, height) = open_rgba(&project_dir.join(path))?;
+                    layers.push(LoadedLayer::Parallax(self.create_parallax_layer(
+                        &rgba, width, height, *strength, *smoothing,
                     )));
                 }
             }
@@ -586,6 +756,81 @@ impl SceneRenderer {
         }
     }
 
+    /// Eases every parallax layer's pan towards a cursor-driven target
+    /// and writes the result into its uniform buffer. `cursor_px` mirrors
+    /// `update_xray_cursors` -- one shared cursor position, in the
+    /// layer's own pixel dimensions (not the output surface's, matching
+    /// how xray's `radius` is likewise authored against the layer's
+    /// native resolution). `dt_ms` is elapsed time since the *previous*
+    /// call to this method, not since the scene was loaded -- easing
+    /// needs a delta, unlike gif timing's running total.
+    ///
+    /// Returns whether any layer's pan actually moved -- mirrors
+    /// [`SceneRenderer::advance_gifs`]'s return for the same reason: a
+    /// caller like render-server that only redraws on real change can't
+    /// just compare `cursor_px` to the last one it saw (unlike xray,
+    /// smoothing means the pan can still be mid-ease towards an old
+    /// target after the cursor itself has stopped moving).
+    pub fn update_parallax(&self, layers: &mut [LoadedLayer], cursor_px: (f32, f32), dt_ms: u64) -> bool {
+        // Below this, the pan's uniform-buffer bytes are indistinguishable
+        // from where it already was -- calling it "settled" here instead
+        // of only at exact equality is what lets an exponential ease
+        // (which in theory never fully reaches its target) stop
+        // triggering redraws.
+        const SETTLED_EPSILON: f32 = 1.0e-4;
+
+        let mut any_changed = false;
+        let dt = dt_ms as f32 / 1000.0;
+        for layer in layers {
+            if let LoadedLayer::Parallax(parallax) = layer {
+                // Cursor at the near edge of the layer -> target =
+                // -strength; far edge -> +strength. In the shader this
+                // pans the *sampled window* the same direction the
+                // cursor moved, which makes the visible content shift
+                // the other way -- the usual "background drifts opposite
+                // your viewpoint" parallax feel. Flip `strength`'s sign
+                // to invert that for a layer meant to feel like it's in
+                // front of the cursor instead of behind it.
+                // Clamped to `strength`'s own range: besides being the
+                // contract the zoom margin is sized against, this also
+                // keeps a cursor pushed far off-canvas (every caller's
+                // way of saying "hide/neutral" when the pointer leaves,
+                // e.g. `App::pointer_frame`'s `Leave` handling) from
+                // producing a wildly out-of-range pan -- it just parks
+                // at the nearest edge instead.
+                let max_offset = parallax.strength.abs();
+                let target = (
+                    ((cursor_px.0 / parallax.width.max(1) as f32 - 0.5) * 2.0 * parallax.strength)
+                        .clamp(-max_offset, max_offset),
+                    ((cursor_px.1 / parallax.height.max(1) as f32 - 0.5) * 2.0 * parallax.strength)
+                        .clamp(-max_offset, max_offset),
+                );
+                let ease = if parallax.smoothing <= 0.0 {
+                    1.0
+                } else {
+                    1.0 - (-dt / parallax.smoothing).exp()
+                };
+                let step = (
+                    (target.0 - parallax.current_offset.0) * ease,
+                    (target.1 - parallax.current_offset.1) * ease,
+                );
+                if step.0.abs() > SETTLED_EPSILON || step.1.abs() > SETTLED_EPSILON {
+                    parallax.current_offset.0 += step.0;
+                    parallax.current_offset.1 += step.1;
+                    any_changed = true;
+
+                    let zoom = zoom_for_strength(parallax.strength);
+                    let mut bytes = [0u8; 16];
+                    bytes[0..4].copy_from_slice(&parallax.current_offset.0.to_le_bytes());
+                    bytes[4..8].copy_from_slice(&parallax.current_offset.1.to_le_bytes());
+                    bytes[8..12].copy_from_slice(&zoom.to_le_bytes());
+                    self.queue.write_buffer(&parallax.uniform_buffer, 0, &bytes);
+                }
+            }
+        }
+        any_changed
+    }
+
     /// Records a composite pass -- `layers` bottom to top, alpha-blended
     /// -- into `target_view`, as part of `encoder`. Low-level: lets a
     /// caller that needs to record more commands in the same submission
@@ -620,6 +865,7 @@ impl SceneRenderer {
                 LoadedLayer::Image(image) => DrawLayer::Image(image),
                 LoadedLayer::Gif { image, .. } => DrawLayer::Image(image),
                 LoadedLayer::Xray(xray) => DrawLayer::Xray(xray),
+                LoadedLayer::Parallax(parallax) => DrawLayer::Parallax(parallax),
             };
             match draw_layer {
                 DrawLayer::Image(image) => {
@@ -630,6 +876,11 @@ impl SceneRenderer {
                 DrawLayer::Xray(xray) => {
                     pass.set_pipeline(&self.xray_pipeline);
                     pass.set_bind_group(0, &xray.bind_group, &[]);
+                    pass.draw(0..3, 0..1);
+                }
+                DrawLayer::Parallax(parallax) => {
+                    pass.set_pipeline(&self.parallax_pipeline);
+                    pass.set_bind_group(0, &parallax.bind_group, &[]);
                     pass.draw(0..3, 0..1);
                 }
             }
@@ -713,6 +964,18 @@ fn adapter_rank(device_type: wgpu::DeviceType) -> u8 {
         wgpu::DeviceType::Other => 3,
         wgpu::DeviceType::Cpu => 4,
     }
+}
+
+/// The zoom-in factor that reserves just enough margin around a panned
+/// picture that a pan of up to `strength` (a `Layer::Parallax::strength`
+/// value) never samples outside `[0, 1]` UV. Comes from requiring the
+/// sampled window `[0.5 + offset - 0.5/zoom, 0.5 + offset + 0.5/zoom]` to
+/// stay inside `[0, 1]` at `offset = strength.abs()`, which reduces to
+/// `zoom = 1 / (1 - 2 * strength)`. Clamped so a `strength` at or past
+/// 0.5 (which would need infinite zoom) degrades to a tight but still
+/// valid crop instead of dividing by zero or going negative.
+fn zoom_for_strength(strength: f32) -> f32 {
+    1.0 / (1.0 - 2.0 * strength.abs()).max(0.1)
 }
 
 fn open_rgba(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {

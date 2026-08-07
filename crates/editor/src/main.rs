@@ -50,6 +50,11 @@ enum EditorLayer {
     Gif {
         path: Option<PathBuf>,
     },
+    Parallax {
+        path: Option<PathBuf>,
+        strength: f32,
+        smoothing: f32,
+    },
 }
 
 impl EditorLayer {
@@ -58,6 +63,7 @@ impl EditorLayer {
             EditorLayer::Image { .. } => "Image",
             EditorLayer::Xray { .. } => "Xray",
             EditorLayer::Gif { .. } => "Gif",
+            EditorLayer::Parallax { .. } => "Parallax",
         }
     }
 
@@ -66,6 +72,7 @@ impl EditorLayer {
             EditorLayer::Image { path } => path.is_some(),
             EditorLayer::Xray { base, overlay, .. } => base.is_some() && overlay.is_some(),
             EditorLayer::Gif { path } => path.is_some(),
+            EditorLayer::Parallax { path, .. } => path.is_some(),
         }
     }
 }
@@ -82,6 +89,7 @@ enum LayerSignature {
     Image(PathBuf),
     Xray(PathBuf, PathBuf),
     Gif(PathBuf),
+    Parallax(PathBuf),
 }
 
 /// Live GPU preview of the current layer stack.
@@ -94,6 +102,11 @@ struct Preview {
     height: u32,
     layers: Vec<LoadedLayer>,
     loaded_at: Instant,
+    // Elapsed time (since `loaded_at`) as of the last parallax ease step
+    // -- mirrors `player::main`'s `last_parallax_update_ms`, see there
+    // for why this needs a delta rather than `loaded_at.elapsed()`
+    // directly.
+    last_parallax_update_ms: u64,
     signature: Option<Vec<LayerSignature>>,
 }
 
@@ -121,6 +134,7 @@ impl Preview {
             height,
             layers: Vec::new(),
             loaded_at: Instant::now(),
+            last_parallax_update_ms: 0,
             signature: None,
         }
     }
@@ -164,42 +178,54 @@ impl Preview {
 
         self.layers = layers;
         self.loaded_at = Instant::now();
+        self.last_parallax_update_ms = 0;
         self.signature = Some(signature);
         Ok(())
     }
 
-    /// Applies each Xray layer's *current* (possibly still-being-dragged)
-    /// radius, scaled down to this preview's resolution -- radii in
-    /// project.json are tuned against the layer's native resolution, so
-    /// using them unscaled against a much smaller preview canvas would
-    /// draw a wildly oversized mask.
-    fn sync_radii(&mut self, editor_layers: &[EditorLayer]) {
+    /// Applies each Xray/Parallax layer's *current* (possibly
+    /// still-being-dragged) params. Xray's radius is scaled down to this
+    /// preview's resolution -- radii in project.json are tuned against
+    /// the layer's native resolution, so using them unscaled against a
+    /// much smaller preview canvas would draw a wildly oversized mask.
+    /// Parallax's strength/smoothing are already resolution-independent
+    /// (a fraction of the layer's own size, a duration), so they pass
+    /// straight through.
+    fn sync_live_params(&mut self, editor_layers: &[EditorLayer]) {
         if self.layers.is_empty() {
             return;
         }
         let (natural_width, _) = self.layers.first().map(LoadedLayer::size).unwrap_or((1, 1));
         let scale = self.width as f32 / natural_width.max(1) as f32;
         for (loaded, editor_layer) in self.layers.iter_mut().zip(editor_layers) {
-            if let EditorLayer::Xray { radius, .. } = editor_layer {
-                loaded.set_xray_radius(*radius * scale);
+            match editor_layer {
+                EditorLayer::Xray { radius, .. } => loaded.set_xray_radius(*radius * scale),
+                EditorLayer::Parallax { strength, smoothing, .. } => {
+                    loaded.set_parallax_params(*strength, *smoothing);
+                }
+                EditorLayer::Image { .. } | EditorLayer::Gif { .. } => {}
             }
         }
     }
 
-    /// Advances gif frames, updates the xray cursor, and redraws into the
-    /// preview texture. `cursor_local` is in preview-texture pixel
-    /// coordinates (i.e. already scaled -- see the caller). Returns
-    /// whether the scene has any layer that needs continuous repainting.
+    /// Advances gif frames, updates the xray cursor and parallax pan, and
+    /// redraws into the preview texture. `cursor_local` is in
+    /// preview-texture pixel coordinates (i.e. already scaled -- see the
+    /// caller). Returns whether the scene has any layer that needs
+    /// continuous repainting.
     fn redraw(&mut self, cursor_local: Option<(f32, f32)>) -> bool {
         let elapsed_ms = self.loaded_at.elapsed().as_millis() as u64;
         self.renderer.advance_gifs(&mut self.layers, elapsed_ms);
         let cursor_px = cursor_local.unwrap_or((-1.0e6, -1.0e6));
         self.renderer.update_xray_cursors(&self.layers, cursor_px);
+        let parallax_dt_ms = elapsed_ms.saturating_sub(self.last_parallax_update_ms);
+        self.last_parallax_update_ms = elapsed_ms;
+        self.renderer.update_parallax(&mut self.layers, cursor_px, parallax_dt_ms);
         self.renderer.render_to_texture(&self.view, &self.layers, wgpu::Color::TRANSPARENT);
 
-        self.layers
-            .iter()
-            .any(|l| matches!(l, LoadedLayer::Gif { .. } | LoadedLayer::Xray(_)))
+        self.layers.iter().any(|l| {
+            matches!(l, LoadedLayer::Gif { .. } | LoadedLayer::Xray(_) | LoadedLayer::Parallax(_))
+        })
     }
 }
 
@@ -265,6 +291,11 @@ fn build_preview_project(layers: &[EditorLayer]) -> Option<project_format::Proje
             EditorLayer::Gif { path } => project_format::Layer::Gif {
                 path: path.as_ref().expect("checked complete above").display().to_string(),
             },
+            EditorLayer::Parallax { path, strength, smoothing } => project_format::Layer::Parallax {
+                path: path.as_ref().expect("checked complete above").display().to_string(),
+                strength: *strength,
+                smoothing: *smoothing,
+            },
         })
         .collect();
     Some(project_format::Project {
@@ -289,6 +320,9 @@ fn build_signature(layers: &[EditorLayer]) -> Vec<LayerSignature> {
             ),
             EditorLayer::Gif { path } => {
                 LayerSignature::Gif(path.clone().expect("checked complete by caller"))
+            }
+            EditorLayer::Parallax { path, .. } => {
+                LayerSignature::Parallax(path.clone().expect("checked complete by caller"))
             }
         })
         .collect()
@@ -382,6 +416,13 @@ impl eframe::App for EditorApp {
                 if ui.button("+ Gif").clicked() {
                     self.layers.push(EditorLayer::Gif { path: None });
                 }
+                if ui.button("+ Parallax").clicked() {
+                    self.layers.push(EditorLayer::Parallax {
+                        path: None,
+                        strength: 0.05,
+                        smoothing: 0.15,
+                    });
+                }
             });
 
             ui.add_space(8.0);
@@ -434,6 +475,24 @@ impl eframe::App for EditorApp {
                         }
                         EditorLayer::Gif { path } => {
                             path_picker(ui, "Gif file", path, &["gif"]);
+                        }
+                        EditorLayer::Parallax { path, strength, smoothing } => {
+                            path_picker(
+                                ui,
+                                "Picture (bigger than your desktop resolution works best)",
+                                path,
+                                &["png", "jpg", "jpeg"],
+                            );
+                            ui.horizontal(|ui| {
+                                ui.label("Strength:")
+                                    .on_hover_text("How far the layer pans at the screen edge, as a fraction of its own size. Negative pans towards the cursor instead of away from it.");
+                                ui.add(eframe::egui::Slider::new(strength, -0.4..=0.4));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Smoothing (s):")
+                                    .on_hover_text("How long the pan takes to ease towards the cursor. 0 = track instantly.");
+                                ui.add(eframe::egui::Slider::new(smoothing, 0.0..=1.0));
+                            });
                         }
                     }
                 });
@@ -498,7 +557,7 @@ impl EditorApp {
         if preview.layers.is_empty() {
             ui.label("Add layers with files set to see a preview.");
         } else {
-            preview.sync_radii(&self.layers);
+            preview.sync_live_params(&self.layers);
 
             // Fit the texture into whatever space the (resizable) panel
             // gives us, preserving aspect ratio -- the texture itself
@@ -593,6 +652,11 @@ fn open_project(project_dir: &Path) -> Result<(Vec<EditorLayer>, u32), String> {
             project_format::Layer::Gif { path } => EditorLayer::Gif {
                 path: Some(project_dir.join(path)),
             },
+            project_format::Layer::Parallax { path, strength, smoothing } => EditorLayer::Parallax {
+                path: Some(project_dir.join(path)),
+                strength,
+                smoothing,
+            },
         })
         .collect();
 
@@ -630,6 +694,15 @@ fn save_project(project_dir: &Path, layers: &[EditorLayer], fps: u32) -> Result<
                 let path = path.as_ref().expect("save is disabled until complete");
                 let file_name = copy_asset(project_dir, path, &format!("layer_{index}_anim"))?;
                 project_format::Layer::Gif { path: file_name }
+            }
+            EditorLayer::Parallax { path, strength, smoothing } => {
+                let path = path.as_ref().expect("save is disabled until complete");
+                let file_name = copy_asset(project_dir, path, &format!("layer_{index}_parallax"))?;
+                project_format::Layer::Parallax {
+                    path: file_name,
+                    strength: *strength,
+                    smoothing: *smoothing,
+                }
             }
         };
         saved_layers.push(saved);

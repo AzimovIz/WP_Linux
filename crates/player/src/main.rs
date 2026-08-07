@@ -1,12 +1,12 @@
 //! Test prototype for the "render straight to the compositor" fix: loads
 //! one wallpaper project (path given on the command line) and draws its
-//! layers -- Image, Gif, Xray -- directly into a wlr-layer-shell surface
+//! layers -- Image, Gif, Xray, Parallax -- directly into a wlr-layer-shell surface
 //! via `wgpu::Surface::present()`. No CPU readback, no PNG/BMP encode, no
 //! HTTP, no Qt image decode -- unlike the render-server + plasma/plasma-plugin
 //! pipeline this exists to compare against.
 //!
 //! The actual compositing (pipelines, layer loading, gif timing, xray
-//! cursor handling) lives in this crate's own `lib.rs`, shared with
+//! cursor handling, parallax panning) lives in this crate's own `lib.rs`, shared with
 //! render-server and editor -- see its module doc comment. This file is
 //! just the wlr-layer-shell/Wayland-specific glue: opening a surface per
 //! output, driving redraws off frame callbacks, and pointer input.
@@ -17,7 +17,7 @@
 //! `SceneRenderer`; the loaded layers (textures, bind groups) are created
 //! once and drawn on every output.
 //!
-//! Cursor-follow for Xray layers uses this process's own Wayland pointer
+//! Cursor-follow for Xray and Parallax layers uses this process's own Wayland pointer
 //! input (surface-local coordinates from `wl_pointer`) rather than the
 //! D-Bus `CursorBridge` render-server relies on -- simpler for a
 //! throughput test, but it means the cursor appears to "stop" wherever
@@ -28,8 +28,9 @@
 //! Also simplified versus render-server: layers are stretched to fill
 //! each output's surface with no aspect-ratio correction, and with
 //! multiple monitors every output shares the exact same cursor pixel
-//! coordinates for Xray (render-server already only ever drives one
-//! shared canvas for every screen, so this isn't a new limitation).
+//! coordinates for Xray and Parallax (render-server already only ever
+//! drives one shared canvas for every screen, so this isn't a new
+//! limitation).
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -90,6 +91,10 @@ struct App {
     outputs: Vec<OutputSurface>,
     pointer: Option<wl_pointer::WlPointer>,
     start: Instant,
+    // Elapsed time (since `start`) as of the last parallax ease step --
+    // parallax needs a per-tick delta, unlike gif timing's running total
+    // from `start`, so this tracks where the previous tick left off.
+    last_parallax_update_ms: u64,
     exit: bool,
 
     project: Project,
@@ -144,6 +149,7 @@ fn main() {
         outputs: Vec::new(),
         pointer: None,
         start: Instant::now(),
+        last_parallax_update_ms: 0,
         exit: false,
         project,
         project_dir,
@@ -241,6 +247,9 @@ impl App {
         let elapsed_ms = self.start.elapsed().as_millis() as u64;
         renderer.advance_gifs(&mut self.layers, elapsed_ms);
         renderer.update_xray_cursors(&self.layers, self.cursor);
+        let parallax_dt_ms = elapsed_ms.saturating_sub(self.last_parallax_update_ms);
+        self.last_parallax_update_ms = elapsed_ms;
+        renderer.update_parallax(&mut self.layers, self.cursor, parallax_dt_ms);
 
         let frame = match out.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(tex)

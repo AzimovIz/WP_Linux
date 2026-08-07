@@ -41,6 +41,24 @@ pub enum Layer {
     },
     /// A looping GIF animation, relative path within the project dir.
     Gif { path: String },
+    /// A single picture that pans opposite* the cursor to fake depth --
+    /// stack several of these (background to foreground) with increasing
+    /// `strength` for a full parallax effect. The renderer zooms the
+    /// picture in just enough to cover the largest possible pan without
+    /// exposing an edge, so any source picture works regardless of how
+    /// much margin it actually has.
+    Parallax {
+        path: String,
+        /// How far the layer pans, as a fraction of its own size, when
+        /// the cursor is at the screen edge. 0.0 = static, and values
+        /// much above ~0.45 make the auto-zoom very noticeable. Negative
+        /// values pan the layer towards the cursor instead of away from
+        /// it.
+        strength: f32,
+        /// Seconds for the pan to ease towards the cursor-driven target
+        /// (exponential decay) -- 0.0 tracks the cursor instantly.
+        smoothing: f32,
+    },
 }
 
 impl Layer {
@@ -48,7 +66,7 @@ impl Layer {
     /// being renderable once and left alone): anything that reacts to
     /// the cursor or animates on its own.
     pub fn is_dynamic(&self) -> bool {
-        matches!(self, Layer::Xray { .. } | Layer::Gif { .. })
+        matches!(self, Layer::Xray { .. } | Layer::Gif { .. } | Layer::Parallax { .. })
     }
 }
 

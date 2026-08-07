@@ -6,7 +6,7 @@
 //!   POST /geometry   body = "virtualX,virtualY,width,height" -> the wallpaper
 //!                    item's placement on the virtual desktop, used to turn
 //!                    the global cursor position (see below) into local,
-//!                    normalized coordinates for xray layers
+//!                    normalized coordinates for xray/parallax layers
 //!   GET  /frame      -> current frame, PNG (static project) or BMP (dynamic)
 //!   GET  /meta       -> {"ready": bool, "frame_id": u64, "needs_cursor": bool, "fps": u32}
 //!
@@ -22,7 +22,7 @@
 //!
 //! Layers that don't react to the cursor or animate on their own (plain
 //! `Image`) are rendered once and left alone. Layers that do (`Xray`,
-//! `Gif`) put the server into a continuous render loop, capped at the
+//! `Gif`, `Parallax`) put the server into a continuous render loop, capped at the
 //! project's configured fps, whose frames go out as uncompressed BMP --
 //! on localhost, bandwidth is free but PNG's deflate compression is not,
 //! and BMP decode in Qt is essentially a memcpy.
@@ -91,6 +91,10 @@ struct LoadedProject {
     // not tick-accumulator-based, so all it needs from us is "how long
     // has this project been loaded" -- no per-layer state to track here.
     loaded_at: Instant,
+    // Parallax easing needs a delta, not a running total (see
+    // `SceneRenderer::update_parallax`) -- this is `loaded_at.elapsed()`
+    // as of the last tick that actually called it.
+    last_parallax_update_ms: u64,
 }
 
 #[derive(Default)]
@@ -403,8 +407,9 @@ fn main() {
 }
 
 /// Runs forever in its own thread: picks up newly-posted project paths,
-/// re-composites dynamic projects (gif animation, xray cursor reaction)
-/// at a capped rate, and renders a static project exactly once. Idles
+/// re-composites dynamic projects (gif animation, xray/parallax cursor
+/// reaction) at a capped rate, and renders a static project exactly
+/// once. Idles
 /// almost for free when nothing is loaded or the current project is
 /// fully static. Never holds `state`'s locks while doing GPU work.
 fn render_tick_loop(renderer: &SceneRenderer, state: &SharedState) {
@@ -474,7 +479,23 @@ fn render_tick_loop(renderer: &SceneRenderer, state: &SharedState) {
             let cursor_changed =
                 project.needs_cursor && !power_saving && cursor_uv != last_rendered_cursor_uv;
 
-            if needs_render || gif_changed || cursor_changed {
+            // Unlike xray, parallax has state that eases towards a
+            // target over several ticks -- it can still be moving after
+            // the cursor itself has stopped, so `cursor_changed` alone
+            // can't tell us whether a redraw is warranted. Advance it
+            // unconditionally (like `advance_gifs` above) and trust its
+            // own answer instead.
+            let parallax_changed = if project.needs_cursor && !power_saving {
+                let elapsed_ms = project.loaded_at.elapsed().as_millis() as u64;
+                let dt_ms = elapsed_ms.saturating_sub(project.last_parallax_update_ms);
+                project.last_parallax_update_ms = elapsed_ms;
+                let cursor_px = cursor_px_from_uv(cursor_uv, project.canvas_width, project.canvas_height);
+                renderer.update_parallax(&mut project.layers, cursor_px, dt_ms)
+            } else {
+                false
+            };
+
+            if needs_render || gif_changed || cursor_changed || parallax_changed {
                 last_rendered_cursor_uv = cursor_uv;
 
                 let (frame_bytes, content_type) = compose_and_encode(renderer, project, cursor_uv);
@@ -504,20 +525,27 @@ fn render_tick_loop(renderer: &SceneRenderer, state: &SharedState) {
     }
 }
 
+/// Converts a normalized (0..1) cursor position within the wallpaper item
+/// into canvas pixel coordinates, or a sentinel far off-canvas if there
+/// currently isn't one (matches `player`'s own convention for "cursor
+/// isn't anywhere near this layer" -- see `App::pointer_frame`'s `Leave`
+/// handling).
+fn cursor_px_from_uv(cursor_uv: Option<(f32, f32)>, canvas_width: u32, canvas_height: u32) -> (f32, f32) {
+    cursor_uv
+        .map(|(u, v)| (u * canvas_width as f32, v * canvas_height as f32))
+        .unwrap_or((-1.0e6, -1.0e6))
+}
+
 fn compose_and_encode(
     renderer: &SceneRenderer,
     project: &LoadedProject,
     cursor_uv: Option<(f32, f32)>,
 ) -> (Vec<u8>, &'static str) {
-    let cursor_px = cursor_uv
-        .filter(|_| project.needs_cursor)
-        .map(|(u, v)| {
-            (
-                u * project.canvas_width as f32,
-                v * project.canvas_height as f32,
-            )
-        })
-        .unwrap_or((-1.0e6, -1.0e6));
+    let cursor_px = cursor_px_from_uv(
+        cursor_uv.filter(|_| project.needs_cursor),
+        project.canvas_width,
+        project.canvas_height,
+    );
 
     renderer.update_xray_cursors(&project.layers, cursor_px);
     let rgba = renderer::render_frame(renderer, &project.canvas, &project.layers);
@@ -553,7 +581,7 @@ fn load_project(renderer: &SceneRenderer, project_dir: &Path) -> Result<LoadedPr
     let needs_cursor = project
         .layers
         .iter()
-        .any(|l| matches!(l, Layer::Xray { .. }));
+        .any(|l| matches!(l, Layer::Xray { .. } | Layer::Parallax { .. }));
     let canvas = renderer::create_canvas(renderer, canvas_width, canvas_height);
     let fps = project.fps.clamp(1, 60);
     let tick_interval = Duration::from_millis(1000 / u64::from(fps));
@@ -568,6 +596,7 @@ fn load_project(renderer: &SceneRenderer, project_dir: &Path) -> Result<LoadedPr
         fps,
         tick_interval,
         loaded_at: Instant::now(),
+        last_parallax_update_ms: 0,
     })
 }
 
