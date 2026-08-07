@@ -11,7 +11,14 @@ EOF
 }
 
 post_upgrade() {
-    post_install
+    cat <<EOF
+==> WP Linux upgraded. As your normal user (not root), pick up the new
+==> render-server binary with:
+==>   systemctl --user daemon-reload
+==>   systemctl --user restart render-server.service
+==> ('restart', not 'start'/'enable --now' -- the service is already
+==> running from before, so those would leave the old binary in place.)
+EOF
 }
 
 pre_remove() {

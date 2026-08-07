@@ -99,7 +99,14 @@ if command -v systemctl >/dev/null 2>&1; then
     mkdir -p "$SYSTEMD_USER_DIR"
     cp "$pkgroot/systemd/render-server.service" "$SYSTEMD_USER_DIR/"
     systemctl --user daemon-reload
-    systemctl --user enable --now render-server.service
+    systemctl --user enable render-server.service
+    # `restart`, not `start`: on a reinstall/update the service is
+    # typically already running, and `start` is a no-op against an
+    # already-active unit -- it would leave the old binary running
+    # until the next reboot/logout instead of picking up the one we
+    # just installed. `restart` starts it either way.
+    log "restarting render-server to pick up the newly installed binary"
+    systemctl --user restart render-server.service
 else
     warn "systemctl not found -- start render-server by hand: ${BIN_DIR}/render-server"
 fi
