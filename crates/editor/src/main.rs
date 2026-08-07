@@ -454,19 +454,19 @@ impl eframe::App for EditorApp {
 
                     match layer {
                         EditorLayer::Image { path } => {
-                            path_picker(ui, "Picture", path, &["png", "jpg", "jpeg"]);
+                            path_picker(ui, "Picture", path, &["png", "jpg", "jpeg", "webp"]);
                         }
                         EditorLayer::Xray {
                             base,
                             overlay,
                             radius,
                         } => {
-                            path_picker(ui, "Base picture", base, &["png", "jpg", "jpeg"]);
+                            path_picker(ui, "Base picture", base, &["png", "jpg", "jpeg", "webp"]);
                             path_picker(
                                 ui,
                                 "Overlay picture (shown near cursor)",
                                 overlay,
-                                &["png", "jpg", "jpeg"],
+                                &["png", "jpg", "jpeg", "webp"],
                             );
                             ui.horizontal(|ui| {
                                 ui.label("Radius (px):");
@@ -481,7 +481,7 @@ impl eframe::App for EditorApp {
                                 ui,
                                 "Picture (bigger than your desktop resolution works best)",
                                 path,
-                                &["png", "jpg", "jpeg"],
+                                &["png", "jpg", "jpeg", "webp"],
                             );
                             ui.horizontal(|ui| {
                                 ui.label("Strength:")
