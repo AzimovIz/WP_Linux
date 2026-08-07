@@ -19,9 +19,9 @@ small GPU-accelerated editor, then run it as your desktop wallpaper.
 Parallax layer in action, reacting to the cursor on the real desktop:
 
 <p align="center">
-  <video src="assets/paralax_preview.webm" controls width="720">
+  <video src="https://github.com/AzimovIz/WP_Linux/raw/main/assets/paralax_preview.webm" controls width="720">
     Your viewer doesn't support inline video --
-    <a href="assets/paralax_preview.webm">download the clip</a> instead.
+    <a href="https://github.com/AzimovIz/WP_Linux/raw/main/assets/paralax_preview.webm">download the clip</a> instead.
   </video>
 </p>
 
