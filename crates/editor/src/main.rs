@@ -67,6 +67,11 @@ const WALLPAPER_GRID_COLUMNS: usize = 4;
 /// Size of each tile's preview image (name label sits below it, outside
 /// this rect).
 const WALLPAPER_TILE_SIZE: eframe::egui::Vec2 = eframe::egui::Vec2::new(220.0, 130.0);
+/// Size of each tile's always-visible Редактировать/Применить icon
+/// buttons, pinned to the top-right corner of the thumbnail.
+const WALLPAPER_ICON_SIZE: f32 = 24.0;
+const WALLPAPER_ICON_MARGIN: f32 = 6.0;
+const WALLPAPER_ICON_GAP: f32 = 4.0;
 
 enum EditorLayer {
     Image {
@@ -595,7 +600,8 @@ impl EditorApp {
 
     /// One tile in the "Обои" grid: a fixed-size preview (or a plain
     /// placeholder if this entry has no `preview.png` yet) with
-    /// Редактировать/Применить buttons overlaid on hover.
+    /// always-visible Редактировать/Применить icon buttons pinned to its
+    /// top-right corner.
     fn show_wallpaper_tile(&mut self, ui: &mut eframe::egui::Ui, entry: &library::LibraryEntry) {
         let display_name = if entry.name.is_empty() { entry.id.as_str() } else { entry.name.as_str() };
 
@@ -614,25 +620,34 @@ impl EditorApp {
             } else {
                 ui.painter().rect_filled(rect, 4.0, ui.visuals().faint_bg_color);
             }
-            let response = response.on_hover_text(hover_text);
+            response.on_hover_text(hover_text);
 
-            if response.hovered() {
-                let button_height = 26.0;
-                let half_width = rect.width() / 2.0;
-                let edit_rect = eframe::egui::Rect::from_min_size(
-                    eframe::egui::pos2(rect.min.x, rect.max.y - button_height),
-                    eframe::egui::vec2(half_width, button_height),
-                );
-                let apply_rect = eframe::egui::Rect::from_min_size(
-                    eframe::egui::pos2(rect.min.x + half_width, rect.max.y - button_height),
-                    eframe::egui::vec2(half_width, button_height),
-                );
-                if ui.put(edit_rect, eframe::egui::Button::new("Редактировать")).clicked() {
-                    self.open_library_entry(entry);
-                }
-                if ui.put(apply_rect, eframe::egui::Button::new("Применить")).clicked() {
-                    self.apply_overlay = Some(entry.dir.clone());
-                }
+            // Always rendered, not hover-revealed -- an earlier version
+            // only drew these inside `if response.hovered()`, but they
+            // sit inside the same rect that response's own hover check
+            // covers, so gating their existence on it toggled them in
+            // and out every time the pointer crossed their own bounds:
+            // visible flicker, and clicks landing on a frame where the
+            // button didn't exist yet. Always rendering them (as small
+            // pinned icons instead of full-width labels, so they don't
+            // dominate the thumbnail) sidesteps that entirely.
+            let icon_size = eframe::egui::Vec2::splat(WALLPAPER_ICON_SIZE);
+            let apply_rect = eframe::egui::Rect::from_min_size(
+                eframe::egui::pos2(
+                    rect.max.x - WALLPAPER_ICON_MARGIN - WALLPAPER_ICON_SIZE,
+                    rect.min.y + WALLPAPER_ICON_MARGIN,
+                ),
+                icon_size,
+            );
+            let edit_rect = eframe::egui::Rect::from_min_size(
+                apply_rect.min - eframe::egui::vec2(WALLPAPER_ICON_GAP + WALLPAPER_ICON_SIZE, 0.0),
+                icon_size,
+            );
+            if ui.put(edit_rect, eframe::egui::Button::new("✏")).on_hover_text("Редактировать").clicked() {
+                self.open_library_entry(entry);
+            }
+            if ui.put(apply_rect, eframe::egui::Button::new("🖥")).on_hover_text("Применить").clicked() {
+                self.apply_overlay = Some(entry.dir.clone());
             }
 
             ui.label(display_name);
