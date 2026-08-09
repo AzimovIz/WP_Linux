@@ -1427,9 +1427,9 @@ impl SceneRenderer {
                     scale: 1.0,
                     bounds: glyphon::TextBounds::default(),
                     default_color: glyphon::Color::rgba(
-                        (text.color[0].clamp(0.0, 1.0) * 255.0).round() as u8,
-                        (text.color[1].clamp(0.0, 1.0) * 255.0).round() as u8,
-                        (text.color[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                        srgb_u8_from_linear(text.color[0]),
+                        srgb_u8_from_linear(text.color[1]),
+                        srgb_u8_from_linear(text.color[2]),
                         (text.color[3].clamp(0.0, 1.0) * 255.0).round() as u8,
                     ),
                     custom_glyphs: &[],
@@ -1610,6 +1610,35 @@ fn zoom_for_strength(strength: f32) -> f32 {
     1.0 / (1.0 - 2.0 * strength.abs()).max(0.1)
 }
 
+/// Converts one linear-light channel (0.0..=1.0, out-of-range clamped) to
+/// an sRGB-gamma-encoded byte -- the standard sRGB transfer function,
+/// matching `ecolor::gamma_u8_from_linear_f32` (egui's own equivalent,
+/// not reused directly since `player` doesn't otherwise depend on egui).
+///
+/// `Layer::Text::color` is filled in by editor's
+/// `ui.color_edit_button_rgba_unmultiplied`, which egui documents as
+/// operating in **linear** RGB space -- but glyphon's `TextAtlas` (built
+/// with its default `ColorMode::Accurate`) expects the vertex color it's
+/// handed to already be gamma-encoded, and un-does that encoding itself
+/// (`srgb_to_linear` in its `shader.wgsl`) before using it. Passing the
+/// linear float straight through as a byte (a naive `* 255.0`) skips the
+/// encoding this step assumes already happened, so glyphon's own decode
+/// then applies to a value that was never encoded -- silently shifting
+/// every non-primary color, most visibly in the midtones. Confirmed with
+/// a color picker against the actual rendered output, not just reasoned
+/// about from the two API docs alone.
+fn srgb_u8_from_linear(linear: f32) -> u8 {
+    if linear <= 0.0 {
+        0
+    } else if linear <= 0.0031308 {
+        (linear * 3294.6).round() as u8
+    } else if linear <= 1.0 {
+        (269.025 * linear.powf(1.0 / 2.4) - 14.025).round() as u8
+    } else {
+        255
+    }
+}
+
 fn open_rgba(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
     let image = image::open(path)
         .map_err(|e| format!("failed to open image {path:?}: {e}"))?
@@ -1681,6 +1710,20 @@ mod tests {
     fn literal_source_always_returns_its_fixed_text() {
         let source = LiteralSource { text: "hello".to_string() };
         assert_eq!(source.poll(fixed_now()), "hello");
+    }
+
+    #[test]
+    fn srgb_u8_from_linear_matches_known_reference_points() {
+        assert_eq!(srgb_u8_from_linear(0.0), 0);
+        assert_eq!(srgb_u8_from_linear(1.0), 255);
+        // Well-known sRGB fact: linear 0.5 (physical half-brightness)
+        // encodes to byte 188, not the naively-expected 128 -- this is
+        // exactly the compression the naive `* 255.0` this replaced was
+        // missing.
+        assert_eq!(srgb_u8_from_linear(0.5), 188);
+        // Out-of-range input clamps instead of wrapping/panicking.
+        assert_eq!(srgb_u8_from_linear(-1.0), 0);
+        assert_eq!(srgb_u8_from_linear(2.0), 255);
     }
 
     #[test]
