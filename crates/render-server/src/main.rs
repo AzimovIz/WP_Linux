@@ -40,6 +40,7 @@
 //! of milliseconds serialized every /meta and /frame request behind it,
 //! since tiny_http handles requests one at a time on a single thread.
 
+mod monitors_config;
 mod renderer;
 
 use std::collections::HashMap;
@@ -386,12 +387,25 @@ fn main() {
     // window between process start and the HTTP bind got connection
     // refused, and for `/geometry` specifically was never retried --
     // leaving xray/parallax layers permanently blind to the cursor until
-    // something recreated the wallpaper item. `/project` already
-    // self-heals via a retry in `sceneMeta.poll()`, which is why it used
-    // to "just work" after a moment while geometry silently didn't.
+    // something recreated the wallpaper item. `/project` no longer needs a
+    // retry at all (from QML or otherwise): its assignments are persisted
+    // to disk by the editor app and reloaded below on every startup.
     let server =
         Server::http(HTTP_ADDR).unwrap_or_else(|e| panic!("failed to bind {HTTP_ADDR}: {e}"));
     eprintln!("render-server: listening on http://{HTTP_ADDR}");
+
+    // Seed pending_project from disk before the render thread starts, so
+    // its very first tick already has every monitor's last-known
+    // assignment to load -- exactly the same map/lock `POST /project`
+    // writes into at runtime, just pre-populated instead of waiting for an
+    // HTTP push. editor is the sole writer of this file; this process only
+    // ever reads it, once, here (see monitors_config's own doc comment).
+    {
+        let assignments = monitors_config::load();
+        let count = assignments.len();
+        state.pending_project.lock().unwrap().extend(assignments);
+        eprintln!("render-server: loaded {count} monitor assignment(s) from disk");
+    }
 
     eprintln!("render-server: initializing wgpu...");
     let renderer = Arc::new(pollster::block_on(SceneRenderer::new_headless(CANVAS_FORMAT)));
@@ -747,13 +761,14 @@ fn load_project(renderer: &SceneRenderer, project_dir: &Path) -> Result<LoadedPr
         return Err("project has no layers".to_string());
     }
 
-    let loaded_layers = renderer.load_scene(&project_dir, &project)?;
+    let mut loaded_layers = renderer.load_scene(&project_dir, &project)?;
     // Whichever layer happens to load first sets the canvas size, same as
     // this always worked before `load_scene` moved into `player`.
     let (canvas_width, canvas_height) = loaded_layers
         .first()
         .map(LoadedLayer::size)
         .expect("checked non-empty above");
+    renderer.set_text_viewport(&mut loaded_layers, canvas_width, canvas_height);
 
     let dynamic = project.layers.iter().any(Layer::is_dynamic);
     let needs_cursor = project

@@ -373,6 +373,14 @@ impl LayerShellHandler for App {
             return;
         }
 
+        // All outputs share one `self.layers` scene (see module doc
+        // comment), so with differently-sized monitors this ends up
+        // tuned for whichever output configured most recently -- a real
+        // but narrow limitation of this secondary/test binary (the
+        // primary path is render-server, which only ever drives one
+        // canvas). Not solved here.
+        renderer.set_text_viewport(&mut self.layers, out.width, out.height);
+
         let caps = out.surface.get_capabilities(&renderer.adapter);
         out.surface.configure(
             &renderer.device,

@@ -13,6 +13,10 @@ pub const MANIFEST_FILE_NAME: &str = "project.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
+    /// Human-readable name shown in the library picker. Empty for any
+    /// project.json that predates this field.
+    #[serde(default)]
+    pub name: String,
     /// Layers, bottom to top -- rendered in this order and alpha-blended
     /// on top of one another.
     pub layers: Vec<Layer>,
@@ -59,6 +63,43 @@ pub enum Layer {
         /// (exponential decay) -- 0.0 tracks the cursor instantly.
         smoothing: f32,
     },
+    /// A string of text drawn at an arbitrary position on the canvas --
+    /// unlike every other layer, not a full-canvas effect. Always drawn
+    /// on top of every other layer regardless of its own position in
+    /// this project's layer list (see player's `record_draw`).
+    Text {
+        /// Position as a fraction of canvas width/height (0.0..=1.0),
+        /// not pixels -- deliberately resolution-independent, so the
+        /// same project reads correctly regardless of which monitor's
+        /// resolution it ends up assigned to.
+        x: f32,
+        y: f32,
+        /// Font size as a fraction of canvas *height* -- same
+        /// resolution-independence rationale as x/y.
+        font_size: f32,
+        /// RGBA, each channel 0.0..=1.0 -- matches `wgpu::Color`'s own
+        /// convention, already used elsewhere in this codebase.
+        color: [f32; 4],
+        source: TextSource,
+    },
+}
+
+/// Where a `Layer::Text`'s displayed string comes from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TextSource {
+    /// A fixed string, never changes.
+    Literal { text: String },
+}
+
+impl TextSource {
+    /// Whether this source can ever produce a different string over
+    /// time (as opposed to `Literal`, which is fixed forever).
+    pub fn is_dynamic(&self) -> bool {
+        match self {
+            TextSource::Literal { .. } => false,
+        }
+    }
 }
 
 impl Layer {
@@ -66,7 +107,11 @@ impl Layer {
     /// being renderable once and left alone): anything that reacts to
     /// the cursor or animates on its own.
     pub fn is_dynamic(&self) -> bool {
-        matches!(self, Layer::Xray { .. } | Layer::Gif { .. } | Layer::Parallax { .. })
+        match self {
+            Layer::Xray { .. } | Layer::Gif { .. } | Layer::Parallax { .. } => true,
+            Layer::Text { source, .. } => source.is_dynamic(),
+            Layer::Image { .. } => false,
+        }
     }
 }
 
@@ -115,5 +160,37 @@ impl Project {
         let text = serde_json::to_string_pretty(self)?;
         fs::write(project_dir.join(MANIFEST_FILE_NAME), text)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_defaults_to_empty_for_pre_existing_project_json() {
+        let project: Project =
+            serde_json::from_str(r#"{"layers":[],"fps":30}"#).expect("should still parse");
+        assert_eq!(project.name, "");
+    }
+
+    #[test]
+    fn text_layer_with_literal_source_round_trips() {
+        let layer = Layer::Text {
+            x: 0.5,
+            y: 0.1,
+            font_size: 0.05,
+            color: [1.0, 1.0, 1.0, 1.0],
+            source: TextSource::Literal { text: "hello".to_string() },
+        };
+        let json = serde_json::to_string(&layer).unwrap();
+        let round_tripped: Layer = serde_json::from_str(&json).unwrap();
+        assert!(!round_tripped.is_dynamic());
+        match round_tripped {
+            Layer::Text { x, y, font_size, color, source: TextSource::Literal { text } } => {
+                assert_eq!((x, y, font_size, color, text.as_str()), (0.5, 0.1, 0.05, [1.0; 4], "hello"));
+            }
+            _ => panic!("expected Layer::Text"),
+        }
     }
 }

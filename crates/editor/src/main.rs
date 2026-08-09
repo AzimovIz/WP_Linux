@@ -11,11 +11,17 @@
 //! render-server uses, not a separate reimplementation that could drift
 //! out of sync with what actually ships.
 
+mod library;
+mod monitors_config;
+mod push;
+
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use player::wgpu;
 use player::{LoadedLayer, SceneRenderer};
+use push::{ProjectPusher, TcpPusher};
 
 /// The offscreen texture itself stays modest -- it's an authoring aid,
 /// not a full-resolution look at the wallpaper (that's what running the
@@ -38,6 +44,30 @@ fn main() -> eframe::Result {
     )
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Wallpapers,
+    Discover,
+    Editor,
+}
+
+/// One connected output, as reported by winit -- `name` is the same
+/// `wl_output` protocol name Qt's `Screen.name` (in main.qml) and
+/// render-server's `?monitor=` query param already use, so it can be used
+/// as a monitor id with no translation.
+#[derive(Clone)]
+struct MonitorInfo {
+    name: String,
+    width: u32,
+    height: u32,
+}
+
+/// Number of tiles per row in the "Обои" tab's wallpaper grid.
+const WALLPAPER_GRID_COLUMNS: usize = 4;
+/// Size of each tile's preview image (name label sits below it, outside
+/// this rect).
+const WALLPAPER_TILE_SIZE: eframe::egui::Vec2 = eframe::egui::Vec2::new(220.0, 130.0);
+
 enum EditorLayer {
     Image {
         path: Option<PathBuf>,
@@ -55,6 +85,15 @@ enum EditorLayer {
         strength: f32,
         smoothing: f32,
     },
+    Text {
+        // Normalized (0.0..=1.0) canvas fractions -- see
+        // `project_format::Layer::Text`.
+        x: f32,
+        y: f32,
+        font_size: f32,
+        color: [f32; 4],
+        text: String,
+    },
 }
 
 impl EditorLayer {
@@ -64,6 +103,7 @@ impl EditorLayer {
             EditorLayer::Xray { .. } => "Xray",
             EditorLayer::Gif { .. } => "Gif",
             EditorLayer::Parallax { .. } => "Parallax",
+            EditorLayer::Text { .. } => "Text",
         }
     }
 
@@ -73,6 +113,9 @@ impl EditorLayer {
             EditorLayer::Xray { base, overlay, .. } => base.is_some() && overlay.is_some(),
             EditorLayer::Gif { path } => path.is_some(),
             EditorLayer::Parallax { path, .. } => path.is_some(),
+            // No external asset -- always ready to preview/save, even
+            // with an empty string.
+            EditorLayer::Text { .. } => true,
         }
     }
 }
@@ -90,6 +133,13 @@ enum LayerSignature {
     Xray(PathBuf, PathBuf),
     Gif(PathBuf),
     Parallax(PathBuf),
+    // No payload -- unlike every other layer, nothing about a Text
+    // layer ever requires a GPU reload; every property (including the
+    // text itself) is updatable live via `SceneRenderer::set_text_params`
+    // (see `Preview::sync_live_params`), so signature equality alone
+    // (Text always equals Text) is enough to skip `ensure_scene`'s
+    // reload path for it.
+    Text,
 }
 
 /// Live GPU preview of the current layer stack.
@@ -158,7 +208,7 @@ impl Preview {
             return Ok(());
         }
 
-        let layers = self.renderer.load_scene(Path::new(""), &project)?;
+        let mut layers = self.renderer.load_scene(Path::new(""), &project)?;
         let (natural_width, natural_height) =
             layers.first().map(LoadedLayer::size).unwrap_or((16, 9));
         let (width, height) = preview_size(natural_width, natural_height);
@@ -175,6 +225,10 @@ impl Preview {
             self.width = width;
             self.height = height;
         }
+        // Text renders directly into this preview texture, at *its*
+        // pixel size -- not `natural_width`/`natural_height`, which is
+        // only used above to pick an aspect-correct preview size.
+        self.renderer.set_text_viewport(&mut layers, width, height);
 
         self.layers = layers;
         self.loaded_at = Instant::now();
@@ -202,6 +256,9 @@ impl Preview {
                 EditorLayer::Xray { radius, .. } => loaded.set_xray_radius(*radius * scale),
                 EditorLayer::Parallax { strength, smoothing, .. } => {
                     loaded.set_parallax_params(*strength, *smoothing);
+                }
+                EditorLayer::Text { x, y, font_size, color, text } => {
+                    self.renderer.set_text_params(loaded, text, *x, *y, *font_size, *color);
                 }
                 EditorLayer::Image { .. } | EditorLayer::Gif { .. } => {}
             }
@@ -296,9 +353,19 @@ fn build_preview_project(layers: &[EditorLayer]) -> Option<project_format::Proje
                 strength: *strength,
                 smoothing: *smoothing,
             },
+            EditorLayer::Text { x, y, font_size, color, text } => project_format::Layer::Text {
+                x: *x,
+                y: *y,
+                font_size: *font_size,
+                color: *color,
+                source: project_format::TextSource::Literal { text: text.clone() },
+            },
         })
         .collect();
     Some(project_format::Project {
+        // Irrelevant to the preview itself -- this `Project` only exists
+        // to hand to `load_scene`, which never reads `name` at all.
+        name: String::new(),
         layers: converted,
         // Irrelevant to the preview itself (see `PREVIEW_REPAINT_INTERVAL`)
         // -- this `Project` only exists to hand to `load_scene`, which
@@ -324,6 +391,7 @@ fn build_signature(layers: &[EditorLayer]) -> Vec<LayerSignature> {
             EditorLayer::Parallax { path, .. } => {
                 LayerSignature::Parallax(path.clone().expect("checked complete by caller"))
             }
+            EditorLayer::Text { .. } => LayerSignature::Text,
         })
         .collect()
 }
@@ -339,21 +407,53 @@ fn build_signature(layers: &[EditorLayer]) -> Vec<LayerSignature> {
 const PREVIEW_REPAINT_INTERVAL: Duration = Duration::from_millis(1000 / 30);
 
 struct EditorApp {
+    tab: Tab,
+    previous_tab: Tab,
+
+    // -- "Обои" tab state --
+    monitors: Vec<MonitorInfo>,
+    /// Mirrors `monitors_config`'s on-disk file -- monitor id -> project dir.
+    assignments: HashMap<String, PathBuf>,
+    library: Vec<library::LibraryEntry>,
+    /// Lazily-loaded preview textures, keyed by each entry's `preview_path`.
+    thumbnails: HashMap<PathBuf, eframe::egui::TextureHandle>,
+    pusher: Box<dyn ProjectPusher>,
+    /// Project dir of the wallpaper whose "Применить" overlay (monitor
+    /// picker) is currently open, if any.
+    apply_overlay: Option<PathBuf>,
+
+    // -- "Редактор" tab state --
     layers: Vec<EditorLayer>,
     fps: u32,
     status: String,
     preview: Option<Preview>,
     preview_error: Option<String>,
+    /// Which library entry the editor tab is currently editing, if any --
+    /// `None` until the first save of a brand-new project. Nothing
+    /// remembered this before: every save used to open a fresh folder
+    /// dialog with no memory of what was last opened.
+    current_project_id: Option<String>,
+    current_project_name: String,
 }
 
 impl Default for EditorApp {
     fn default() -> Self {
         Self {
+            tab: Tab::Wallpapers,
+            previous_tab: Tab::Wallpapers,
+            monitors: Vec::new(),
+            assignments: monitors_config::load(),
+            library: library::scan(),
+            thumbnails: HashMap::new(),
+            pusher: Box::new(TcpPusher),
+            apply_overlay: None,
             layers: Vec::new(),
             fps: 30,
             status: String::new(),
             preview: None,
             preview_error: None,
+            current_project_id: None,
+            current_project_name: String::new(),
         }
     }
 }
@@ -362,34 +462,256 @@ impl eframe::App for EditorApp {
     fn ui(&mut self, ui: &mut eframe::egui::Ui, frame: &mut eframe::Frame) {
         let render_state = frame.wgpu_render_state().cloned();
 
-        eframe::egui::Panel::left("preview_panel")
-            .resizable(true)
-            .default_size(760.0)
-            .size_range(320.0..=980.0)
-            .show(ui, |ui| {
-                self.show_preview(ui, render_state.as_ref());
+        // Cheap (no IPC round trip -- just already-known compositor state)
+        // to recompute every frame, so monitor hot-plug just shows up on
+        // the next repaint with no manual "refresh" needed. Deduped by
+        // name -- winit's Wayland backend has been observed to list the
+        // same output more than once in a single `available_monitors()`
+        // call, which without this showed e.g. 4 entries for 2 real
+        // monitors.
+        if let Some(window) = frame.winit_window() {
+            let mut seen_names = std::collections::HashSet::new();
+            self.monitors = window
+                .available_monitors()
+                .filter_map(|m| {
+                    let name = m.name()?;
+                    if !seen_names.insert(name.clone()) {
+                        return None;
+                    }
+                    let size = m.size();
+                    Some(MonitorInfo { name, width: size.width, height: size.height })
+                })
+                .collect();
+        }
+
+        eframe::egui::Panel::top("tabs").show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.tab, Tab::Wallpapers, "Обои");
+                ui.selectable_value(&mut self.tab, Tab::Discover, "Больше обоев");
+                ui.selectable_value(&mut self.tab, Tab::Editor, "Редактор");
+            });
+            ui.add_space(4.0);
+        });
+
+        // Auto-rescan whenever the Wallpapers tab gains focus (e.g. a
+        // project was dropped into the library by hand while this tab
+        // wasn't showing) -- the Rescan button inside the tab itself is a
+        // fallback/confidence action, not the only trigger.
+        if self.previous_tab != Tab::Wallpapers && self.tab == Tab::Wallpapers {
+            self.rescan_library();
+        }
+        self.previous_tab = self.tab;
+
+        match self.tab {
+            Tab::Wallpapers => {
+                eframe::egui::CentralPanel::default().show(ui, |ui| {
+                    self.show_wallpapers_tab(ui);
+                });
+            }
+            Tab::Discover => {
+                eframe::egui::CentralPanel::default().show(ui, |ui| {
+                    self.show_discover_tab(ui);
+                });
+            }
+            Tab::Editor => {
+                eframe::egui::Panel::left("preview_panel")
+                    .resizable(true)
+                    .default_size(760.0)
+                    .size_range(320.0..=980.0)
+                    .show(ui, |ui| {
+                        self.show_preview(ui, render_state.as_ref());
+                    });
+
+                eframe::egui::CentralPanel::default().show(ui, |ui| {
+                    self.show_editor_tab(ui);
+                });
+            }
+        }
+    }
+}
+
+impl EditorApp {
+    fn show_discover_tab(&mut self, ui: &mut eframe::egui::Ui) {
+        ui.centered_and_justified(|ui| {
+            ui.heading("Больше обоев — скоро");
+        });
+    }
+
+    fn rescan_library(&mut self) {
+        self.library = library::scan();
+        // Clear cached thumbnails too -- otherwise a just-resaved
+        // project's changed preview.png would keep showing the old
+        // texture, still cached under the same path.
+        self.thumbnails.clear();
+    }
+
+    /// The three effects of picking a wallpaper for a monitor: remember it
+    /// locally, persist it (so render-server picks it up on its next
+    /// startup even if it's not running right now), and try to push it to
+    /// a currently-running render-server so the change applies live.
+    fn assign(&mut self, monitor_id: &str, project_dir: &Path) {
+        self.assignments.insert(monitor_id.to_string(), project_dir.to_path_buf());
+        if let Err(e) = monitors_config::save(&self.assignments) {
+            self.status = format!("Failed to save monitor assignment: {e}");
+            return;
+        }
+        match self.pusher.push(monitor_id, project_dir) {
+            Ok(()) => self.status = format!("Assigned {monitor_id} -> {}", project_dir.display()),
+            Err(e) => {
+                self.status =
+                    format!("Assigned locally, but couldn't reach render-server: {e}");
+            }
+        }
+    }
+
+    fn show_wallpapers_tab(&mut self, ui: &mut eframe::egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Обои");
+            if ui.button("Rescan").clicked() {
+                self.rescan_library();
+            }
+        });
+        ui.add_space(8.0);
+
+        if self.library.is_empty() {
+            ui.label("No wallpapers in the library yet -- save one from the Редактор tab.");
+        }
+
+        eframe::egui::ScrollArea::vertical().show(ui, |ui| {
+            let entries = self.library.clone();
+            for row in entries.chunks(WALLPAPER_GRID_COLUMNS) {
+                ui.horizontal(|ui| {
+                    for entry in row {
+                        self.show_wallpaper_tile(ui, entry);
+                    }
+                });
+                ui.add_space(12.0);
+            }
+        });
+
+        self.show_apply_overlay(ui.ctx());
+    }
+
+    /// One tile in the "Обои" grid: a fixed-size preview (or a plain
+    /// placeholder if this entry has no `preview.png` yet) with
+    /// Редактировать/Применить buttons overlaid on hover.
+    fn show_wallpaper_tile(&mut self, ui: &mut eframe::egui::Ui, entry: &library::LibraryEntry) {
+        let display_name = if entry.name.is_empty() { entry.id.as_str() } else { entry.name.as_str() };
+
+        let hover_text = format!("{display_name} -- {} layer(s), {} fps", entry.layer_count, entry.fps);
+
+        ui.vertical(|ui| {
+            ui.set_width(WALLPAPER_TILE_SIZE.x);
+            let (rect, response) = ui.allocate_exact_size(WALLPAPER_TILE_SIZE, eframe::egui::Sense::hover());
+
+            if let Some(preview_path) = &entry.preview_path {
+                let texture = self
+                    .thumbnails
+                    .entry(preview_path.clone())
+                    .or_insert_with(|| load_thumbnail_texture(ui.ctx(), preview_path));
+                ui.put(rect, eframe::egui::Image::from_texture((texture.id(), WALLPAPER_TILE_SIZE)));
+            } else {
+                ui.painter().rect_filled(rect, 4.0, ui.visuals().faint_bg_color);
+            }
+            let response = response.on_hover_text(hover_text);
+
+            if response.hovered() {
+                let button_height = 26.0;
+                let half_width = rect.width() / 2.0;
+                let edit_rect = eframe::egui::Rect::from_min_size(
+                    eframe::egui::pos2(rect.min.x, rect.max.y - button_height),
+                    eframe::egui::vec2(half_width, button_height),
+                );
+                let apply_rect = eframe::egui::Rect::from_min_size(
+                    eframe::egui::pos2(rect.min.x + half_width, rect.max.y - button_height),
+                    eframe::egui::vec2(half_width, button_height),
+                );
+                if ui.put(edit_rect, eframe::egui::Button::new("Редактировать")).clicked() {
+                    self.open_library_entry(entry);
+                }
+                if ui.put(apply_rect, eframe::egui::Button::new("Применить")).clicked() {
+                    self.apply_overlay = Some(entry.dir.clone());
+                }
+            }
+
+            ui.label(display_name);
+        });
+    }
+
+    /// The "Применить" modal: pick which monitor `self.apply_overlay`'s
+    /// wallpaper should be assigned to, or cancel. Closes on Cancel, on a
+    /// backdrop click, or on Escape (the latter two via `Modal`'s own
+    /// `should_close`).
+    fn show_apply_overlay(&mut self, ctx: &eframe::egui::Context) {
+        let Some(dir) = self.apply_overlay.clone() else {
+            return;
+        };
+
+        let modal_response =
+            eframe::egui::Modal::new(eframe::egui::Id::new("apply_overlay")).show(ctx, |ui| {
+                ui.heading("Применить к монитору");
+                ui.add_space(8.0);
+
+                if self.monitors.is_empty() {
+                    ui.label("No monitors detected.");
+                }
+                for monitor in self.monitors.clone() {
+                    if ui.button(format!("{} ({}x{})", monitor.name, monitor.width, monitor.height)).clicked() {
+                        self.assign(&monitor.name, &dir);
+                        self.apply_overlay = None;
+                    }
+                }
+
+                ui.add_space(8.0);
+                if ui.button("Отмена").clicked() {
+                    self.apply_overlay = None;
+                }
             });
 
-        eframe::egui::CentralPanel::default().show(ui, |ui| {
+        if modal_response.should_close() {
+            self.apply_overlay = None;
+        }
+    }
+
+    /// Loads a library entry into the editor tab and switches to it --
+    /// shared by the Wallpapers tab's "Редактировать" button and the
+    /// Editor tab's own "Open project..." picker.
+    fn open_library_entry(&mut self, entry: &library::LibraryEntry) {
+        match open_project(&entry.dir) {
+            Ok((layers, fps)) => {
+                self.layers = layers;
+                self.fps = fps;
+                self.current_project_id = Some(entry.id.clone());
+                self.current_project_name = entry.name.clone();
+                self.status = format!("Opened {}", entry.dir.display());
+                self.tab = Tab::Editor;
+            }
+            Err(e) => {
+                self.status = format!("Failed to open {}: {e}", entry.dir.display());
+            }
+        }
+    }
+
+    fn show_editor_tab(&mut self, ui: &mut eframe::egui::Ui) {
             ui.heading("New wallpaper project");
             ui.label("Layers are drawn bottom to top -- the first one in the list is furthest back.");
             ui.add_space(8.0);
 
             ui.horizontal(|ui| {
-                if ui.button("Open project...").clicked() {
-                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                        match open_project(&dir) {
-                            Ok((layers, fps)) => {
-                                self.layers = layers;
-                                self.fps = fps;
-                                self.status = format!("Opened {}", dir.display());
-                            }
-                            Err(e) => {
-                                self.status = format!("Failed to open {}: {e}", dir.display());
-                            }
+                ui.menu_button("Open project...", |ui| {
+                    if self.library.is_empty() {
+                        ui.label("Library is empty.");
+                    }
+                    for entry in self.library.clone() {
+                        let display_name =
+                            if entry.name.is_empty() { entry.id.clone() } else { entry.name.clone() };
+                        if ui.button(display_name).clicked() {
+                            self.open_library_entry(&entry);
+                            ui.close();
                         }
                     }
-                }
+                });
             });
 
             ui.add_space(8.0);
@@ -421,6 +743,15 @@ impl eframe::App for EditorApp {
                         path: None,
                         strength: 0.05,
                         smoothing: 0.15,
+                    });
+                }
+                if ui.button("+ Text").clicked() {
+                    self.layers.push(EditorLayer::Text {
+                        x: 0.5,
+                        y: 0.5,
+                        font_size: 0.05,
+                        color: [1.0, 1.0, 1.0, 1.0],
+                        text: String::new(),
                     });
                 }
             });
@@ -494,6 +825,29 @@ impl eframe::App for EditorApp {
                                 ui.add(eframe::egui::Slider::new(smoothing, 0.0..=1.0));
                             });
                         }
+                        EditorLayer::Text { x, y, font_size, color, text } => {
+                            ui.horizontal(|ui| {
+                                ui.label("Text:");
+                                ui.text_edit_singleline(text);
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Font size:")
+                                    .on_hover_text("Fraction of canvas height -- resolution-independent.");
+                                ui.add(eframe::egui::Slider::new(font_size, 0.01..=0.3));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Color:");
+                                ui.color_edit_button_rgba_unmultiplied(color);
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("X:");
+                                ui.add(eframe::egui::Slider::new(x, 0.0..=1.0));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Y:");
+                                ui.add(eframe::egui::Slider::new(y, 0.0..=1.0));
+                            });
+                        }
                     }
                 });
             }
@@ -516,16 +870,30 @@ impl eframe::App for EditorApp {
             ui.separator();
             ui.add_space(8.0);
 
+            ui.horizontal(|ui| {
+                ui.label("Name:");
+                ui.text_edit_singleline(&mut self.current_project_name);
+            });
+            ui.add_space(8.0);
+
             let can_save = !self.layers.is_empty() && self.layers.iter().all(EditorLayer::is_complete);
-            if ui
-                .add_enabled(can_save, eframe::egui::Button::new("Save project as..."))
-                .clicked()
-            {
-                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                    self.status = match save_project(&dir, &self.layers, self.fps) {
-                        Ok(()) => format!("Saved to {}", dir.display()),
-                        Err(e) => format!("Failed to save: {e}"),
-                    };
+            let save_label = if self.current_project_id.is_some() { "Save" } else { "Save (new)" };
+            if ui.add_enabled(can_save, eframe::egui::Button::new(save_label)).clicked() {
+                let id = self.current_project_id.clone().unwrap_or_else(library::new_project_id);
+                let dir = library::project_dir(&id);
+                match save_project(&dir, &self.layers, self.fps, &self.current_project_name) {
+                    Ok(()) => {
+                        self.current_project_id = Some(id);
+                        if let Some(preview) = &self.preview
+                            && let Err(e) =
+                                generate_thumbnail(preview, &dir.join(library::PREVIEW_FILE_NAME))
+                        {
+                            eprintln!("editor: failed to generate thumbnail for {dir:?}: {e}");
+                        }
+                        self.rescan_library();
+                        self.status = format!("Saved to {}", dir.display());
+                    }
+                    Err(e) => self.status = format!("Failed to save: {e}"),
                 }
             }
 
@@ -533,11 +901,8 @@ impl eframe::App for EditorApp {
                 ui.add_space(8.0);
                 ui.label(&self.status);
             }
-        });
     }
-}
 
-impl EditorApp {
     fn show_preview(&mut self, ui: &mut eframe::egui::Ui, render_state: Option<&eframe::egui_wgpu::RenderState>) {
         ui.heading("Preview");
         ui.add_space(4.0);
@@ -595,6 +960,120 @@ impl EditorApp {
             ui.colored_label(eframe::egui::Color32::RED, err);
         }
     }
+}
+
+/// Thumbnails saved into the library -- deliberately smaller than the
+/// live preview texture, since these only need to look decent shrunk down
+/// to a picker button, never fill a resizable panel.
+const THUMBNAIL_WIDTH: u32 = 320;
+
+/// Renders one more offscreen frame from the already-live editor preview
+/// scene and encodes it as `dest` (a PNG). Reuses `Preview`'s
+/// `SceneRenderer`/loaded layers, which are already up to date with
+/// `self.layers` by the time Save is clicked (`show_preview` runs earlier
+/// in the same frame, in `Tab::Editor`'s left panel).
+///
+/// Mirrors the GPU-readback technique `render-server/src/renderer.rs`'s
+/// `create_canvas`/`render_frame` already use -- duplicated here rather
+/// than shared, since this is a one-shot call (once per save) with a
+/// different lifetime than that reusable per-tick `Canvas`; hoisting a
+/// shared `player::render_to_rgba`-style helper out of render-server is a
+/// reasonable future cleanup once there's a second caller, not needed yet.
+fn generate_thumbnail(preview: &Preview, dest: &Path) -> Result<(), String> {
+    if preview.layers.is_empty() {
+        return Err("no scene loaded".to_string());
+    }
+    let (natural_width, natural_height) =
+        preview.layers.first().map(LoadedLayer::size).unwrap_or((16, 9));
+    let width = THUMBNAIL_WIDTH.min(natural_width).max(1);
+    let height =
+        ((width as u64 * natural_height as u64) / natural_width.max(1) as u64).max(1) as u32;
+
+    let texture = preview.renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("editor-thumbnail"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: player::OFFSCREEN_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+    // Rows in a copy-to-buffer destination must be padded to a multiple
+    // of COPY_BYTES_PER_ROW_ALIGNMENT; strip the padding back out below.
+    let unpadded_bytes_per_row = 4 * width;
+    let padding = (wgpu::COPY_BYTES_PER_ROW_ALIGNMENT
+        - unpadded_bytes_per_row % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+        % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded_bytes_per_row = unpadded_bytes_per_row + padding;
+
+    let readback_buffer = preview.renderer.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("editor-thumbnail-readback"),
+        size: (padded_bytes_per_row * height) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = preview
+        .renderer
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    preview.renderer.record_draw(&mut encoder, &view, &preview.layers, wgpu::Color::TRANSPARENT);
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback_buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_bytes_per_row),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+    );
+    preview.renderer.queue.submit(Some(encoder.finish()));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    readback_buffer.map_async(wgpu::MapMode::Read, .., move |result| {
+        let _ = tx.send(result);
+    });
+    preview.renderer.device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll failed");
+    rx.recv().expect("map_async callback never fired").expect("failed to map readback buffer");
+
+    let mut pixels = Vec::with_capacity((unpadded_bytes_per_row * height) as usize);
+    {
+        let mapped = readback_buffer.get_mapped_range(..);
+        for row in 0..height {
+            let start = (row * padded_bytes_per_row) as usize;
+            let end = start + unpadded_bytes_per_row as usize;
+            pixels.extend_from_slice(&mapped[start..end]);
+        }
+    }
+    readback_buffer.unmap();
+
+    image::RgbaImage::from_raw(width, height, pixels)
+        .ok_or_else(|| "bad thumbnail dimensions".to_string())?
+        .save(dest)
+        .map_err(|e| e.to_string())
+}
+
+/// Loads a library entry's `preview.png` as an egui texture for the
+/// Wallpapers tab's picker grid -- decode failures fall back to a 1x1
+/// placeholder rather than erroring the whole tab out.
+fn load_thumbnail_texture(ctx: &eframe::egui::Context, path: &Path) -> eframe::egui::TextureHandle {
+    let rgba = image::open(path)
+        .map(|img| img.into_rgba8())
+        .unwrap_or_else(|_| image::RgbaImage::new(1, 1));
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let color_image = eframe::egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+    ctx.load_texture(path.display().to_string(), color_image, eframe::egui::TextureOptions::default())
 }
 
 /// Shows `label`, a Browse button, and the chosen file's name -- full
@@ -657,6 +1136,10 @@ fn open_project(project_dir: &Path) -> Result<(Vec<EditorLayer>, u32), String> {
                 strength,
                 smoothing,
             },
+            project_format::Layer::Text { x, y, font_size, color, source } => {
+                let project_format::TextSource::Literal { text } = source;
+                EditorLayer::Text { x, y, font_size, color, text }
+            }
         })
         .collect();
 
@@ -677,7 +1160,7 @@ fn open_project(project_dir: &Path) -> Result<(Vec<EditorLayer>, u32), String> {
 /// losing that layer's picture. Staging first means every source is
 /// safely read into the scratch directory before any final name is
 /// touched, so the order layers happen to be processed in can't matter.
-fn save_project(project_dir: &Path, layers: &[EditorLayer], fps: u32) -> Result<(), String> {
+fn save_project(project_dir: &Path, layers: &[EditorLayer], fps: u32, name: &str) -> Result<(), String> {
     std::fs::create_dir_all(project_dir).map_err(|e| e.to_string())?;
 
     let staging_dir = project_dir.join(".wplinux-staging");
@@ -728,6 +1211,14 @@ fn save_project(project_dir: &Path, layers: &[EditorLayer], fps: u32) -> Result<
                         smoothing: *smoothing,
                     }
                 }
+                // No asset to stage.
+                EditorLayer::Text { x, y, font_size, color, text } => project_format::Layer::Text {
+                    x: *x,
+                    y: *y,
+                    font_size: *font_size,
+                    color: *color,
+                    source: project_format::TextSource::Literal { text: text.clone() },
+                },
             };
             saved_layers.push(saved);
         }
@@ -736,11 +1227,13 @@ fn save_project(project_dir: &Path, layers: &[EditorLayer], fps: u32) -> Result<
         // safe to promote the staged files into their final names, even
         // where a reorder made one layer's final name equal another
         // layer's original source path.
-        for name in &staged_names {
-            std::fs::rename(staging_dir.join(name), project_dir.join(name)).map_err(|e| e.to_string())?;
+        for staged_name in &staged_names {
+            std::fs::rename(staging_dir.join(staged_name), project_dir.join(staged_name))
+                .map_err(|e| e.to_string())?;
         }
 
         let project = project_format::Project {
+            name: name.to_string(),
             layers: saved_layers,
             fps,
         };
@@ -814,7 +1307,7 @@ mod tests {
             EditorLayer::Image { path: Some(project_dir.join("layer_1_image.png")) },
         ];
 
-        save_project(&project_dir, &reordered, 30).expect("save_project failed");
+        save_project(&project_dir, &reordered, 30, "Test Project").expect("save_project failed");
 
         // Each index's *new* final name should hold whatever that layer's
         // source actually was, not whatever the earlier single-pass copy

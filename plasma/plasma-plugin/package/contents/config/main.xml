@@ -5,10 +5,12 @@
       http://www.kde.org/standards/kcfg/1.0/kcfg.xsd" >
   <kcfgfile name=""/>
 
+  <!-- No entries: wallpaper selection is owned entirely by the WP Linux
+       app's own library/monitors_config, not Plasma's config system (see
+       config.qml). This file is kept only because KPackage's
+       Plasma/Wallpaper package structure expects config/main.xml to
+       exist. ⚠ Confirm on real hardware that kpackagetool6 still
+       installs/loads a package with an empty config group cleanly. -->
   <group name="General">
-    <entry name="ProjectPath" type="String">
-      <label>Path to the wallpaper project folder created by the editor</label>
-      <default></default>
-    </entry>
   </group>
 </kcfg>

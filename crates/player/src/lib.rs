@@ -38,7 +38,7 @@ use std::io::BufReader;
 use std::path::Path;
 
 use image::AnimationDecoder;
-use project_format::{Layer, Project};
+use project_format::{Layer, Project, TextSource};
 
 const IMAGE_SHADER: &str = include_str!("shader.wgsl");
 const XRAY_SHADER: &str = include_str!("xray.wgsl");
@@ -110,12 +110,54 @@ pub enum LoadedLayer {
     },
     Xray(XrayLayer),
     Parallax(ParallaxLayer),
+    Text(TextLayer),
 }
 
 pub enum DrawLayer<'a> {
     Image(&'a ImageLayer),
     Xray(&'a XrayLayer),
     Parallax(&'a ParallaxLayer),
+}
+
+/// A positioned string drawn via glyphon -- see
+/// [`Layer::Text`](project_format::Layer::Text). `x`/`y`/`font_size` are
+/// kept as the normalized (0.0..=1.0) values from the schema, not
+/// pre-converted to pixels, so [`SceneRenderer::set_text_viewport`] can
+/// re-lay-out against a new canvas size without needing the original
+/// fractions back from anywhere else. `text` mirrors whatever was last
+/// actually shaped into `buffer`, purely so
+/// [`SceneRenderer::set_text_params`] can skip an expensive re-shape when
+/// neither it nor `font_size` actually changed.
+pub struct TextLayer {
+    buffer: glyphon::Buffer,
+    text: String,
+    x: f32,
+    y: f32,
+    font_size: f32,
+    color: [f32; 4],
+}
+
+/// Bundles every piece of glyphon/cosmic-text state needed to shape and
+/// draw text layers. One instance per [`SceneRenderer`] (not per scene,
+/// not per layer) -- glyphon's `TextAtlas`/`TextRenderer` are meant to be
+/// long-lived and shared across everything drawn through them. Held
+/// behind a `Mutex` purely to satisfy the borrow checker inside
+/// `&self`-taking methods like `record_draw`; every real caller
+/// (render-server's tick thread, editor's owned `Preview`, player's own
+/// owned `App`) is single-owner already, so there's no real contention.
+struct GlyphonState {
+    font_system: glyphon::FontSystem,
+    swash_cache: glyphon::SwashCache,
+    atlas: glyphon::TextAtlas,
+    text_renderer: glyphon::TextRenderer,
+    viewport: glyphon::Viewport,
+    // Last size passed to `set_text_viewport` -- the pixel basis that
+    // every Text layer's normalized x/y/font_size get multiplied
+    // against. Seeded to a sane fallback so a layer loaded before the
+    // first `set_text_viewport` call still renders at *some* reasonable
+    // size instead of collapsing to font_size 0.
+    canvas_width: u32,
+    canvas_height: u32,
 }
 
 impl LoadedLayer {
@@ -130,6 +172,12 @@ impl LoadedLayer {
             LoadedLayer::Gif { width, height, .. } => (*width, *height),
             LoadedLayer::Xray(xray) => (xray.width, xray.height),
             LoadedLayer::Parallax(parallax) => (parallax.width, parallax.height),
+            // Text has no source asset of its own to derive a canvas
+            // size from -- callers that pick canvas size from
+            // `layers.first()` (render-server, editor) should put a
+            // picture layer first if precise sizing matters; this is a
+            // soft product constraint, not solved generally here.
+            LoadedLayer::Text(_) => (1920, 1080),
         }
     }
 
@@ -171,6 +219,7 @@ pub struct SceneRenderer {
     parallax_pipeline: wgpu::RenderPipeline,
     parallax_bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    glyphon: std::sync::Mutex<GlyphonState>,
 }
 
 impl SceneRenderer {
@@ -451,6 +500,26 @@ impl SceneRenderer {
             cache: None,
         });
 
+        let glyphon_cache = glyphon::Cache::new(&device);
+        let glyphon_viewport = glyphon::Viewport::new(&device, &glyphon_cache);
+        let mut glyphon_atlas =
+            glyphon::TextAtlas::new(&device, &queue, &glyphon_cache, target_format);
+        let glyphon_text_renderer = glyphon::TextRenderer::new(
+            &mut glyphon_atlas,
+            &device,
+            wgpu::MultisampleState::default(),
+            None,
+        );
+        let glyphon = std::sync::Mutex::new(GlyphonState {
+            font_system: glyphon::FontSystem::new(),
+            swash_cache: glyphon::SwashCache::new(),
+            atlas: glyphon_atlas,
+            text_renderer: glyphon_text_renderer,
+            viewport: glyphon_viewport,
+            canvas_width: 1920,
+            canvas_height: 1080,
+        });
+
         Self {
             adapter,
             device,
@@ -462,6 +531,7 @@ impl SceneRenderer {
             parallax_pipeline,
             parallax_bind_group_layout,
             sampler,
+            glyphon,
         }
     }
 
@@ -647,6 +717,40 @@ impl SceneRenderer {
         }
     }
 
+    fn create_text_layer(
+        &self,
+        text: &str,
+        x: f32,
+        y: f32,
+        font_size: f32,
+        color: [f32; 4],
+    ) -> TextLayer {
+        let mut glyphon = self.glyphon.lock().unwrap();
+        let pixel_font_size = (font_size * glyphon.canvas_height as f32).max(1.0);
+        let canvas_width = glyphon.canvas_width as f32;
+        let canvas_height = glyphon.canvas_height as f32;
+        let mut buffer = glyphon::Buffer::new(
+            &mut glyphon.font_system,
+            glyphon::Metrics::new(pixel_font_size, pixel_font_size * 1.2),
+        );
+        buffer.set_size(&mut glyphon.font_system, Some(canvas_width), Some(canvas_height));
+        buffer.set_text(
+            &mut glyphon.font_system,
+            text,
+            &glyphon::Attrs::new(),
+            glyphon::Shaping::Advanced,
+            None,
+        );
+        TextLayer {
+            buffer,
+            text: text.to_string(),
+            x,
+            y,
+            font_size,
+            color,
+        }
+    }
+
     /// Loads every layer of `project` onto the GPU, ready to draw. Asset
     /// paths in `project` are resolved relative to `project_dir`.
     pub fn load_scene(
@@ -702,6 +806,20 @@ impl SceneRenderer {
                     let (rgba, width, height) = open_rgba(&project_dir.join(path))?;
                     layers.push(LoadedLayer::Parallax(self.create_parallax_layer(
                         &rgba, width, height, *strength, *smoothing,
+                    )));
+                }
+                Layer::Text {
+                    x,
+                    y,
+                    font_size,
+                    color,
+                    source,
+                } => {
+                    let text = match source {
+                        TextSource::Literal { text } => text.clone(),
+                    };
+                    layers.push(LoadedLayer::Text(self.create_text_layer(
+                        &text, *x, *y, *font_size, *color,
                     )));
                 }
             }
@@ -831,6 +949,82 @@ impl SceneRenderer {
         any_changed
     }
 
+    /// Updates the pixel size that every Text layer's normalized x/y/
+    /// font_size get converted against, and re-lays-out every
+    /// already-loaded Text layer in `layers` to match. Call once right
+    /// after `load_scene` (canvas size usually isn't known until then --
+    /// see `LoadedLayer::size`'s Text fallback) and again any time the
+    /// actual render target is resized, passing its real pixel
+    /// dimensions -- editor's preview in particular renders at a
+    /// downscaled size, not a project's "natural" size, so callers must
+    /// pass whatever size they're really about to draw into.
+    pub fn set_text_viewport(&self, layers: &mut [LoadedLayer], width: u32, height: u32) {
+        let mut glyphon = self.glyphon.lock().unwrap();
+        glyphon.canvas_width = width;
+        glyphon.canvas_height = height;
+        glyphon
+            .viewport
+            .update(&self.queue, glyphon::Resolution { width, height });
+        for layer in layers {
+            if let LoadedLayer::Text(text) = layer {
+                let pixel_font_size = (text.font_size * height as f32).max(1.0);
+                text.buffer.set_metrics_and_size(
+                    &mut glyphon.font_system,
+                    glyphon::Metrics::new(pixel_font_size, pixel_font_size * 1.2),
+                    Some(width as f32),
+                    Some(height as f32),
+                );
+            }
+        }
+    }
+
+    /// Live-updates an already-loaded Text layer's displayed text,
+    /// position, size and color without reloading the whole scene --
+    /// lets a caller like editor keep a text-editing UI feeling live,
+    /// same rationale as `set_xray_radius`/`set_parallax_params`. Unlike
+    /// those, this needs `&mut FontSystem` to re-shape the buffer, so it
+    /// lives on `SceneRenderer` rather than as a plain `LoadedLayer`
+    /// method. Only re-shapes (the expensive part) when `text` or
+    /// `font_size` actually changed; position/color are plain field
+    /// writes either way. No-op on any other layer kind.
+    pub fn set_text_params(
+        &self,
+        layer: &mut LoadedLayer,
+        text: &str,
+        x: f32,
+        y: f32,
+        font_size: f32,
+        color: [f32; 4],
+    ) {
+        let LoadedLayer::Text(text_layer) = layer else {
+            return;
+        };
+        text_layer.x = x;
+        text_layer.y = y;
+        text_layer.color = color;
+        if text_layer.text != text || text_layer.font_size != font_size {
+            text_layer.font_size = font_size;
+            text_layer.text = text.to_string();
+            let mut glyphon = self.glyphon.lock().unwrap();
+            let pixel_font_size = (font_size * glyphon.canvas_height as f32).max(1.0);
+            let canvas_width = glyphon.canvas_width as f32;
+            let canvas_height = glyphon.canvas_height as f32;
+            text_layer.buffer.set_metrics_and_size(
+                &mut glyphon.font_system,
+                glyphon::Metrics::new(pixel_font_size, pixel_font_size * 1.2),
+                Some(canvas_width),
+                Some(canvas_height),
+            );
+            text_layer.buffer.set_text(
+                &mut glyphon.font_system,
+                text,
+                &glyphon::Attrs::new(),
+                glyphon::Shaping::Advanced,
+                None,
+            );
+        }
+    }
+
     /// Records a composite pass -- `layers` bottom to top, alpha-blended
     /// -- into `target_view`, as part of `encoder`. Low-level: lets a
     /// caller that needs to record more commands in the same submission
@@ -843,6 +1037,55 @@ impl SceneRenderer {
         layers: &[LoadedLayer],
         clear_color: wgpu::Color,
     ) {
+        // glyphon's `prepare` only touches the device/queue/atlas -- like
+        // `update_xray_cursors`'s `queue.write_buffer` calls, it can't run
+        // once `pass` below already holds `encoder` mutably borrowed, so
+        // it has to happen first. Always called (even with zero text
+        // layers) so it clears out any glyphs prepared for a *previous*
+        // frame that had text when this one doesn't.
+        let mut glyphon = self.glyphon.lock().unwrap();
+        let text_areas: Vec<glyphon::TextArea> = layers
+            .iter()
+            .filter_map(|layer| match layer {
+                LoadedLayer::Text(text) => Some(glyphon::TextArea {
+                    buffer: &text.buffer,
+                    left: text.x * glyphon.canvas_width as f32,
+                    top: text.y * glyphon.canvas_height as f32,
+                    scale: 1.0,
+                    bounds: glyphon::TextBounds::default(),
+                    default_color: glyphon::Color::rgba(
+                        (text.color[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                        (text.color[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                        (text.color[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                        (text.color[3].clamp(0.0, 1.0) * 255.0).round() as u8,
+                    ),
+                    custom_glyphs: &[],
+                }),
+                _ => None,
+            })
+            .collect();
+        {
+            let GlyphonState {
+                font_system,
+                swash_cache,
+                atlas,
+                viewport,
+                text_renderer,
+                ..
+            } = &mut *glyphon;
+            text_renderer
+                .prepare(
+                    &self.device,
+                    &self.queue,
+                    font_system,
+                    atlas,
+                    viewport,
+                    text_areas,
+                    swash_cache,
+                )
+                .expect("glyphon text layout failed");
+        }
+
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("composite-pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -866,6 +1109,12 @@ impl SceneRenderer {
                 LoadedLayer::Gif { image, .. } => DrawLayer::Image(image),
                 LoadedLayer::Xray(xray) => DrawLayer::Xray(xray),
                 LoadedLayer::Parallax(parallax) => DrawLayer::Parallax(parallax),
+                // Text isn't part of this per-layer pipeline dispatch at
+                // all -- glyphon batches every prepared text area into
+                // one `render()` call below instead, so it always draws
+                // on top of everything else regardless of its position
+                // in the project's own layer list.
+                LoadedLayer::Text(_) => continue,
             };
             match draw_layer {
                 DrawLayer::Image(image) => {
@@ -885,6 +1134,16 @@ impl SceneRenderer {
                 }
             }
         }
+
+        let GlyphonState {
+            atlas,
+            viewport,
+            text_renderer,
+            ..
+        } = &*glyphon;
+        text_renderer
+            .render(atlas, viewport, &mut pass)
+            .expect("glyphon text render failed");
     }
 
     /// Composites `layers` into `target_view` and submits immediately --

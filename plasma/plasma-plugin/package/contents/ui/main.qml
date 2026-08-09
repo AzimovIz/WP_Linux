@@ -5,11 +5,6 @@ import org.kde.plasma.plasmoid
 WallpaperItem {
     id: root
 
-    // While no project is configured yet, don't touch the network at all --
-    // just show the plain background below. Avoids spamming "Connection
-    // refused" (render-server may not even be running yet) and gives a
-    // clean, obviously-unconfigured state instead.
-    readonly property bool hasProject: root.configuration.ProjectPath !== ""
     // render-server now tracks one independently-loaded project per
     // monitor rather than one shared by the whole desktop (see its own
     // module doc comment), so every request needs to say which monitor
@@ -17,14 +12,6 @@ WallpaperItem {
     // already -- it's the same attached property `Screen.virtualX`/
     // `Screen.virtualY` below already read correctly per screen.
     readonly property string monitorId: Screen.name || ""
-    // Path we last actually POSTed to render-server. Compared against
-    // the live config every tick (see the Timer below) instead of
-    // relying solely on onProjectPathChanged firing -- clicking Apply in
-    // the wallpaper settings dialog can replace `configuration` itself,
-    // and a Connections target re-binding to a new object can miss the
-    // one signal that mattered. Polling the actual value is slower by
-    // at most one tick, but can't miss a change.
-    property string lastPushedProjectPath: ""
 
     // Appends this item's monitor id (as `?monitor=` or `&monitor=`,
     // whichever `url` still needs) to a render-server URL -- every route
@@ -38,18 +25,6 @@ WallpaperItem {
         }
         const separator = url.indexOf("?") === -1 ? "?" : "&";
         return url + separator + "monitor=" + encodeURIComponent(root.monitorId);
-    }
-
-    function pushProjectPath() {
-        const path = root.configuration.ProjectPath;
-        const url = root.withMonitorParam("http://127.0.0.1:47824/project");
-        if (!path || !url) {
-            return;
-        }
-        root.lastPushedProjectPath = path;
-        const xhr = new XMLHttpRequest();
-        xhr.open("POST", url);
-        xhr.send(path);
     }
 
     // Tells render-server where this wallpaper item actually sits on the
@@ -70,31 +45,20 @@ WallpaperItem {
     }
 
     Connections {
-        target: root.configuration
-        function onProjectPathChanged() {
-            root.pushProjectPath();
-        }
-    }
-
-    Connections {
         target: Screen
         function onVirtualXChanged() { root.pushGeometry(); }
         function onVirtualYChanged() { root.pushGeometry(); }
         // A screen can be (re-)identified by the compositor after this
         // item already existed (e.g. hotplug/reconfiguration) -- resend
-        // both once `monitorId` actually has a value to key on, same as
+        // once `monitorId` actually has a value to key on, same as
         // Component.onCompleted does for the normal startup case.
-        function onNameChanged() {
-            root.pushProjectPath();
-            root.pushGeometry();
-        }
+        function onNameChanged() { root.pushGeometry(); }
     }
 
     onWidthChanged: root.pushGeometry()
     onHeightChanged: root.pushGeometry()
 
     Component.onCompleted: {
-        root.pushProjectPath();
         root.pushGeometry();
     }
 
@@ -118,16 +82,14 @@ WallpaperItem {
             property int fps: 30
             property var activeXhr: null
             // Whether render-server currently has geometry on file for
-            // this monitor. Unlike `ready` (see the resend below),
-            // `pushGeometry()` normally only fires reactively (screen
-            // moved/resized) with no retry of its own -- if its one push
-            // at Component.onCompleted lands before render-server has
-            // even bound its HTTP port yet (e.g. right after a reboot,
-            // while it's still initializing wgpu), that POST is just
-            // lost, and nothing would ever resend it since the screen
-            // itself isn't going to move again on its own. Polling this
-            // flag closes that gap the same way `ready` already does for
-            // the project path.
+            // this monitor. `pushGeometry()` normally only fires
+            // reactively (screen moved/resized) with no retry of its own
+            // -- if its one push at Component.onCompleted lands before
+            // render-server has even bound its HTTP port yet (e.g. right
+            // after a reboot, while it's still initializing wgpu), that
+            // POST is just lost, and nothing would ever resend it since
+            // the screen itself isn't going to move again on its own.
+            // Polling this flag closes that gap (see the resend below).
             property bool hasGeometry: false
 
             onFrameIdChanged: framePoll.refresh()
@@ -178,16 +140,15 @@ WallpaperItem {
                         ready = false;
                     }
 
-                    // render-server may have been restarted (lost its
-                    // in-memory project) after we already pushed the path
-                    // once, e.g. on load. Resend it until it sticks instead
-                    // of requiring a manual re-poke.
-                    if (!ready && root.hasProject) {
-                        root.pushProjectPath();
-                    }
-                    // Same idea for geometry -- see `hasGeometry`'s doc
-                    // comment for why its one reactive push can go missing
-                    // with nothing to naturally trigger a resend.
+                    // render-server may have been restarted (losing
+                    // whatever geometry we last pushed) since we last
+                    // pushed it -- resend until it sticks, see
+                    // `hasGeometry`'s own doc comment. `/project` doesn't
+                    // need this dance: its assignment is persisted to disk
+                    // and reloaded by render-server itself on every
+                    // startup (see the WP Linux app's monitors_config
+                    // module), so there's nothing for this item to resend
+                    // at all.
                     if (!hasGeometry) {
                         root.pushGeometry();
                     }
@@ -203,15 +164,10 @@ WallpaperItem {
         // cheap no-op poll regardless of the interval.
         Timer {
             interval: Math.max(8, Math.round(1000 / sceneMeta.fps))
-            running: root.hasProject && root.monitorId !== ""
+            running: root.monitorId !== ""
             repeat: true
             triggeredOnStart: true
-            onTriggered: {
-                if (root.configuration.ProjectPath !== root.lastPushedProjectPath) {
-                    root.pushProjectPath();
-                }
-                sceneMeta.poll();
-            }
+            onTriggered: sceneMeta.poll()
         }
 
         // Fetches the current rendered frame from render-server. Only

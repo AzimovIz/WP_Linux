@@ -5,7 +5,12 @@ edition.workspace = true
 publish = false
 
 [dependencies]
+dirs = "6"
 eframe = "0.35"
+image = { version = "0.25", default-features = false, features = ["png"] }
 player = { path = "../player" }
 project-format = { path = "../project-format" }
 rfd = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+winit = "=0.30.13"
