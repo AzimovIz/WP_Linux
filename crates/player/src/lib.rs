@@ -119,18 +119,318 @@ pub enum DrawLayer<'a> {
     Parallax(&'a ParallaxLayer),
 }
 
+/// What a Text layer currently displays, recomputed fresh on every call
+/// -- no internal history/caching of its own (that's [`TextLayer::text`]'s
+/// job, the single point comparisons happen against). `now` is always
+/// caller-supplied, matching this module's existing convention
+/// (`advance_gifs`'s `elapsed_ms`, `update_parallax`'s `dt_ms`) --
+/// nothing in here ever reads the wall clock itself, so
+/// [`ClockSource::poll`] stays trivially unit-testable with a fixed
+/// injected time.
+trait LiveTextSource {
+    fn poll(&self, now: chrono::DateTime<chrono::Local>) -> String;
+    /// Whether this source can ever produce a different string over
+    /// time -- used by a caller that redraws on its own timer (editor's
+    /// preview) to decide whether to keep requesting repaints for a Text
+    /// layer, same question `project_format::TextSource::is_dynamic`
+    /// answers at the schema level before anything is ever loaded.
+    fn is_dynamic(&self) -> bool;
+}
+
+struct LiteralSource {
+    text: String,
+}
+
+impl LiveTextSource for LiteralSource {
+    fn poll(&self, _now: chrono::DateTime<chrono::Local>) -> String {
+        self.text.clone()
+    }
+
+    fn is_dynamic(&self) -> bool {
+        false
+    }
+}
+
+struct ClockSource {
+    format: String,
+}
+
+impl LiveTextSource for ClockSource {
+    fn poll(&self, now: chrono::DateTime<chrono::Local>) -> String {
+        // `DateTime::format` panics (via its `Display` impl) on an
+        // unrecognized `%x` specifier instead of returning an error --
+        // confirmed the hard way, by a test that reproduced exactly
+        // that panic. `self.format` is hand-typed into the editor's
+        // format field, so it has to be validated before ever reaching
+        // `format()`, not just trusted. Showing the raw format string
+        // back verbatim on failure (instead of a generic placeholder)
+        // doubles as the error signal: it very visibly isn't a
+        // formatted time.
+        match chrono::format::StrftimeItems::new(&self.format).parse() {
+            Ok(items) => now.format_with_items(items.into_iter()).to_string(),
+            Err(_) => self.format.clone(),
+        }
+    }
+
+    fn is_dynamic(&self) -> bool {
+        true
+    }
+}
+
+/// Fixed timeout for a single `Command` source invocation -- not
+/// configurable per-layer in this pass. A command that hangs past this
+/// gets killed (best-effort) and treated exactly like any other failure.
+const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often a live `CommandSource`'s background thread checks whether
+/// it's been asked to stop, while otherwise sleeping out its
+/// `interval_secs` between runs -- bounds shutdown latency (e.g. when a
+/// project is reloaded and the old `LoadedTextSource` is dropped) to
+/// this, not to a whole possibly-long interval.
+const COMMAND_STOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Runs `command` via `sh -c`, waits up to [`COMMAND_TIMEOUT`], and
+/// returns its trimmed stdout -- `None` on any failure, non-zero exit,
+/// timeout, or empty output, all treated identically (the already-decided
+/// "NULL" display convention lives in [`CommandSource::poll`], not here).
+/// The real reason is always logged to stderr.
+fn run_command_with_timeout(command: &str) -> Option<String> {
+    run_command_with_timeout_inner(command, COMMAND_TIMEOUT)
+}
+
+/// The actual implementation, with the timeout as a parameter purely so
+/// tests can exercise the kill path (see `command_that_hangs_gets_killed_
+/// instead_of_hanging_the_caller`) against a short timeout instead of
+/// waiting out the real several-second one.
+///
+/// Spawns a second "waiter" thread that owns the blocking
+/// `wait_with_output()` call, so this function's own timeout can give up
+/// on a hung command without leaking a blocked thread forever: the
+/// waiter still exits on its own once the (best-effort-killed) child is
+/// reaped, its channel send just lands nowhere. Same
+/// spawn-thread-plus-`mpsc`-channel-plus-`recv_timeout` shape this
+/// crate's GPU-readback and `editor`'s thumbnail generation already use
+/// for the same "bound how long we wait for someone else's work"
+/// problem.
+fn run_command_with_timeout_inner(command: &str, timeout: std::time::Duration) -> Option<String> {
+    let child = match std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("player: failed to spawn command {command:?}: {e}");
+            return None;
+        }
+    };
+    let pid = child.id();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(output)) => {
+            if !output.status.success() {
+                eprintln!(
+                    "player: command {command:?} exited with {:?}, stderr: {:?}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr).trim(),
+                );
+                return None;
+            }
+            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        }
+        Ok(Err(e)) => {
+            eprintln!("player: failed to wait for command {command:?}: {e}");
+            None
+        }
+        Err(_) => {
+            eprintln!("player: command {command:?} timed out after {timeout:?}, killing it");
+            // Best-effort: `kill` failing (already exited, no
+            // permission, PID already reused by something else in the
+            // astronomically unlikely case) just means there's nothing
+            // left to clean up.
+            let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
+            None
+        }
+    }
+}
+
+/// Background-polled shell command output -- see
+/// [`Layer::Text`](project_format::Layer::Text)'s `TextSource::Command`.
+/// Owns a thread that re-runs `command` every `interval_secs` (starting
+/// immediately, not after the first interval) and writes its result into
+/// `shared`; [`CommandSource::poll`] is then just a cheap non-blocking
+/// read -- the real work already happened off the render thread.
+struct CommandSource {
+    command: String,
+    interval_secs: u32,
+    shared: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    // Set by `Drop` so the background thread notices and exits instead
+    // of leaking forever once this value (and the thread's only other
+    // handle back to it) is gone -- see `COMMAND_STOP_POLL_INTERVAL`.
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl CommandSource {
+    /// Builds a `CommandSource` that never actually runs `command` --
+    /// used for an untrusted project (see `SceneRenderer::load_scene`'s
+    /// `allow_commands` parameter). `shared` permanently stays `None`
+    /// (so `poll` permanently shows "NULL"), matching this crate's
+    /// established behavior for a Command source that produced nothing:
+    /// the process is never spawned at all here, not merely hidden after
+    /// running.
+    fn untrusted(command: String, interval_secs: u32) -> Self {
+        CommandSource {
+            command,
+            interval_secs,
+            shared: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn spawn(command: String, interval_secs: u32) -> Self {
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let interval = std::time::Duration::from_secs(u64::from(interval_secs.max(1)));
+
+        let thread_command = command.clone();
+        let thread_shared = std::sync::Arc::clone(&shared);
+        let thread_stop = std::sync::Arc::clone(&stop);
+        std::thread::spawn(move || {
+            while !thread_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let result = run_command_with_timeout(&thread_command);
+                *thread_shared.lock().unwrap() = result;
+                sleep_unless_stopped(interval, &thread_stop);
+            }
+        });
+
+        CommandSource { command, interval_secs, shared, stop }
+    }
+}
+
+impl Drop for CommandSource {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn sleep_unless_stopped(total: std::time::Duration, stop: &std::sync::atomic::AtomicBool) {
+    let mut remaining = total;
+    while !remaining.is_zero() && !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        let chunk = remaining.min(COMMAND_STOP_POLL_INTERVAL);
+        std::thread::sleep(chunk);
+        remaining -= chunk;
+    }
+}
+
+impl LiveTextSource for CommandSource {
+    fn poll(&self, _now: chrono::DateTime<chrono::Local>) -> String {
+        self.shared.lock().unwrap().clone().unwrap_or_else(|| "NULL".to_string())
+    }
+
+    fn is_dynamic(&self) -> bool {
+        true
+    }
+}
+
+/// Exhaustive enum wrapping each [`LiveTextSource`] impl -- not
+/// `Box<dyn>`, matching this codebase's existing preference (see
+/// `LoadedLayer`/`DrawLayer`) for compiler-enforced exhaustiveness over
+/// dynamic dispatch. The genuine trait-strategy application for this
+/// feature: three real implementations behind one interface, dispatched
+/// by an exhaustive match.
+enum LoadedTextSource {
+    Literal(LiteralSource),
+    Clock(ClockSource),
+    Command(CommandSource),
+}
+
+impl LoadedTextSource {
+    /// `allow_commands` gates only the `Command` variant -- see
+    /// `SceneRenderer::load_scene`'s doc comment for what decides it.
+    fn from_project(source: &TextSource, allow_commands: bool) -> Self {
+        match source {
+            TextSource::Literal { text } => LoadedTextSource::Literal(LiteralSource { text: text.clone() }),
+            TextSource::Clock { format } => LoadedTextSource::Clock(ClockSource { format: format.clone() }),
+            TextSource::Command { command, interval_secs } => {
+                if allow_commands {
+                    LoadedTextSource::Command(CommandSource::spawn(command.clone(), *interval_secs))
+                } else {
+                    eprintln!(
+                        "player: refusing to run command {command:?} for an untrusted project \
+                         -- displaying NULL instead"
+                    );
+                    LoadedTextSource::Command(CommandSource::untrusted(command.clone(), *interval_secs))
+                }
+            }
+        }
+    }
+
+    /// Whether `source` describes the exact same configuration this
+    /// value was already built from -- lets a caller like
+    /// `LoadedLayer::set_text_params` (invoked every editor frame, not
+    /// just on an actual edit) skip rebuilding entirely when nothing
+    /// really changed. For `Command` this isn't just an optimization:
+    /// rebuilding spawns a whole new background thread and starts
+    /// re-running the command on its own interval immediately, so doing
+    /// that on every frame regardless of whether the command string
+    /// actually changed would be a real (if `Drop`-bounded) resource
+    /// leak, not just wasted work.
+    fn matches(&self, source: &TextSource) -> bool {
+        match (self, source) {
+            (LoadedTextSource::Literal(current), TextSource::Literal { text }) => &current.text == text,
+            (LoadedTextSource::Clock(current), TextSource::Clock { format }) => &current.format == format,
+            (LoadedTextSource::Command(current), TextSource::Command { command, interval_secs }) => {
+                &current.command == command && current.interval_secs == *interval_secs
+            }
+            _ => false,
+        }
+    }
+}
+
+impl LiveTextSource for LoadedTextSource {
+    fn poll(&self, now: chrono::DateTime<chrono::Local>) -> String {
+        match self {
+            LoadedTextSource::Literal(source) => source.poll(now),
+            LoadedTextSource::Clock(source) => source.poll(now),
+            LoadedTextSource::Command(source) => source.poll(now),
+        }
+    }
+
+    fn is_dynamic(&self) -> bool {
+        match self {
+            LoadedTextSource::Literal(source) => source.is_dynamic(),
+            LoadedTextSource::Clock(source) => source.is_dynamic(),
+            LoadedTextSource::Command(source) => source.is_dynamic(),
+        }
+    }
+}
+
 /// A positioned string drawn via glyphon -- see
 /// [`Layer::Text`](project_format::Layer::Text). `x`/`y`/`font_size` are
 /// kept as the normalized (0.0..=1.0) values from the schema, not
 /// pre-converted to pixels, so [`SceneRenderer::set_text_viewport`] can
 /// re-lay-out against a new canvas size without needing the original
-/// fractions back from anywhere else. `text` mirrors whatever was last
-/// actually shaped into `buffer`, purely so
-/// [`SceneRenderer::set_text_params`] can skip an expensive re-shape when
-/// neither it nor `font_size` actually changed.
+/// fractions back from anywhere else. `text` is whatever `source` last
+/// resolved to and got actually shaped into `buffer` -- the single point
+/// [`SceneRenderer::advance_text_sources`] compares a fresh `source.poll`
+/// against to decide whether an expensive re-shape is even needed.
 pub struct TextLayer {
     buffer: glyphon::Buffer,
     text: String,
+    source: LoadedTextSource,
     x: f32,
     y: f32,
     font_size: f32,
@@ -181,6 +481,21 @@ impl LoadedLayer {
         }
     }
 
+    /// Whether this layer needs continuous re-rendering to look right --
+    /// mirrors `project_format::Layer::is_dynamic`, but at the loaded/
+    /// GPU-side representation. Meant for a caller that redraws on its
+    /// own timer and wants to know whether to keep doing so (editor's
+    /// preview); render-server instead asks the schema-level question up
+    /// front, before anything is ever loaded (see `Layer::is_dynamic`,
+    /// which `LoadedProject::dynamic` is computed from).
+    pub fn is_dynamic(&self) -> bool {
+        match self {
+            LoadedLayer::Image(_) => false,
+            LoadedLayer::Gif { .. } | LoadedLayer::Xray(_) | LoadedLayer::Parallax(_) => true,
+            LoadedLayer::Text(text) => text.source.is_dynamic(),
+        }
+    }
+
     /// Changes an already-loaded Xray layer's mask radius in place -- no
     /// GPU reload needed, just a plain field write picked up next time
     /// [`SceneRenderer::update_xray_cursors`] writes the uniform buffer.
@@ -201,6 +516,47 @@ impl LoadedLayer {
         if let LoadedLayer::Parallax(parallax) = self {
             parallax.strength = strength;
             parallax.smoothing = smoothing;
+        }
+    }
+
+    /// Reconfigures an already-loaded Text layer's position, size, color
+    /// and *source* (the literal string, the clock format string, or the
+    /// command/interval) in place -- lets a caller like editor keep a
+    /// text-editing UI feeling live, same rationale as
+    /// `set_xray_radius`/`set_parallax_params`. Doesn't touch `buffer`
+    /// itself: unlike those two, actually re-shaping glyphon's buffer
+    /// needs `&mut FontSystem`, which lives on `SceneRenderer`, not here
+    /// -- the next `SceneRenderer::advance_text_sources` call (every real
+    /// caller already ticks it every frame/frame-tick) picks up whatever
+    /// the reconfigured source currently resolves to. No-op on any other
+    /// layer kind.
+    ///
+    /// Only actually rebuilds `source` when its configuration differs
+    /// from what's already loaded (see `LoadedTextSource::matches`) --
+    /// this method gets called every editor frame regardless of whether
+    /// anything was actually edited, and for a `Command` source
+    /// rebuilding means spawning a whole new background thread/process,
+    /// not just a cheap field write. `allow_commands` is always `true`
+    /// from editor's own call site: the editor is the self-authoring
+    /// context, trusted the moment it saves (see `SceneRenderer::
+    /// load_scene`'s doc comment for the untrusted case this skips).
+    pub fn set_text_params(
+        &mut self,
+        source: &TextSource,
+        x: f32,
+        y: f32,
+        font_size: f32,
+        color: [f32; 4],
+        allow_commands: bool,
+    ) {
+        if let LoadedLayer::Text(text) = self {
+            if !text.source.matches(source) {
+                text.source = LoadedTextSource::from_project(source, allow_commands);
+            }
+            text.x = x;
+            text.y = y;
+            text.font_size = font_size;
+            text.color = color;
         }
     }
 }
@@ -719,12 +1075,20 @@ impl SceneRenderer {
 
     fn create_text_layer(
         &self,
-        text: &str,
+        source: &TextSource,
         x: f32,
         y: f32,
         font_size: f32,
         color: [f32; 4],
+        allow_commands: bool,
     ) -> TextLayer {
+        let source = LoadedTextSource::from_project(source, allow_commands);
+        // Resolved once up front (e.g. a Clock source's format string
+        // applied against "now") so the buffer starts out already
+        // showing the right thing -- `advance_text_sources` re-polls and
+        // re-shapes from here on, this is just the initial value.
+        let text = source.poll(chrono::Local::now());
+
         let mut glyphon = self.glyphon.lock().unwrap();
         let pixel_font_size = (font_size * glyphon.canvas_height as f32).max(1.0);
         let canvas_width = glyphon.canvas_width as f32;
@@ -736,14 +1100,15 @@ impl SceneRenderer {
         buffer.set_size(&mut glyphon.font_system, Some(canvas_width), Some(canvas_height));
         buffer.set_text(
             &mut glyphon.font_system,
-            text,
+            &text,
             &glyphon::Attrs::new(),
             glyphon::Shaping::Advanced,
             None,
         );
         TextLayer {
             buffer,
-            text: text.to_string(),
+            text,
+            source,
             x,
             y,
             font_size,
@@ -753,10 +1118,20 @@ impl SceneRenderer {
 
     /// Loads every layer of `project` onto the GPU, ready to draw. Asset
     /// paths in `project` are resolved relative to `project_dir`.
+    ///
+    /// `allow_commands` gates whether any `TextSource::Command` layer in
+    /// `project` actually gets to run its shell command -- `false` for
+    /// an untrusted project makes it behave exactly like a Command
+    /// source that has never produced output (permanently "NULL"),
+    /// without ever spawning anything. Deciding *what* counts as trusted
+    /// is entirely the caller's job (render-server consults its trust
+    /// store; `player`'s own standalone binary always passes `true` --
+    /// see its module doc comment for that scope cut).
     pub fn load_scene(
         &self,
         project_dir: &Path,
         project: &Project,
+        allow_commands: bool,
     ) -> Result<Vec<LoadedLayer>, String> {
         let mut layers = Vec::with_capacity(project.layers.len());
         for layer in &project.layers {
@@ -815,11 +1190,8 @@ impl SceneRenderer {
                     color,
                     source,
                 } => {
-                    let text = match source {
-                        TextSource::Literal { text } => text.clone(),
-                    };
                     layers.push(LoadedLayer::Text(self.create_text_layer(
-                        &text, *x, *y, *font_size, *color,
+                        source, *x, *y, *font_size, *color, allow_commands,
                     )));
                 }
             }
@@ -978,51 +1350,52 @@ impl SceneRenderer {
         }
     }
 
-    /// Live-updates an already-loaded Text layer's displayed text,
-    /// position, size and color without reloading the whole scene --
-    /// lets a caller like editor keep a text-editing UI feeling live,
-    /// same rationale as `set_xray_radius`/`set_parallax_params`. Unlike
-    /// those, this needs `&mut FontSystem` to re-shape the buffer, so it
-    /// lives on `SceneRenderer` rather than as a plain `LoadedLayer`
-    /// method. Only re-shapes (the expensive part) when `text` or
-    /// `font_size` actually changed; position/color are plain field
-    /// writes either way. No-op on any other layer kind.
-    pub fn set_text_params(
-        &self,
-        layer: &mut LoadedLayer,
-        text: &str,
-        x: f32,
-        y: f32,
-        font_size: f32,
-        color: [f32; 4],
-    ) {
-        let LoadedLayer::Text(text_layer) = layer else {
-            return;
-        };
-        text_layer.x = x;
-        text_layer.y = y;
-        text_layer.color = color;
-        if text_layer.text != text || text_layer.font_size != font_size {
-            text_layer.font_size = font_size;
-            text_layer.text = text.to_string();
-            let mut glyphon = self.glyphon.lock().unwrap();
-            let pixel_font_size = (font_size * glyphon.canvas_height as f32).max(1.0);
-            let canvas_width = glyphon.canvas_width as f32;
-            let canvas_height = glyphon.canvas_height as f32;
-            text_layer.buffer.set_metrics_and_size(
-                &mut glyphon.font_system,
-                glyphon::Metrics::new(pixel_font_size, pixel_font_size * 1.2),
-                Some(canvas_width),
-                Some(canvas_height),
-            );
-            text_layer.buffer.set_text(
-                &mut glyphon.font_system,
-                text,
-                &glyphon::Attrs::new(),
-                glyphon::Shaping::Advanced,
-                None,
-            );
+    /// Re-polls every Text layer's source against `now` and re-shapes
+    /// only the ones whose displayed string actually changed -- the
+    /// shared tick mechanism every consumer of this crate drives once
+    /// per frame/tick (render-server's tick loop, player's own frame
+    /// callback, editor's preview redraw), same contract shape as
+    /// `advance_gifs`/`update_parallax`: returns whether anything
+    /// changed, so a caller that only wants to redraw on actual change
+    /// (render-server) can act on it. `now` is always caller-supplied,
+    /// never read internally -- see [`LiveTextSource`]'s own doc comment
+    /// for why.
+    ///
+    /// Metrics (font size/canvas dimensions) are re-applied
+    /// unconditionally every call rather than compared by hand first --
+    /// `Buffer::set_metrics_and_size` already no-ops internally when
+    /// nothing actually changed, so there's no reason to duplicate that
+    /// check here.
+    pub fn advance_text_sources(&self, layers: &mut [LoadedLayer], now: chrono::DateTime<chrono::Local>) -> bool {
+        let mut any_changed = false;
+        let mut glyphon = self.glyphon.lock().unwrap();
+        let canvas_width = glyphon.canvas_width as f32;
+        let canvas_height = glyphon.canvas_height as f32;
+        for layer in layers {
+            if let LoadedLayer::Text(text) = layer {
+                let pixel_font_size = (text.font_size * canvas_height).max(1.0);
+                text.buffer.set_metrics_and_size(
+                    &mut glyphon.font_system,
+                    glyphon::Metrics::new(pixel_font_size, pixel_font_size * 1.2),
+                    Some(canvas_width),
+                    Some(canvas_height),
+                );
+
+                let new_text = text.source.poll(now);
+                if new_text != text.text {
+                    text.buffer.set_text(
+                        &mut glyphon.font_system,
+                        &new_text,
+                        &glyphon::Attrs::new(),
+                        glyphon::Shaping::Advanced,
+                        None,
+                    );
+                    text.text = new_text;
+                    any_changed = true;
+                }
+            }
         }
+        any_changed
     }
 
     /// Records a composite pass -- `layers` bottom to top, alpha-blended
@@ -1287,4 +1660,107 @@ fn cumulative_delays(frames: &[GifFrame]) -> Vec<u64> {
             total
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    /// A fixed, arbitrary point in time (nowhere near a DST transition,
+    /// so `Local.with_ymd_and_hms` resolves unambiguously regardless of
+    /// which timezone this test happens to run in) -- these tests only
+    /// assert on the hour/minute/day fields formatting comes out to, not
+    /// on any real wall-clock behavior, so no GPU/device is needed at
+    /// all (unlike almost everything else in this module).
+    fn fixed_now() -> chrono::DateTime<chrono::Local> {
+        chrono::Local.with_ymd_and_hms(2024, 6, 15, 9, 5, 30).unwrap()
+    }
+
+    #[test]
+    fn literal_source_always_returns_its_fixed_text() {
+        let source = LiteralSource { text: "hello".to_string() };
+        assert_eq!(source.poll(fixed_now()), "hello");
+    }
+
+    #[test]
+    fn clock_source_formats_against_the_given_time() {
+        let source = ClockSource { format: "%H:%M".to_string() };
+        assert_eq!(source.poll(fixed_now()), "09:05");
+    }
+
+    #[test]
+    fn clock_source_with_a_garbled_format_falls_back_to_the_raw_string_instead_of_panicking() {
+        let format = "%Q not a real specifier %".to_string();
+        let source = ClockSource { format: format.clone() };
+        assert_eq!(source.poll(fixed_now()), format);
+    }
+
+    #[test]
+    fn loaded_text_source_from_project_dispatches_to_the_matching_variant() {
+        let literal =
+            LoadedTextSource::from_project(&TextSource::Literal { text: "hi".to_string() }, true);
+        assert_eq!(literal.poll(fixed_now()), "hi");
+
+        let clock =
+            LoadedTextSource::from_project(&TextSource::Clock { format: "%Y".to_string() }, true);
+        assert_eq!(clock.poll(fixed_now()), "2024");
+    }
+
+    #[test]
+    fn untrusted_command_source_never_runs_and_always_shows_null() {
+        let source = CommandSource::untrusted("echo should-never-run".to_string(), 60);
+        // No thread was ever spawned for this one, so there's nothing to
+        // wait for -- the shared cell simply starts and stays `None`.
+        assert_eq!(source.poll(fixed_now()), "NULL");
+    }
+
+    #[test]
+    fn loaded_text_source_matches_compares_configuration_not_identity() {
+        let literal =
+            LoadedTextSource::from_project(&TextSource::Literal { text: "hi".to_string() }, true);
+        assert!(literal.matches(&TextSource::Literal { text: "hi".to_string() }));
+        assert!(!literal.matches(&TextSource::Literal { text: "bye".to_string() }));
+        assert!(!literal.matches(&TextSource::Clock { format: "%H".to_string() }));
+
+        let command = LoadedTextSource::from_project(
+            &TextSource::Command { command: "date".to_string(), interval_secs: 5 },
+            false,
+        );
+        assert!(command.matches(&TextSource::Command {
+            command: "date".to_string(),
+            interval_secs: 5
+        }));
+        assert!(!command.matches(&TextSource::Command {
+            command: "date".to_string(),
+            interval_secs: 6
+        }));
+    }
+
+    #[test]
+    fn run_command_with_timeout_returns_trimmed_stdout_on_success() {
+        assert_eq!(run_command_with_timeout("echo hello"), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn run_command_with_timeout_returns_none_on_nonzero_exit() {
+        assert_eq!(run_command_with_timeout("sh -c 'exit 1'"), None);
+    }
+
+    #[test]
+    fn run_command_with_timeout_returns_none_for_empty_output() {
+        assert_eq!(run_command_with_timeout("printf ''"), None);
+    }
+
+    #[test]
+    fn command_that_hangs_gets_killed_instead_of_hanging_the_caller() {
+        let start = std::time::Instant::now();
+        let result =
+            run_command_with_timeout_inner("sleep 10", std::time::Duration::from_millis(300));
+        assert_eq!(result, None);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "should give up around the 300ms timeout, not wait out the full sleep"
+        );
+    }
 }

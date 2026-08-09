@@ -215,8 +215,15 @@ impl App {
                 &wgpu_surface,
                 SURFACE_FORMAT,
             ));
+            // Scope cut: this standalone binary is a secondary/test path
+            // (the primary supported path is render-server + the Plasma
+            // plugin, which does enforce the trust store -- see
+            // `render-server/src/trust_store.rs`). It always trusts
+            // whatever project it's pointed at, since it's only ever run
+            // by hand against a project directory the invoking user
+            // already chose themselves.
             self.layers = renderer
-                .load_scene(&self.project_dir, &self.project)
+                .load_scene(&self.project_dir, &self.project, true)
                 .unwrap_or_else(|e| panic!("failed to load project layers: {e}"));
             self.renderer = Some(renderer);
         }
@@ -250,6 +257,7 @@ impl App {
         let parallax_dt_ms = elapsed_ms.saturating_sub(self.last_parallax_update_ms);
         self.last_parallax_update_ms = elapsed_ms;
         renderer.update_parallax(&mut self.layers, self.cursor, parallax_dt_ms);
+        renderer.advance_text_sources(&mut self.layers, chrono::Local::now());
 
         let frame = match out.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(tex)

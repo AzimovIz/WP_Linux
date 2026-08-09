@@ -42,6 +42,7 @@
 
 mod monitors_config;
 mod renderer;
+mod trust_store;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -660,6 +661,19 @@ fn render_tick_loop(renderer: &SceneRenderer, state: &SharedState) {
                 false
             };
 
+            // Unlike gif/parallax, a Clock text layer needs real
+            // wall-clock time, not elapsed time since `loaded_at` -- read
+            // fresh every cycle. Its actual on-screen update cadence is
+            // still bounded by this project's own `fps` (the same value
+            // throttling gif/xray/parallax above), so a 1fps project with
+            // a seconds-resolution clock will visibly stutter -- not a
+            // bug, just a consequence of sharing that knob.
+            let text_changed = if project.dynamic && !power_saving {
+                renderer.advance_text_sources(&mut project.layers, chrono::Local::now())
+            } else {
+                false
+            };
+
             let cursor_uv = if project.needs_cursor && !power_saving {
                 compute_cursor_uv(state, monitor_id)
             } else {
@@ -685,7 +699,7 @@ fn render_tick_loop(renderer: &SceneRenderer, state: &SharedState) {
                 false
             };
 
-            if project.needs_render || gif_changed || cursor_changed || parallax_changed {
+            if project.needs_render || gif_changed || cursor_changed || parallax_changed || text_changed {
                 project.last_rendered_cursor_uv = cursor_uv;
 
                 let (frame_bytes, content_type) = compose_and_encode(renderer, project, cursor_uv);
@@ -761,7 +775,13 @@ fn load_project(renderer: &SceneRenderer, project_dir: &Path) -> Result<LoadedPr
         return Err("project has no layers".to_string());
     }
 
-    let mut loaded_layers = renderer.load_scene(&project_dir, &project)?;
+    // The library's own convention is already "id = the project
+    // directory's own name" -- reusing it here means trust doesn't need
+    // a dedicated id field threaded through `Project`/the HTTP endpoint.
+    let project_id = project_dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let allow_commands = trust_store::is_trusted(project_id);
+
+    let mut loaded_layers = renderer.load_scene(&project_dir, &project, allow_commands)?;
     // Whichever layer happens to load first sets the canvas size, same as
     // this always worked before `load_scene` moved into `player`.
     let (canvas_width, canvas_height) = loaded_layers

@@ -90,6 +90,17 @@ pub enum Layer {
 pub enum TextSource {
     /// A fixed string, never changes.
     Literal { text: String },
+    /// The current local time, re-formatted every tick -- `format` is a
+    /// chrono strftime-style format string (e.g. `"%H:%M"`).
+    Clock { format: String },
+    /// A shell command's stdout, re-run every `interval_secs` -- e.g. a
+    /// temperature/CPU widget. Failure, timeout, untrusted-project
+    /// refusal, and empty output all display literally as `"NULL"`
+    /// (decided up front -- never a distinct error UI); the real reason
+    /// is always logged server-side instead. Only executed by
+    /// render-server for a project whose id is in the local trust store
+    /// -- see `player`'s `load_scene`'s `allow_commands` parameter.
+    Command { command: String, interval_secs: u32 },
 }
 
 impl TextSource {
@@ -98,6 +109,7 @@ impl TextSource {
     pub fn is_dynamic(&self) -> bool {
         match self {
             TextSource::Literal { .. } => false,
+            TextSource::Clock { .. } | TextSource::Command { .. } => true,
         }
     }
 }
@@ -191,6 +203,46 @@ mod tests {
                 assert_eq!((x, y, font_size, color, text.as_str()), (0.5, 0.1, 0.05, [1.0; 4], "hello"));
             }
             _ => panic!("expected Layer::Text"),
+        }
+    }
+
+    #[test]
+    fn text_layer_with_clock_source_round_trips_and_is_dynamic() {
+        let layer = Layer::Text {
+            x: 0.05,
+            y: 0.05,
+            font_size: 0.04,
+            color: [1.0, 1.0, 1.0, 1.0],
+            source: TextSource::Clock { format: "%H:%M".to_string() },
+        };
+        let json = serde_json::to_string(&layer).unwrap();
+        let round_tripped: Layer = serde_json::from_str(&json).unwrap();
+        assert!(round_tripped.is_dynamic());
+        match round_tripped {
+            Layer::Text { source: TextSource::Clock { format }, .. } => {
+                assert_eq!(format, "%H:%M");
+            }
+            _ => panic!("expected Layer::Text with TextSource::Clock"),
+        }
+    }
+
+    #[test]
+    fn text_layer_with_command_source_round_trips_and_is_dynamic() {
+        let layer = Layer::Text {
+            x: 0.9,
+            y: 0.05,
+            font_size: 0.03,
+            color: [1.0, 1.0, 1.0, 1.0],
+            source: TextSource::Command { command: "date".to_string(), interval_secs: 60 },
+        };
+        let json = serde_json::to_string(&layer).unwrap();
+        let round_tripped: Layer = serde_json::from_str(&json).unwrap();
+        assert!(round_tripped.is_dynamic());
+        match round_tripped {
+            Layer::Text { source: TextSource::Command { command, interval_secs }, .. } => {
+                assert_eq!((command.as_str(), interval_secs), ("date", 60));
+            }
+            _ => panic!("expected Layer::Text with TextSource::Command"),
         }
     }
 }

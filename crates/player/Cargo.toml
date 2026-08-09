@@ -5,6 +5,7 @@ edition.workspace = true
 publish = false
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 env_logger = "0.11"
 glyphon = "=0.11.0"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }

@@ -14,6 +14,7 @@
 mod library;
 mod monitors_config;
 mod push;
+mod trust_store;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -97,8 +98,56 @@ enum EditorLayer {
         y: f32,
         font_size: f32,
         color: [f32; 4],
-        text: String,
+        source: EditorTextSource,
     },
+}
+
+/// Mirrors `project_format::TextSource`'s variants -- kept as a separate
+/// type (rather than using the schema type directly here) purely so the
+/// property panel has somewhere to keep an in-progress format string
+/// without it round-tripping through the preview/save path on every
+/// keystroke; converted to/from `project_format::TextSource` at the
+/// `open_project`/`save_project`/`build_preview_project` boundaries.
+enum EditorTextSource {
+    Literal(String),
+    Clock { format: String },
+    Command { command: String, interval_secs: u32 },
+}
+
+impl EditorTextSource {
+    /// Whether this source ever shells out -- used by the Save button
+    /// handler to decide whether this project's id needs
+    /// `trust_store::mark_trusted`.
+    fn is_command(&self) -> bool {
+        matches!(self, EditorTextSource::Command { .. })
+    }
+
+    fn to_project(&self) -> project_format::TextSource {
+        match self {
+            EditorTextSource::Literal(text) => {
+                project_format::TextSource::Literal { text: text.clone() }
+            }
+            EditorTextSource::Clock { format } => {
+                project_format::TextSource::Clock { format: format.clone() }
+            }
+            EditorTextSource::Command { command, interval_secs } => {
+                project_format::TextSource::Command {
+                    command: command.clone(),
+                    interval_secs: *interval_secs,
+                }
+            }
+        }
+    }
+
+    fn from_project(source: project_format::TextSource) -> Self {
+        match source {
+            project_format::TextSource::Literal { text } => EditorTextSource::Literal(text),
+            project_format::TextSource::Clock { format } => EditorTextSource::Clock { format },
+            project_format::TextSource::Command { command, interval_secs } => {
+                EditorTextSource::Command { command, interval_secs }
+            }
+        }
+    }
 }
 
 impl EditorLayer {
@@ -213,7 +262,9 @@ impl Preview {
             return Ok(());
         }
 
-        let mut layers = self.renderer.load_scene(Path::new(""), &project)?;
+        // Always trusted -- see `sync_live_params`'s Text arm for the
+        // same self-authoring rationale.
+        let mut layers = self.renderer.load_scene(Path::new(""), &project, true)?;
         let (natural_width, natural_height) =
             layers.first().map(LoadedLayer::size).unwrap_or((16, 9));
         let (width, height) = preview_size(natural_width, natural_height);
@@ -262,8 +313,12 @@ impl Preview {
                 EditorLayer::Parallax { strength, smoothing, .. } => {
                     loaded.set_parallax_params(*strength, *smoothing);
                 }
-                EditorLayer::Text { x, y, font_size, color, text } => {
-                    self.renderer.set_text_params(loaded, text, *x, *y, *font_size, *color);
+                EditorLayer::Text { x, y, font_size, color, source } => {
+                    // Always trusted: the editor is the self-authoring
+                    // context (the user typed the command themselves),
+                    // matching the auto-trust-on-save policy in the Save
+                    // button handler.
+                    loaded.set_text_params(&source.to_project(), *x, *y, *font_size, *color, true);
                 }
                 EditorLayer::Image { .. } | EditorLayer::Gif { .. } => {}
             }
@@ -283,11 +338,10 @@ impl Preview {
         let parallax_dt_ms = elapsed_ms.saturating_sub(self.last_parallax_update_ms);
         self.last_parallax_update_ms = elapsed_ms;
         self.renderer.update_parallax(&mut self.layers, cursor_px, parallax_dt_ms);
+        self.renderer.advance_text_sources(&mut self.layers, chrono::Local::now());
         self.renderer.render_to_texture(&self.view, &self.layers, wgpu::Color::TRANSPARENT);
 
-        self.layers.iter().any(|l| {
-            matches!(l, LoadedLayer::Gif { .. } | LoadedLayer::Xray(_) | LoadedLayer::Parallax(_))
-        })
+        self.layers.iter().any(LoadedLayer::is_dynamic)
     }
 }
 
@@ -358,12 +412,12 @@ fn build_preview_project(layers: &[EditorLayer]) -> Option<project_format::Proje
                 strength: *strength,
                 smoothing: *smoothing,
             },
-            EditorLayer::Text { x, y, font_size, color, text } => project_format::Layer::Text {
+            EditorLayer::Text { x, y, font_size, color, source } => project_format::Layer::Text {
                 x: *x,
                 y: *y,
                 font_size: *font_size,
                 color: *color,
-                source: project_format::TextSource::Literal { text: text.clone() },
+                source: source.to_project(),
             },
         })
         .collect();
@@ -766,7 +820,7 @@ impl EditorApp {
                         y: 0.5,
                         font_size: 0.05,
                         color: [1.0, 1.0, 1.0, 1.0],
-                        text: String::new(),
+                        source: EditorTextSource::Literal(String::new()),
                     });
                 }
             });
@@ -840,11 +894,55 @@ impl EditorApp {
                                 ui.add(eframe::egui::Slider::new(smoothing, 0.0..=1.0));
                             });
                         }
-                        EditorLayer::Text { x, y, font_size, color, text } => {
+                        EditorLayer::Text { x, y, font_size, color, source } => {
                             ui.horizontal(|ui| {
-                                ui.label("Text:");
-                                ui.text_edit_singleline(text);
+                                ui.label("Source:");
+                                let is_literal = matches!(source, EditorTextSource::Literal(_));
+                                if ui.selectable_label(is_literal, "Текст").clicked() && !is_literal {
+                                    *source = EditorTextSource::Literal(String::new());
+                                }
+                                let is_clock = matches!(source, EditorTextSource::Clock { .. });
+                                if ui.selectable_label(is_clock, "Часы").clicked() && !is_clock {
+                                    *source = EditorTextSource::Clock { format: "%H:%M".to_string() };
+                                }
+                                let is_command = source.is_command();
+                                if ui.selectable_label(is_command, "Команда").clicked() && !is_command {
+                                    *source = EditorTextSource::Command {
+                                        command: String::new(),
+                                        interval_secs: 60,
+                                    };
+                                }
                             });
+                            match source {
+                                EditorTextSource::Literal(text) => {
+                                    ui.horizontal(|ui| {
+                                        ui.label("Text:");
+                                        ui.text_edit_singleline(text);
+                                    });
+                                }
+                                EditorTextSource::Clock { format } => {
+                                    ui.horizontal(|ui| {
+                                        ui.label("Format:").on_hover_text(
+                                            "strftime-style -- e.g. %H:%M for a 24h clock, %Y-%m-%d for a date.",
+                                        );
+                                        ui.text_edit_singleline(format);
+                                    });
+                                }
+                                EditorTextSource::Command { command, interval_secs } => {
+                                    ui.horizontal(|ui| {
+                                        ui.label("Command:").on_hover_text(
+                                            "Run through sh -c. Failure, timeout (5s) or empty \
+                                             output all just show \"NULL\" -- check render-server's \
+                                             own log for the real reason if that happens.",
+                                        );
+                                        ui.text_edit_singleline(command);
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Interval (s):");
+                                        ui.add(eframe::egui::DragValue::new(interval_secs).range(1..=86400));
+                                    });
+                                }
+                            }
                             ui.horizontal(|ui| {
                                 ui.label("Font size:")
                                     .on_hover_text("Fraction of canvas height -- resolution-independent.");
@@ -898,6 +996,19 @@ impl EditorApp {
                 let dir = library::project_dir(&id);
                 match save_project(&dir, &self.layers, self.fps, &self.current_project_name) {
                     Ok(()) => {
+                        // Auto-trust: the user just typed this command
+                        // themselves and saved it, which is exactly the
+                        // self-authoring context that makes a separate
+                        // consent dialog unnecessary in this pass (see
+                        // `trust_store`'s module doc comment). Without
+                        // this, render-server would refuse to ever run
+                        // it, even though it was authored here.
+                        let has_command_layer = self.layers.iter().any(|layer| {
+                            matches!(layer, EditorLayer::Text { source, .. } if source.is_command())
+                        });
+                        if has_command_layer && let Err(e) = trust_store::mark_trusted(&id) {
+                            eprintln!("editor: failed to update the trust store for {id:?}: {e}");
+                        }
                         self.current_project_id = Some(id);
                         if let Some(preview) = &self.preview
                             && let Err(e) =
@@ -1151,10 +1262,13 @@ fn open_project(project_dir: &Path) -> Result<(Vec<EditorLayer>, u32), String> {
                 strength,
                 smoothing,
             },
-            project_format::Layer::Text { x, y, font_size, color, source } => {
-                let project_format::TextSource::Literal { text } = source;
-                EditorLayer::Text { x, y, font_size, color, text }
-            }
+            project_format::Layer::Text { x, y, font_size, color, source } => EditorLayer::Text {
+                x,
+                y,
+                font_size,
+                color,
+                source: EditorTextSource::from_project(source),
+            },
         })
         .collect();
 
@@ -1227,12 +1341,12 @@ fn save_project(project_dir: &Path, layers: &[EditorLayer], fps: u32, name: &str
                     }
                 }
                 // No asset to stage.
-                EditorLayer::Text { x, y, font_size, color, text } => project_format::Layer::Text {
+                EditorLayer::Text { x, y, font_size, color, source } => project_format::Layer::Text {
                     x: *x,
                     y: *y,
                     font_size: *font_size,
                     color: *color,
-                    source: project_format::TextSource::Literal { text: text.clone() },
+                    source: source.to_project(),
                 },
             };
             saved_layers.push(saved);
