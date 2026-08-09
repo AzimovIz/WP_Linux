@@ -41,8 +41,56 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "WP Linux Editor",
         native_options,
-        Box::new(|_cc| Ok(Box::new(EditorApp::default()))),
+        Box::new(|cc| {
+            apply_style(&cc.egui_ctx);
+            Ok(Box::new(EditorApp::default()))
+        }),
     )
+}
+
+/// Softens up egui's stock look (sharp corners, tight spacing) into
+/// something a bit more current -- rounded widgets, a bit more breathing
+/// room, and one accent color used consistently for selection/hover/
+/// active states instead of the default flat gray. Applied once at
+/// startup rather than per-frame since nothing here is dynamic (no
+/// light/dark toggle in this app).
+fn apply_style(ctx: &eframe::egui::Context) {
+    // Applied to both the light and dark `Style` egui keeps internally
+    // (it can switch between them to follow the system theme) rather
+    // than whichever happens to be active right now.
+    ctx.all_styles_mut(|style| {
+        style.spacing.item_spacing = eframe::egui::vec2(8.0, 10.0);
+        style.spacing.button_padding = eframe::egui::vec2(10.0, 6.0);
+        style.spacing.window_margin = eframe::egui::Margin::same(12);
+        style.spacing.menu_margin = eframe::egui::Margin::same(8);
+        style.spacing.interact_size.y = 24.0;
+        // Wider than the default 100px -- a slider spanning a large
+        // range (e.g. 20..=800) gets noticeably more precision per pixel
+        // of drag just from this, on top of `scroll_slider`'s wheel
+        // support below.
+        style.spacing.slider_width = 180.0;
+
+        let accent = eframe::egui::Color32::from_rgb(94, 129, 244);
+        let corner_radius = eframe::egui::CornerRadius::from(6);
+
+        let visuals = &mut style.visuals;
+        visuals.window_corner_radius = eframe::egui::CornerRadius::from(10);
+        visuals.menu_corner_radius = eframe::egui::CornerRadius::from(8);
+        for widgets in [
+            &mut visuals.widgets.noninteractive,
+            &mut visuals.widgets.inactive,
+            &mut visuals.widgets.hovered,
+            &mut visuals.widgets.active,
+            &mut visuals.widgets.open,
+        ] {
+            widgets.corner_radius = corner_radius;
+        }
+        visuals.widgets.hovered.bg_stroke = eframe::egui::Stroke::new(1.0, accent);
+        visuals.widgets.active.bg_stroke = eframe::egui::Stroke::new(1.5, accent);
+        visuals.selection.bg_fill = accent;
+        visuals.selection.stroke = eframe::egui::Stroke::new(1.0, eframe::egui::Color32::WHITE);
+        visuals.hyperlink_color = accent;
+    });
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -63,16 +111,23 @@ struct MonitorInfo {
     height: u32,
 }
 
-/// Number of tiles per row in the "Обои" tab's wallpaper grid.
+/// Number of tiles per row in the "Wallpapers" tab's wallpaper grid.
 const WALLPAPER_GRID_COLUMNS: usize = 4;
 /// Size of each tile's preview image (name label sits below it, outside
 /// this rect).
 const WALLPAPER_TILE_SIZE: eframe::egui::Vec2 = eframe::egui::Vec2::new(220.0, 130.0);
-/// Size of each tile's always-visible Редактировать/Применить icon
+/// Size of each tile's always-visible Edit/Apply icon
 /// buttons, pinned to the top-right corner of the thumbnail.
 const WALLPAPER_ICON_SIZE: f32 = 24.0;
 const WALLPAPER_ICON_MARGIN: f32 = 6.0;
 const WALLPAPER_ICON_GAP: f32 = 4.0;
+
+/// Rough estimate of `show_editor_tab`'s fixed footer (separator, name
+/// field, save button, status line, spacing) below the scrollable layer
+/// list -- just needs to be in the right neighborhood, not pixel-exact,
+/// since it only caps how tall the scroll area is allowed to grow before
+/// it starts scrolling instead of pushing the footer further down.
+const EDITOR_FOOTER_RESERVED_HEIGHT: f32 = 140.0;
 
 enum EditorLayer {
     Image {
@@ -524,7 +579,7 @@ struct EditorApp {
     tab: Tab,
     previous_tab: Tab,
 
-    // -- "Обои" tab state --
+    // -- "Wallpapers" tab state --
     monitors: Vec<MonitorInfo>,
     /// Mirrors `monitors_config`'s on-disk file -- monitor id -> project dir.
     assignments: HashMap<String, PathBuf>,
@@ -532,11 +587,11 @@ struct EditorApp {
     /// Lazily-loaded preview textures, keyed by each entry's `preview_path`.
     thumbnails: HashMap<PathBuf, eframe::egui::TextureHandle>,
     pusher: Box<dyn ProjectPusher>,
-    /// Project dir of the wallpaper whose "Применить" overlay (monitor
+    /// Project dir of the wallpaper whose "Apply" overlay (monitor
     /// picker) is currently open, if any.
     apply_overlay: Option<PathBuf>,
 
-    // -- "Редактор" tab state --
+    // -- "Editor" tab state --
     layers: Vec<EditorLayer>,
     fps: u32,
     status: String,
@@ -605,9 +660,9 @@ impl eframe::App for EditorApp {
         eframe::egui::Panel::top("tabs").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Wallpapers, "Обои");
-                ui.selectable_value(&mut self.tab, Tab::Discover, "Больше обоев");
-                ui.selectable_value(&mut self.tab, Tab::Editor, "Редактор");
+                ui.selectable_value(&mut self.tab, Tab::Wallpapers, "Wallpapers");
+                ui.selectable_value(&mut self.tab, Tab::Discover, "Discover");
+                ui.selectable_value(&mut self.tab, Tab::Editor, "Editor");
             });
             ui.add_space(4.0);
         });
@@ -652,7 +707,7 @@ impl eframe::App for EditorApp {
 impl EditorApp {
     fn show_discover_tab(&mut self, ui: &mut eframe::egui::Ui) {
         ui.centered_and_justified(|ui| {
-            ui.heading("Больше обоев — скоро");
+            ui.heading("Discover — coming soon");
         });
     }
 
@@ -685,7 +740,7 @@ impl EditorApp {
 
     fn show_wallpapers_tab(&mut self, ui: &mut eframe::egui::Ui) {
         ui.horizontal(|ui| {
-            ui.heading("Обои");
+            ui.heading("Wallpapers");
             if ui.button("Rescan").clicked() {
                 self.rescan_library();
             }
@@ -693,7 +748,7 @@ impl EditorApp {
         ui.add_space(8.0);
 
         if self.library.is_empty() {
-            ui.label("No wallpapers in the library yet -- save one from the Редактор tab.");
+            ui.label("No wallpapers in the library yet -- save one from the Editor tab.");
         }
 
         eframe::egui::ScrollArea::vertical().show(ui, |ui| {
@@ -711,9 +766,9 @@ impl EditorApp {
         self.show_apply_overlay(ui.ctx());
     }
 
-    /// One tile in the "Обои" grid: a fixed-size preview (or a plain
+    /// One tile in the "Wallpapers" grid: a fixed-size preview (or a plain
     /// placeholder if this entry has no `preview.png` yet) with
-    /// always-visible Редактировать/Применить icon buttons pinned to its
+    /// always-visible Edit/Apply icon buttons pinned to its
     /// top-right corner.
     fn show_wallpaper_tile(&mut self, ui: &mut eframe::egui::Ui, entry: &library::LibraryEntry) {
         let display_name = if entry.name.is_empty() {
@@ -770,14 +825,14 @@ impl EditorApp {
             );
             if ui
                 .put(edit_rect, eframe::egui::Button::new("✏"))
-                .on_hover_text("Редактировать")
+                .on_hover_text("Edit")
                 .clicked()
             {
                 self.open_library_entry(entry);
             }
             if ui
                 .put(apply_rect, eframe::egui::Button::new("🖥"))
-                .on_hover_text("Применить")
+                .on_hover_text("Apply")
                 .clicked()
             {
                 self.apply_overlay = Some(entry.dir.clone());
@@ -787,7 +842,7 @@ impl EditorApp {
         });
     }
 
-    /// The "Применить" modal: pick which monitor `self.apply_overlay`'s
+    /// The "Apply" modal: pick which monitor `self.apply_overlay`'s
     /// wallpaper should be assigned to, or cancel. Closes on Cancel, on a
     /// backdrop click, or on Escape (the latter two via `Modal`'s own
     /// `should_close`).
@@ -798,7 +853,7 @@ impl EditorApp {
 
         let modal_response =
             eframe::egui::Modal::new(eframe::egui::Id::new("apply_overlay")).show(ctx, |ui| {
-                ui.heading("Применить к монитору");
+                ui.heading("Apply to monitor");
                 ui.add_space(8.0);
 
                 if self.monitors.is_empty() {
@@ -818,7 +873,7 @@ impl EditorApp {
                 }
 
                 ui.add_space(8.0);
-                if ui.button("Отмена").clicked() {
+                if ui.button("Cancel").clicked() {
                     self.apply_overlay = None;
                 }
             });
@@ -829,7 +884,7 @@ impl EditorApp {
     }
 
     /// Loads a library entry into the editor tab and switches to it --
-    /// shared by the Wallpapers tab's "Редактировать" button and the
+    /// shared by the Wallpapers tab's "Edit" button and the
     /// Editor tab's own "Open project..." picker.
     fn open_library_entry(&mut self, entry: &library::LibraryEntry) {
         match open_project(&entry.dir) {
@@ -876,7 +931,7 @@ impl EditorApp {
         ui.horizontal(|ui| {
                 ui.label("Target FPS (animated/cursor layers only):")
                     .on_hover_text("Used by render-server once this project is loaded there -- doesn't affect the preview on the left, which always redraws at a fixed rate.");
-                ui.add(eframe::egui::Slider::new(&mut self.fps, 1..=60));
+                scroll_slider(ui, &mut self.fps, 1..=60);
             });
 
         ui.add_space(8.0);
@@ -919,30 +974,45 @@ impl EditorApp {
         let mut move_down = None;
         let mut remove = None;
 
-        for (index, layer) in self.layers.iter_mut().enumerate() {
-            ui.group(|ui| {
-                // Match the group to whatever width the (resizable)
-                // panel actually has instead of sizing to content --
-                // otherwise a group can only ever grow to fit its
-                // widest child and never shrinks back down when the
-                // window is narrowed.
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.strong(format!("#{} {}", index + 1, layer.label()));
-                    if ui.small_button("up").clicked() {
-                        move_up = Some(index);
-                    }
-                    if ui.small_button("down").clicked() {
-                        move_down = Some(index);
-                    }
-                    if ui.small_button("remove").clicked() {
-                        remove = Some(index);
-                    }
-                });
+        // Capped, not unbounded, so a project with many layers scrolls
+        // internally instead of pushing the name/save section below the
+        // window's bottom edge (previously the only fix was resizing the
+        // whole window). `EDITOR_FOOTER_RESERVED_HEIGHT` is a rough
+        // estimate of everything below this scroll area, not pixel-exact
+        // -- `auto_shrink`'s `true` on the y-axis means a short layer
+        // list still shrinks the area down to its own content instead of
+        // always eating the full cap.
+        let list_max_height = (ui.available_height() - EDITOR_FOOTER_RESERVED_HEIGHT).max(120.0);
+        eframe::egui::ScrollArea::vertical()
+            .max_height(list_max_height)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for (index, layer) in self.layers.iter_mut().enumerate() {
+                    ui.group(|ui| {
+                        // Match the group to whatever width the
+                        // (resizable) panel actually has instead of
+                        // sizing to content -- otherwise a group can
+                        // only ever grow to fit its widest child and
+                        // never shrinks back down when the window is
+                        // narrowed.
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.strong(format!("#{} {}", index + 1, layer.label()));
+                            if ui.small_button("up").clicked() {
+                                move_up = Some(index);
+                            }
+                            if ui.small_button("down").clicked() {
+                                move_down = Some(index);
+                            }
+                            if ui.small_button("remove").clicked() {
+                                remove = Some(index);
+                            }
+                        });
 
-                show_layer_panel(ui, layer);
+                        show_layer_panel(ui, layer);
+                    });
+                }
             });
-        }
 
         if let Some(index) = remove {
             self.layers.remove(index);
@@ -1132,7 +1202,7 @@ fn show_xray_panel(
     );
     ui.horizontal(|ui| {
         ui.label("Radius (px):");
-        ui.add(eframe::egui::Slider::new(radius, 20.0..=800.0));
+        scroll_slider(ui, radius, 20.0..=800.0);
     });
 }
 
@@ -1155,13 +1225,13 @@ fn show_parallax_panel(
     ui.horizontal(|ui| {
         ui.label("Strength:")
             .on_hover_text("How far the layer pans at the screen edge, as a fraction of its own size. Negative pans towards the cursor instead of away from it.");
-        ui.add(eframe::egui::Slider::new(strength, -0.4..=0.4));
+        scroll_slider(ui, strength, -0.4..=0.4);
     });
     ui.horizontal(|ui| {
         ui.label("Smoothing (s):").on_hover_text(
             "How long the pan takes to ease towards the cursor. 0 = track instantly.",
         );
-        ui.add(eframe::egui::Slider::new(smoothing, 0.0..=1.0));
+        scroll_slider(ui, smoothing, 0.0..=1.0);
     });
 }
 
@@ -1176,17 +1246,17 @@ fn show_text_panel(
     ui.horizontal(|ui| {
         ui.label("Source:");
         let is_literal = matches!(source, EditorTextSource::Literal(_));
-        if ui.selectable_label(is_literal, "Текст").clicked() && !is_literal {
+        if ui.selectable_label(is_literal, "Text").clicked() && !is_literal {
             *source = EditorTextSource::Literal(String::new());
         }
         let is_clock = matches!(source, EditorTextSource::Clock { .. });
-        if ui.selectable_label(is_clock, "Часы").clicked() && !is_clock {
+        if ui.selectable_label(is_clock, "Clock").clicked() && !is_clock {
             *source = EditorTextSource::Clock {
                 format: "%H:%M".to_string(),
             };
         }
         let is_command = source.is_command();
-        if ui.selectable_label(is_command, "Команда").clicked() && !is_command {
+        if ui.selectable_label(is_command, "Command").clicked() && !is_command {
             *source = EditorTextSource::Command {
                 command: String::new(),
                 interval_secs: 60,
@@ -1229,7 +1299,7 @@ fn show_text_panel(
     ui.horizontal(|ui| {
         ui.label("Font size:")
             .on_hover_text("Fraction of canvas height -- resolution-independent.");
-        ui.add(eframe::egui::Slider::new(font_size, 0.01..=0.3));
+        scroll_slider(ui, font_size, 0.01..=0.3);
     });
     ui.horizontal(|ui| {
         ui.label("Color:");
@@ -1237,11 +1307,11 @@ fn show_text_panel(
     });
     ui.horizontal(|ui| {
         ui.label("X:");
-        ui.add(eframe::egui::Slider::new(x, 0.0..=1.0));
+        scroll_slider(ui, x, 0.0..=1.0);
     });
     ui.horizontal(|ui| {
         ui.label("Y:");
-        ui.add(eframe::egui::Slider::new(y, 0.0..=1.0));
+        scroll_slider(ui, y, 0.0..=1.0);
     });
 }
 
@@ -1389,6 +1459,38 @@ fn load_thumbnail_texture(ctx: &eframe::egui::Context, path: &Path) -> eframe::e
         color_image,
         eframe::egui::TextureOptions::default(),
     )
+}
+
+/// A `Slider` that also responds to the mouse wheel while hovered.
+/// Stock egui sliders only move by click/drag, and dragging across a
+/// ~180px-wide slider to hit one of, say, 780 possible values (radius
+/// 20..=800) is nearly impossible by mouse movement alone. Scrolling
+/// maps 1:1 to the same distance dragging would: scrolling the slider's
+/// own on-screen width across moves it end to end, so short wheel
+/// notches give fine control near the current value.
+///
+/// Consumes the scroll delta it acts on (see the `smooth_scroll_delta`
+/// reset below) so it doesn't *also* get read by an enclosing
+/// `ScrollArea` -- see `show_editor_tab`'s layer list, which relies on
+/// this to let wheel-over-a-slider and wheel-over-the-list-background
+/// do two different things instead of both firing at once.
+fn scroll_slider<Num: eframe::egui::emath::Numeric>(
+    ui: &mut eframe::egui::Ui,
+    value: &mut Num,
+    range: std::ops::RangeInclusive<Num>,
+) -> eframe::egui::Response {
+    let response = ui.add(eframe::egui::Slider::new(value, range.clone()));
+    if response.hovered() {
+        let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
+        if scroll_y != 0.0 {
+            let (min, max) = (range.start().to_f64(), range.end().to_f64());
+            let value_per_pixel = (max - min) / response.rect.width().max(1.0) as f64;
+            let new_value = (value.to_f64() + scroll_y as f64 * value_per_pixel).clamp(min, max);
+            *value = Num::from_f64(new_value);
+            ui.input_mut(|i| i.smooth_scroll_delta.y = 0.0);
+        }
+    }
+    response
 }
 
 /// Shows `label`, a Browse button, and the chosen file's name -- full

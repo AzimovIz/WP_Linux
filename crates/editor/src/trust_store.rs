@@ -6,7 +6,7 @@
 //! moment it saves one containing any Command-sourced text layer (see
 //! the Save button handler in `main.rs`) -- the editor is the
 //! self-authoring context, so there's no separate consent dialog in this
-//! pass; a real prompt only becomes necessary once a "Больше обоев"
+//! pass; a real prompt only becomes necessary once a "Discover"
 //! import feature exists (out of scope, unbuilt).
 //!
 //! Deliberately **additive** (read-modify-write), unlike

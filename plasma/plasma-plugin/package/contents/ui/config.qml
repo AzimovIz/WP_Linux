@@ -14,7 +14,7 @@ ColumnLayout {
     property var configDialog
 
     // Wallpaper selection no longer happens on this page at all -- it
-    // lives in the WP Linux app's own "Обои" tab now (see that app's
+    // lives in the WP Linux app's own "Wallpapers" tab now (see that app's
     // library/monitors_config modules), which is the only way assignments
     // stay valid: it's the app that scans the library and knows what
     // actually exists, rather than this page accepting any typed/browsed
