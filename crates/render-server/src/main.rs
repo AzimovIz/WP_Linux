@@ -12,7 +12,7 @@
 //!                    used to turn the global cursor position (see below) into
 //!                    local, normalized coordinates for xray/parallax layers
 //!   GET  /frame?monitor=ID      -> current frame, PNG (static project) or BMP (dynamic)
-//!   GET  /meta?monitor=ID       -> {"ready": bool, "frame_id": u64, "needs_cursor": bool, "fps": u32}
+//!   GET  /meta?monitor=ID       -> {"ready": bool, "frame_id": u64, "needs_cursor": bool, "fps": u32, "has_geometry": bool}
 //!
 //! Cursor position itself does NOT come in over HTTP: this process also
 //! registers the `dev.wplinux.CursorBridge` D-Bus service (formerly a
@@ -176,28 +176,55 @@ impl CursorDbusService {
     }
 }
 
+/// How long to wait between attempts to register the cursor D-Bus
+/// service after a failed one -- see `run_cursor_dbus_service`.
+const CURSOR_DBUS_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Registers the cursor D-Bus service and then parks forever, keeping
 /// the connection alive for the life of the process. Runs in its own
-/// thread so a D-Bus setup failure (e.g. another instance of this
-/// service already running) can't take down the HTTP server or the
-/// render loop -- it just means xray layers won't see cursor movement.
+/// thread so a D-Bus setup failure can't take down the HTTP server or
+/// the render loop -- it just means xray layers won't see cursor
+/// movement until registration succeeds.
+///
+/// Retries on failure instead of giving up after one attempt: the two
+/// realistic failure causes -- a stale instance of this same service
+/// still holding the bus name (e.g. a previous render-server process
+/// that didn't exit cleanly), or the session D-Bus not being fully up
+/// yet this early after login/reboot -- both tend to resolve themselves
+/// within a few seconds. A one-shot `.expect()` here meant either of
+/// those left cursor input permanently dead for the rest of the
+/// process's life, with no way to recover short of restarting it by
+/// hand.
 fn run_cursor_dbus_service(state: Arc<SharedState>) {
-    let service = CursorDbusService { state };
-    let _conn = connection::Builder::session()
-        .expect("failed to connect to session D-Bus")
-        .name(CURSOR_BUS_NAME)
-        .expect(
-            "failed to request bus name -- is another instance of this service already running?",
-        )
-        .serve_at(CURSOR_OBJECT_PATH, service)
-        .expect("failed to register D-Bus object")
-        .build()
-        .expect("failed to build D-Bus connection");
-    eprintln!(
-        "render-server: registered {CURSOR_BUS_NAME}{CURSOR_OBJECT_PATH}, waiting for SetCursorPosition calls"
-    );
+    let connect = || -> zbus::Result<zbus::blocking::Connection> {
+        let service = CursorDbusService {
+            state: Arc::clone(&state),
+        };
+        connection::Builder::session()?
+            .name(CURSOR_BUS_NAME)?
+            .serve_at(CURSOR_OBJECT_PATH, service)?
+            .build()
+    };
+
     loop {
-        std::thread::park();
+        match connect() {
+            Ok(_conn) => {
+                eprintln!(
+                    "render-server: registered {CURSOR_BUS_NAME}{CURSOR_OBJECT_PATH}, waiting for SetCursorPosition calls"
+                );
+                loop {
+                    std::thread::park();
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "render-server: failed to register {CURSOR_BUS_NAME} ({e}) -- retrying in \
+                     {}s (xray/parallax layers won't see cursor movement until this succeeds)",
+                    CURSOR_DBUS_RETRY_INTERVAL.as_secs(),
+                );
+                std::thread::sleep(CURSOR_DBUS_RETRY_INTERVAL);
+            }
+        }
     }
 }
 
@@ -346,11 +373,29 @@ fn compute_cursor_uv(state: &SharedState, monitor_id: &str) -> Option<(f32, f32)
 
 fn main() {
     eprintln!("render-server: starting (pid {})", std::process::id());
+
+    let state = Arc::new(SharedState::default());
+
+    // Bind (and start listening on) the HTTP socket before doing anything
+    // slow -- wgpu init below can take a real amount of time on a cold GPU
+    // right after boot. The OS queues incoming TCP connections in its
+    // accept backlog as soon as a socket is listening, even before we ever
+    // call `incoming_requests()`, so binding first closes the startup race
+    // that used to cost QML's one-shot `/geometry` POST (see main.qml's
+    // own comment on why it has no retry): a request arriving in the old
+    // window between process start and the HTTP bind got connection
+    // refused, and for `/geometry` specifically was never retried --
+    // leaving xray/parallax layers permanently blind to the cursor until
+    // something recreated the wallpaper item. `/project` already
+    // self-heals via a retry in `sceneMeta.poll()`, which is why it used
+    // to "just work" after a moment while geometry silently didn't.
+    let server =
+        Server::http(HTTP_ADDR).unwrap_or_else(|e| panic!("failed to bind {HTTP_ADDR}: {e}"));
+    eprintln!("render-server: listening on http://{HTTP_ADDR}");
+
     eprintln!("render-server: initializing wgpu...");
     let renderer = Arc::new(pollster::block_on(SceneRenderer::new_headless(CANVAS_FORMAT)));
     eprintln!("render-server: wgpu ready");
-
-    let state = Arc::new(SharedState::default());
 
     {
         let renderer = Arc::clone(&renderer);
@@ -370,8 +415,6 @@ fn main() {
 
     ensure_kwin_cursor_script_loaded();
 
-    let server =
-        Server::http(HTTP_ADDR).unwrap_or_else(|e| panic!("failed to bind {HTTP_ADDR}: {e}"));
     eprintln!("render-server: serving http://{HTTP_ADDR} (no project loaded yet)");
 
     for mut request in server.incoming_requests() {
@@ -420,6 +463,9 @@ fn main() {
                     // leaves whatever geometry this monitor already had,
                     // so a bad request can't regress a working cursor.
                     Some(geometry) => {
+                        eprintln!(
+                            "render-server: received /geometry {geometry:?} for monitor {monitor_id:?}"
+                        );
                         state
                             .geometry
                             .lock()
@@ -428,6 +474,9 @@ fn main() {
                         let _ = request.respond(text_response(200, "ok"));
                     }
                     None => {
+                        eprintln!(
+                            "render-server: bad /geometry body {body:?} for monitor {monitor_id:?}"
+                        );
                         let _ = request.respond(text_response(400, "bad geometry body"));
                     }
                 }
@@ -461,20 +510,32 @@ fn main() {
                     let _ = request.respond(missing_monitor_response());
                     continue;
                 };
-                let output = state.output.lock().unwrap();
                 // No entry yet (monitor never loaded / render-server was
                 // restarted) reports the same all-defaults "not ready"
                 // shape a fresh `FrameOutput::default()` always did --
                 // still a 200, not a 404, so QML's "resend the project
                 // path until it sticks" retry in `sceneMeta.poll()` keeps
                 // working exactly as it did for the single-project case.
-                let entry = output.get(monitor_id);
+                let (ready, frame_id, needs_cursor, fps) = {
+                    let output = state.output.lock().unwrap();
+                    let entry = output.get(monitor_id);
+                    (
+                        entry.is_some_and(|o| o.ready),
+                        entry.map_or(0, |o| o.frame_id),
+                        entry.is_some_and(|o| o.needs_cursor),
+                        entry.map_or(0, |o| o.fps),
+                    )
+                };
+                // Same idea as the project-path retry mentioned above, but
+                // for `/geometry`: it's normally pushed once, reactively,
+                // by QML (see main.qml), with no retry of its own. Telling
+                // QML here whether we actually have geometry on file for
+                // this monitor lets its poll loop resend if a one-shot
+                // push got lost (e.g. it fired before this process had
+                // even bound its HTTP port yet).
+                let has_geometry = state.geometry.lock().unwrap().contains_key(monitor_id);
                 let body = format!(
-                    "{{\"ready\":{},\"frame_id\":{},\"needs_cursor\":{},\"fps\":{}}}",
-                    entry.is_some_and(|o| o.ready),
-                    entry.map_or(0, |o| o.frame_id),
-                    entry.is_some_and(|o| o.needs_cursor),
-                    entry.map_or(0, |o| o.fps),
+                    "{{\"ready\":{ready},\"frame_id\":{frame_id},\"needs_cursor\":{needs_cursor},\"fps\":{fps},\"has_geometry\":{has_geometry}}}"
                 );
                 let response = Response::from_string(body).with_header(
                     tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])

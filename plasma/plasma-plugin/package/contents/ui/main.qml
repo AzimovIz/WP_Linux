@@ -117,6 +117,18 @@ WallpaperItem {
             property real frameId: -1
             property int fps: 30
             property var activeXhr: null
+            // Whether render-server currently has geometry on file for
+            // this monitor. Unlike `ready` (see the resend below),
+            // `pushGeometry()` normally only fires reactively (screen
+            // moved/resized) with no retry of its own -- if its one push
+            // at Component.onCompleted lands before render-server has
+            // even bound its HTTP port yet (e.g. right after a reboot,
+            // while it's still initializing wgpu), that POST is just
+            // lost, and nothing would ever resend it since the screen
+            // itself isn't going to move again on its own. Polling this
+            // flag closes that gap the same way `ready` already does for
+            // the project path.
+            property bool hasGeometry: false
 
             onFrameIdChanged: framePoll.refresh()
 
@@ -158,6 +170,7 @@ WallpaperItem {
                         ready = !!meta.ready;
                         needsCursor = !!meta.needs_cursor;
                         frameId = meta.frame_id;
+                        hasGeometry = !!meta.has_geometry;
                         if (meta.fps) {
                             fps = meta.fps;
                         }
@@ -171,6 +184,12 @@ WallpaperItem {
                     // of requiring a manual re-poke.
                     if (!ready && root.hasProject) {
                         root.pushProjectPath();
+                    }
+                    // Same idea for geometry -- see `hasGeometry`'s doc
+                    // comment for why its one reactive push can go missing
+                    // with nothing to naturally trigger a resend.
+                    if (!hasGeometry) {
+                        root.pushGeometry();
                     }
                 };
                 xhr.open("GET", root.withMonitorParam("http://127.0.0.1:47824/meta"));
