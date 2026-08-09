@@ -880,9 +880,24 @@ impl EditorApp {
         }
     }
 
+    /// Resets the editor tab back to a blank, unsaved project -- the same
+    /// state `EditorApp::default()` starts in, so "New" undoes whatever
+    /// `open_library_entry`/layer edits did without needing to relaunch
+    /// the app. `current_project_id` going back to `None` means the next
+    /// Save writes a fresh library entry rather than overwriting whatever
+    /// was open before.
+    fn new_project(&mut self) {
+        self.layers = Vec::new();
+        self.fps = 30;
+        self.current_project_id = None;
+        self.current_project_name = String::new();
+        self.current_project_description = String::new();
+        self.status = String::new();
+    }
+
     /// Loads a library entry into the editor tab and switches to it --
     /// shared by the Wallpapers tab's "Edit" button and the
-    /// Editor tab's own "Open project..." picker.
+    /// Editor tab's own "Open" picker.
     fn open_library_entry(&mut self, entry: &library::LibraryEntry) {
         match open_project(&entry.dir) {
             Ok((layers, fps, description)) => {
@@ -901,13 +916,14 @@ impl EditorApp {
     }
 
     fn show_editor_tab(&mut self, ui: &mut eframe::egui::Ui) {
-        ui.heading("New wallpaper project");
-        ui.add_space(8.0);
-
-        // Open/Save first -- the two actions that load or persist
+        // New/Open/Save first -- the actions that reset, load, or persist
         // everything below them, so they lead rather than trail the form.
         ui.horizontal(|ui| {
-            ui.menu_button("Open project...", |ui| {
+            if ui.button("New").clicked() {
+                self.new_project();
+            }
+
+            ui.menu_button("Open", |ui| {
                 if self.library.is_empty() {
                     ui.label("Library is empty.");
                 }
@@ -983,7 +999,7 @@ impl EditorApp {
             ui.text_edit_singleline(&mut self.current_project_name);
         });
 
-        ui.add_space(8.0);
+        ui.add_space(2.0);
 
         ui.label("Description:");
         // Capped to ~4 lines regardless of how much text is in there --
@@ -1006,7 +1022,7 @@ impl EditorApp {
                 );
             });
 
-        ui.add_space(8.0);
+        ui.add_space(2.0);
 
         ui.horizontal(|ui| {
                 ui.label("Target FPS (animated/cursor layers only):")
