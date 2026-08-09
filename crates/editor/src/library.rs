@@ -22,7 +22,9 @@ pub const PREVIEW_FILE_NAME: &str = "preview.png";
 /// always goes through `dirs::data_dir()` rather than hardcoding
 /// `~/.local/share`, so a user's `$XDG_DATA_HOME` override is respected.
 pub fn library_root() -> PathBuf {
-    dirs::data_dir().expect("no data dir (HOME unset?)").join(LIBRARY_SUBDIR)
+    dirs::data_dir()
+        .expect("no data dir (HOME unset?)")
+        .join(LIBRARY_SUBDIR)
 }
 
 pub fn project_dir(id: &str) -> PathBuf {
@@ -102,10 +104,8 @@ mod tests {
     fn unique_temp_dir() -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "wplinux-library-test-{}-{n}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("wplinux-library-test-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

@@ -113,12 +113,6 @@ pub enum LoadedLayer {
     Text(TextLayer),
 }
 
-pub enum DrawLayer<'a> {
-    Image(&'a ImageLayer),
-    Xray(&'a XrayLayer),
-    Parallax(&'a ParallaxLayer),
-}
-
 /// What a Text layer currently displays, recomputed fresh on every call
 /// -- no internal history/caching of its own (that's [`TextLayer::text`]'s
 /// job, the single point comparisons happen against). `now` is always
@@ -245,11 +239,7 @@ fn run_command_with_timeout_inner(command: &str, timeout: std::time::Duration) -
                 return None;
             }
             let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if text.is_empty() {
-                None
-            } else {
-                Some(text)
-            }
+            if text.is_empty() { None } else { Some(text) }
         }
         Ok(Err(e)) => {
             eprintln!("player: failed to wait for command {command:?}: {e}");
@@ -261,7 +251,9 @@ fn run_command_with_timeout_inner(command: &str, timeout: std::time::Duration) -
             // permission, PID already reused by something else in the
             // astronomically unlikely case) just means there's nothing
             // left to clean up.
-            let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
+            let _ = std::process::Command::new("kill")
+                .arg(pid.to_string())
+                .status();
             None
         }
     }
@@ -316,7 +308,12 @@ impl CommandSource {
             }
         });
 
-        CommandSource { command, interval_secs, shared, stop }
+        CommandSource {
+            command,
+            interval_secs,
+            shared,
+            stop,
+        }
     }
 }
 
@@ -337,7 +334,11 @@ fn sleep_unless_stopped(total: std::time::Duration, stop: &std::sync::atomic::At
 
 impl LiveTextSource for CommandSource {
     fn poll(&self, _now: chrono::DateTime<chrono::Local>) -> String {
-        self.shared.lock().unwrap().clone().unwrap_or_else(|| "NULL".to_string())
+        self.shared
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "NULL".to_string())
     }
 
     fn is_dynamic(&self) -> bool {
@@ -347,8 +348,8 @@ impl LiveTextSource for CommandSource {
 
 /// Exhaustive enum wrapping each [`LiveTextSource`] impl -- not
 /// `Box<dyn>`, matching this codebase's existing preference (see
-/// `LoadedLayer`/`DrawLayer`) for compiler-enforced exhaustiveness over
-/// dynamic dispatch. The genuine trait-strategy application for this
+/// `LoadedLayer`) for compiler-enforced exhaustiveness over dynamic
+/// dispatch. The genuine trait-strategy application for this
 /// feature: three real implementations behind one interface, dispatched
 /// by an exhaustive match.
 enum LoadedTextSource {
@@ -362,9 +363,16 @@ impl LoadedTextSource {
     /// `SceneRenderer::load_scene`'s doc comment for what decides it.
     fn from_project(source: &TextSource, allow_commands: bool) -> Self {
         match source {
-            TextSource::Literal { text } => LoadedTextSource::Literal(LiteralSource { text: text.clone() }),
-            TextSource::Clock { format } => LoadedTextSource::Clock(ClockSource { format: format.clone() }),
-            TextSource::Command { command, interval_secs } => {
+            TextSource::Literal { text } => {
+                LoadedTextSource::Literal(LiteralSource { text: text.clone() })
+            }
+            TextSource::Clock { format } => LoadedTextSource::Clock(ClockSource {
+                format: format.clone(),
+            }),
+            TextSource::Command {
+                command,
+                interval_secs,
+            } => {
                 if allow_commands {
                     LoadedTextSource::Command(CommandSource::spawn(command.clone(), *interval_secs))
                 } else {
@@ -372,7 +380,10 @@ impl LoadedTextSource {
                         "player: refusing to run command {command:?} for an untrusted project \
                          -- displaying NULL instead"
                     );
-                    LoadedTextSource::Command(CommandSource::untrusted(command.clone(), *interval_secs))
+                    LoadedTextSource::Command(CommandSource::untrusted(
+                        command.clone(),
+                        *interval_secs,
+                    ))
                 }
             }
         }
@@ -390,11 +401,19 @@ impl LoadedTextSource {
     /// leak, not just wasted work.
     fn matches(&self, source: &TextSource) -> bool {
         match (self, source) {
-            (LoadedTextSource::Literal(current), TextSource::Literal { text }) => &current.text == text,
-            (LoadedTextSource::Clock(current), TextSource::Clock { format }) => &current.format == format,
-            (LoadedTextSource::Command(current), TextSource::Command { command, interval_secs }) => {
-                &current.command == command && current.interval_secs == *interval_secs
+            (LoadedTextSource::Literal(current), TextSource::Literal { text }) => {
+                &current.text == text
             }
+            (LoadedTextSource::Clock(current), TextSource::Clock { format }) => {
+                &current.format == format
+            }
+            (
+                LoadedTextSource::Command(current),
+                TextSource::Command {
+                    command,
+                    interval_secs,
+                },
+            ) => &current.command == command && current.interval_secs == *interval_secs,
             _ => false,
         }
     }
@@ -979,7 +998,12 @@ impl SceneRenderer {
         let base_view = base_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let overlay_texture = self.create_texture(overlay_width, overlay_height);
-        self.write_texture(&overlay_texture, overlay_rgba, overlay_width, overlay_height);
+        self.write_texture(
+            &overlay_texture,
+            overlay_rgba,
+            overlay_width,
+            overlay_height,
+        );
         let overlay_view = overlay_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let uniform_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1097,7 +1121,11 @@ impl SceneRenderer {
             &mut glyphon.font_system,
             glyphon::Metrics::new(pixel_font_size, pixel_font_size * 1.2),
         );
-        buffer.set_size(&mut glyphon.font_system, Some(canvas_width), Some(canvas_height));
+        buffer.set_size(
+            &mut glyphon.font_system,
+            Some(canvas_width),
+            Some(canvas_height),
+        );
         buffer.set_text(
             &mut glyphon.font_system,
             &text,
@@ -1138,7 +1166,9 @@ impl SceneRenderer {
             match layer {
                 Layer::Image { path } => {
                     let (rgba, width, height) = open_rgba(&project_dir.join(path))?;
-                    layers.push(LoadedLayer::Image(self.create_image_layer(&rgba, width, height)));
+                    layers.push(LoadedLayer::Image(
+                        self.create_image_layer(&rgba, width, height),
+                    ));
                 }
                 Layer::Gif { path } => {
                     let (frames, width, height) = decode_gif(&project_dir.join(path))?;
@@ -1179,9 +1209,9 @@ impl SceneRenderer {
                     smoothing,
                 } => {
                     let (rgba, width, height) = open_rgba(&project_dir.join(path))?;
-                    layers.push(LoadedLayer::Parallax(self.create_parallax_layer(
-                        &rgba, width, height, *strength, *smoothing,
-                    )));
+                    layers.push(LoadedLayer::Parallax(
+                        self.create_parallax_layer(&rgba, width, height, *strength, *smoothing),
+                    ));
                 }
                 Layer::Text {
                     x,
@@ -1191,7 +1221,12 @@ impl SceneRenderer {
                     source,
                 } => {
                     layers.push(LoadedLayer::Text(self.create_text_layer(
-                        source, *x, *y, *font_size, *color, allow_commands,
+                        source,
+                        *x,
+                        *y,
+                        *font_size,
+                        *color,
+                        allow_commands,
                     )));
                 }
             }
@@ -1219,7 +1254,9 @@ impl SceneRenderer {
             } = layer
             {
                 let t = elapsed_ms % *total_ms;
-                let index = cumulative_ms.partition_point(|&c| c <= t).min(frames.len() - 1);
+                let index = cumulative_ms
+                    .partition_point(|&c| c <= t)
+                    .min(frames.len() - 1);
                 if index != *current {
                     *current = index;
                     self.update_image_layer(image, &frames[index].rgba, *width, *height);
@@ -1261,7 +1298,12 @@ impl SceneRenderer {
     /// just compare `cursor_px` to the last one it saw (unlike xray,
     /// smoothing means the pan can still be mid-ease towards an old
     /// target after the cursor itself has stopped moving).
-    pub fn update_parallax(&self, layers: &mut [LoadedLayer], cursor_px: (f32, f32), dt_ms: u64) -> bool {
+    pub fn update_parallax(
+        &self,
+        layers: &mut [LoadedLayer],
+        cursor_px: (f32, f32),
+        dt_ms: u64,
+    ) -> bool {
         // Below this, the pan's uniform-buffer bytes are indistinguishable
         // from where it already was -- calling it "settled" here instead
         // of only at exact equality is what lets an exponential ease
@@ -1366,7 +1408,11 @@ impl SceneRenderer {
     /// `Buffer::set_metrics_and_size` already no-ops internally when
     /// nothing actually changed, so there's no reason to duplicate that
     /// check here.
-    pub fn advance_text_sources(&self, layers: &mut [LoadedLayer], now: chrono::DateTime<chrono::Local>) -> bool {
+    pub fn advance_text_sources(
+        &self,
+        layers: &mut [LoadedLayer],
+        now: chrono::DateTime<chrono::Local>,
+    ) -> bool {
         let mut any_changed = false;
         let mut glyphon = self.glyphon.lock().unwrap();
         let canvas_width = glyphon.canvas_width as f32;
@@ -1477,11 +1523,16 @@ impl SceneRenderer {
         });
 
         for layer in layers {
-            let draw_layer = match layer {
-                LoadedLayer::Image(image) => DrawLayer::Image(image),
-                LoadedLayer::Gif { image, .. } => DrawLayer::Image(image),
-                LoadedLayer::Xray(xray) => DrawLayer::Xray(xray),
-                LoadedLayer::Parallax(parallax) => DrawLayer::Parallax(parallax),
+            // Every variant here draws the same way -- one fullscreen
+            // triangle through its own pipeline and bind group -- so
+            // this only needs to pick which of those two, not repeat the
+            // three draw calls per variant.
+            let (pipeline, bind_group) = match layer {
+                LoadedLayer::Image(image) | LoadedLayer::Gif { image, .. } => {
+                    (&self.image_pipeline, &image.bind_group)
+                }
+                LoadedLayer::Xray(xray) => (&self.xray_pipeline, &xray.bind_group),
+                LoadedLayer::Parallax(parallax) => (&self.parallax_pipeline, &parallax.bind_group),
                 // Text isn't part of this per-layer pipeline dispatch at
                 // all -- glyphon batches every prepared text area into
                 // one `render()` call below instead, so it always draws
@@ -1489,23 +1540,9 @@ impl SceneRenderer {
                 // in the project's own layer list.
                 LoadedLayer::Text(_) => continue,
             };
-            match draw_layer {
-                DrawLayer::Image(image) => {
-                    pass.set_pipeline(&self.image_pipeline);
-                    pass.set_bind_group(0, &image.bind_group, &[]);
-                    pass.draw(0..3, 0..1);
-                }
-                DrawLayer::Xray(xray) => {
-                    pass.set_pipeline(&self.xray_pipeline);
-                    pass.set_bind_group(0, &xray.bind_group, &[]);
-                    pass.draw(0..3, 0..1);
-                }
-                DrawLayer::Parallax(parallax) => {
-                    pass.set_pipeline(&self.parallax_pipeline);
-                    pass.set_bind_group(0, &parallax.bind_group, &[]);
-                    pass.draw(0..3, 0..1);
-                }
-            }
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.draw(0..3, 0..1);
         }
 
         let GlyphonState {
@@ -1573,10 +1610,15 @@ pub async fn pick_adapter(instance: &wgpu::Instance) -> wgpu::Adapter {
             .position(|a| a.get_info().name.to_lowercase().contains(&want_lower))
         {
             let adapter = candidates.remove(pos);
-            eprintln!("WPLINUX_GPU={want:?} matched adapter {:?}", adapter.get_info().name);
+            eprintln!(
+                "WPLINUX_GPU={want:?} matched adapter {:?}",
+                adapter.get_info().name
+            );
             return adapter;
         }
-        eprintln!("WPLINUX_GPU={want:?} matched no candidate adapter, falling back to automatic selection");
+        eprintln!(
+            "WPLINUX_GPU={want:?} matched no candidate adapter, falling back to automatic selection"
+        );
     }
 
     candidates.sort_by_key(|a| adapter_rank(a.get_info().device_type));
@@ -1703,12 +1745,16 @@ mod tests {
     /// on any real wall-clock behavior, so no GPU/device is needed at
     /// all (unlike almost everything else in this module).
     fn fixed_now() -> chrono::DateTime<chrono::Local> {
-        chrono::Local.with_ymd_and_hms(2024, 6, 15, 9, 5, 30).unwrap()
+        chrono::Local
+            .with_ymd_and_hms(2024, 6, 15, 9, 5, 30)
+            .unwrap()
     }
 
     #[test]
     fn literal_source_always_returns_its_fixed_text() {
-        let source = LiteralSource { text: "hello".to_string() };
+        let source = LiteralSource {
+            text: "hello".to_string(),
+        };
         assert_eq!(source.poll(fixed_now()), "hello");
     }
 
@@ -1728,25 +1774,37 @@ mod tests {
 
     #[test]
     fn clock_source_formats_against_the_given_time() {
-        let source = ClockSource { format: "%H:%M".to_string() };
+        let source = ClockSource {
+            format: "%H:%M".to_string(),
+        };
         assert_eq!(source.poll(fixed_now()), "09:05");
     }
 
     #[test]
     fn clock_source_with_a_garbled_format_falls_back_to_the_raw_string_instead_of_panicking() {
         let format = "%Q not a real specifier %".to_string();
-        let source = ClockSource { format: format.clone() };
+        let source = ClockSource {
+            format: format.clone(),
+        };
         assert_eq!(source.poll(fixed_now()), format);
     }
 
     #[test]
     fn loaded_text_source_from_project_dispatches_to_the_matching_variant() {
-        let literal =
-            LoadedTextSource::from_project(&TextSource::Literal { text: "hi".to_string() }, true);
+        let literal = LoadedTextSource::from_project(
+            &TextSource::Literal {
+                text: "hi".to_string(),
+            },
+            true,
+        );
         assert_eq!(literal.poll(fixed_now()), "hi");
 
-        let clock =
-            LoadedTextSource::from_project(&TextSource::Clock { format: "%Y".to_string() }, true);
+        let clock = LoadedTextSource::from_project(
+            &TextSource::Clock {
+                format: "%Y".to_string(),
+            },
+            true,
+        );
         assert_eq!(clock.poll(fixed_now()), "2024");
     }
 
@@ -1760,14 +1818,27 @@ mod tests {
 
     #[test]
     fn loaded_text_source_matches_compares_configuration_not_identity() {
-        let literal =
-            LoadedTextSource::from_project(&TextSource::Literal { text: "hi".to_string() }, true);
-        assert!(literal.matches(&TextSource::Literal { text: "hi".to_string() }));
-        assert!(!literal.matches(&TextSource::Literal { text: "bye".to_string() }));
-        assert!(!literal.matches(&TextSource::Clock { format: "%H".to_string() }));
+        let literal = LoadedTextSource::from_project(
+            &TextSource::Literal {
+                text: "hi".to_string(),
+            },
+            true,
+        );
+        assert!(literal.matches(&TextSource::Literal {
+            text: "hi".to_string()
+        }));
+        assert!(!literal.matches(&TextSource::Literal {
+            text: "bye".to_string()
+        }));
+        assert!(!literal.matches(&TextSource::Clock {
+            format: "%H".to_string()
+        }));
 
         let command = LoadedTextSource::from_project(
-            &TextSource::Command { command: "date".to_string(), interval_secs: 5 },
+            &TextSource::Command {
+                command: "date".to_string(),
+                interval_secs: 5,
+            },
             false,
         );
         assert!(command.matches(&TextSource::Command {
@@ -1782,7 +1853,10 @@ mod tests {
 
     #[test]
     fn run_command_with_timeout_returns_trimmed_stdout_on_success() {
-        assert_eq!(run_command_with_timeout("echo hello"), Some("hello".to_string()));
+        assert_eq!(
+            run_command_with_timeout("echo hello"),
+            Some("hello".to_string())
+        );
     }
 
     #[test]

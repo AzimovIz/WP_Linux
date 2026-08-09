@@ -50,21 +50,21 @@ use smithay_client_toolkit::{
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
-        pointer::{PointerEvent, PointerEventKind, PointerHandler},
         Capability, SeatHandler, SeatState,
+        pointer::{PointerEvent, PointerEventKind, PointerHandler},
     },
     shell::{
+        WaylandSurface,
         wlr_layer::{
             Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
             LayerSurfaceConfigure,
         },
-        WaylandSurface,
     },
 };
 use wayland_client::{
+    Connection, Proxy, QueueHandle,
     globals::registry_queue_init,
     protocol::{wl_output, wl_pointer, wl_seat, wl_surface},
-    Connection, Proxy, QueueHandle,
 };
 
 const SURFACE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
@@ -159,7 +159,9 @@ fn main() {
 
     // Populate OutputState and fire `new_output` for every already-present
     // monitor before we enter the main loop.
-    event_queue.roundtrip(&mut app).expect("initial roundtrip failed");
+    event_queue
+        .roundtrip(&mut app)
+        .expect("initial roundtrip failed");
 
     if app.outputs.is_empty() {
         panic!("no outputs were reported by the compositor");
@@ -239,7 +241,9 @@ impl App {
     }
 
     fn draw(&mut self, wl_surface: &wl_surface::WlSurface, qh: &QueueHandle<Self>) {
-        let Some(renderer) = &self.renderer else { return };
+        let Some(renderer) = &self.renderer else {
+            return;
+        };
         let Some(out) = self
             .outputs
             .iter_mut()
@@ -332,7 +336,12 @@ impl OutputHandler for App {
         &mut self.output_state
     }
 
-    fn new_output(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
+    fn new_output(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        output: wl_output::WlOutput,
+    ) {
         self.add_output(output, qh);
     }
 
@@ -370,7 +379,9 @@ impl LayerShellHandler for App {
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
-        let Some(renderer) = &self.renderer else { return };
+        let Some(renderer) = &self.renderer else {
+            return;
+        };
         let Some(out) = self.outputs.iter_mut().find(|o| &o.layer == layer) else {
             return;
         };
@@ -436,10 +447,10 @@ impl SeatHandler for App {
         _: wl_seat::WlSeat,
         capability: Capability,
     ) {
-        if capability == Capability::Pointer {
-            if let Some(pointer) = self.pointer.take() {
-                pointer.release();
-            }
+        if capability == Capability::Pointer
+            && let Some(pointer) = self.pointer.take()
+        {
+            pointer.release();
         }
     }
 

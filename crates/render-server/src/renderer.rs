@@ -8,8 +8,8 @@
 //! them over HTTP. No window, no surface -- this never touches Wayland at
 //! all.
 
-pub use player::{LoadedLayer, SceneRenderer};
 use player::wgpu;
+pub use player::{LoadedLayer, SceneRenderer};
 
 /// `player::OFFSCREEN_FORMAT` under a locally meaningful name -- happens
 /// to also be exactly the byte order `image`'s encoders and the
@@ -91,7 +91,12 @@ pub fn render_frame(renderer: &SceneRenderer, canvas: &Canvas, layers: &[LoadedL
     let mut encoder = renderer
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    renderer.record_draw(&mut encoder, &canvas.target_view, layers, wgpu::Color::TRANSPARENT);
+    renderer.record_draw(
+        &mut encoder,
+        &canvas.target_view,
+        layers,
+        wgpu::Color::TRANSPARENT,
+    );
 
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
@@ -127,8 +132,7 @@ pub fn render_frame(renderer: &SceneRenderer, canvas: &Canvas, layers: &[LoadedL
         .expect("map_async callback never fired")
         .expect("failed to map readback buffer");
 
-    let mut pixels =
-        Vec::with_capacity((canvas.unpadded_bytes_per_row * canvas.height) as usize);
+    let mut pixels = Vec::with_capacity((canvas.unpadded_bytes_per_row * canvas.height) as usize);
     {
         let view = canvas.readback_buffer.get_mapped_range(..);
         for row in 0..canvas.height {

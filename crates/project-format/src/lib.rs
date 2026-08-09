@@ -193,14 +193,25 @@ mod tests {
             y: 0.1,
             font_size: 0.05,
             color: [1.0, 1.0, 1.0, 1.0],
-            source: TextSource::Literal { text: "hello".to_string() },
+            source: TextSource::Literal {
+                text: "hello".to_string(),
+            },
         };
         let json = serde_json::to_string(&layer).unwrap();
         let round_tripped: Layer = serde_json::from_str(&json).unwrap();
         assert!(!round_tripped.is_dynamic());
         match round_tripped {
-            Layer::Text { x, y, font_size, color, source: TextSource::Literal { text } } => {
-                assert_eq!((x, y, font_size, color, text.as_str()), (0.5, 0.1, 0.05, [1.0; 4], "hello"));
+            Layer::Text {
+                x,
+                y,
+                font_size,
+                color,
+                source: TextSource::Literal { text },
+            } => {
+                assert_eq!(
+                    (x, y, font_size, color, text.as_str()),
+                    (0.5, 0.1, 0.05, [1.0; 4], "hello")
+                );
             }
             _ => panic!("expected Layer::Text"),
         }
@@ -213,13 +224,18 @@ mod tests {
             y: 0.05,
             font_size: 0.04,
             color: [1.0, 1.0, 1.0, 1.0],
-            source: TextSource::Clock { format: "%H:%M".to_string() },
+            source: TextSource::Clock {
+                format: "%H:%M".to_string(),
+            },
         };
         let json = serde_json::to_string(&layer).unwrap();
         let round_tripped: Layer = serde_json::from_str(&json).unwrap();
         assert!(round_tripped.is_dynamic());
         match round_tripped {
-            Layer::Text { source: TextSource::Clock { format }, .. } => {
+            Layer::Text {
+                source: TextSource::Clock { format },
+                ..
+            } => {
                 assert_eq!(format, "%H:%M");
             }
             _ => panic!("expected Layer::Text with TextSource::Clock"),
@@ -233,13 +249,23 @@ mod tests {
             y: 0.05,
             font_size: 0.03,
             color: [1.0, 1.0, 1.0, 1.0],
-            source: TextSource::Command { command: "date".to_string(), interval_secs: 60 },
+            source: TextSource::Command {
+                command: "date".to_string(),
+                interval_secs: 60,
+            },
         };
         let json = serde_json::to_string(&layer).unwrap();
         let round_tripped: Layer = serde_json::from_str(&json).unwrap();
         assert!(round_tripped.is_dynamic());
         match round_tripped {
-            Layer::Text { source: TextSource::Command { command, interval_secs }, .. } => {
+            Layer::Text {
+                source:
+                    TextSource::Command {
+                        command,
+                        interval_secs,
+                    },
+                ..
+            } => {
                 assert_eq!((command.as_str(), interval_secs), ("date", 60));
             }
             _ => panic!("expected Layer::Text with TextSource::Command"),

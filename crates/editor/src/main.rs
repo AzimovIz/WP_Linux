@@ -127,15 +127,16 @@ impl EditorTextSource {
             EditorTextSource::Literal(text) => {
                 project_format::TextSource::Literal { text: text.clone() }
             }
-            EditorTextSource::Clock { format } => {
-                project_format::TextSource::Clock { format: format.clone() }
-            }
-            EditorTextSource::Command { command, interval_secs } => {
-                project_format::TextSource::Command {
-                    command: command.clone(),
-                    interval_secs: *interval_secs,
-                }
-            }
+            EditorTextSource::Clock { format } => project_format::TextSource::Clock {
+                format: format.clone(),
+            },
+            EditorTextSource::Command {
+                command,
+                interval_secs,
+            } => project_format::TextSource::Command {
+                command: command.clone(),
+                interval_secs: *interval_secs,
+            },
         }
     }
 
@@ -143,9 +144,13 @@ impl EditorTextSource {
         match source {
             project_format::TextSource::Literal { text } => EditorTextSource::Literal(text),
             project_format::TextSource::Clock { format } => EditorTextSource::Clock { format },
-            project_format::TextSource::Command { command, interval_secs } => {
-                EditorTextSource::Command { command, interval_secs }
-            }
+            project_format::TextSource::Command {
+                command,
+                interval_secs,
+            } => EditorTextSource::Command {
+                command,
+                interval_secs,
+            },
         }
     }
 }
@@ -270,12 +275,15 @@ impl Preview {
         let (width, height) = preview_size(natural_width, natural_height);
         if width != self.width || height != self.height {
             let (texture, view) = create_preview_texture(&self.renderer, width, height);
-            render_state.renderer.write().update_egui_texture_from_wgpu_texture(
-                &self.renderer.device,
-                &view,
-                wgpu::FilterMode::Linear,
-                self.texture_id,
-            );
+            render_state
+                .renderer
+                .write()
+                .update_egui_texture_from_wgpu_texture(
+                    &self.renderer.device,
+                    &view,
+                    wgpu::FilterMode::Linear,
+                    self.texture_id,
+                );
             self.texture = texture;
             self.view = view;
             self.width = width;
@@ -310,10 +318,20 @@ impl Preview {
         for (loaded, editor_layer) in self.layers.iter_mut().zip(editor_layers) {
             match editor_layer {
                 EditorLayer::Xray { radius, .. } => loaded.set_xray_radius(*radius * scale),
-                EditorLayer::Parallax { strength, smoothing, .. } => {
+                EditorLayer::Parallax {
+                    strength,
+                    smoothing,
+                    ..
+                } => {
                     loaded.set_parallax_params(*strength, *smoothing);
                 }
-                EditorLayer::Text { x, y, font_size, color, source } => {
+                EditorLayer::Text {
+                    x,
+                    y,
+                    font_size,
+                    color,
+                    source,
+                } => {
                     // Always trusted: the editor is the self-authoring
                     // context (the user typed the command themselves),
                     // matching the auto-trust-on-save policy in the Save
@@ -337,15 +355,22 @@ impl Preview {
         self.renderer.update_xray_cursors(&self.layers, cursor_px);
         let parallax_dt_ms = elapsed_ms.saturating_sub(self.last_parallax_update_ms);
         self.last_parallax_update_ms = elapsed_ms;
-        self.renderer.update_parallax(&mut self.layers, cursor_px, parallax_dt_ms);
-        self.renderer.advance_text_sources(&mut self.layers, chrono::Local::now());
-        self.renderer.render_to_texture(&self.view, &self.layers, wgpu::Color::TRANSPARENT);
+        self.renderer
+            .update_parallax(&mut self.layers, cursor_px, parallax_dt_ms);
+        self.renderer
+            .advance_text_sources(&mut self.layers, chrono::Local::now());
+        self.renderer
+            .render_to_texture(&self.view, &self.layers, wgpu::Color::TRANSPARENT);
 
         self.layers.iter().any(LoadedLayer::is_dynamic)
     }
 }
 
-fn create_preview_texture(renderer: &SceneRenderer, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
+fn create_preview_texture(
+    renderer: &SceneRenderer,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
     let texture = renderer.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("editor-preview"),
         size: wgpu::Extent3d {
@@ -393,10 +418,22 @@ fn build_preview_project(layers: &[EditorLayer]) -> Option<project_format::Proje
             // side just returns that absolute path unchanged, so passing
             // `Path::new("")` as the base works out.
             EditorLayer::Image { path } => project_format::Layer::Image {
-                path: path.as_ref().expect("checked complete above").display().to_string(),
+                path: path
+                    .as_ref()
+                    .expect("checked complete above")
+                    .display()
+                    .to_string(),
             },
-            EditorLayer::Xray { base, overlay, radius } => project_format::Layer::Xray {
-                base: base.as_ref().expect("checked complete above").display().to_string(),
+            EditorLayer::Xray {
+                base,
+                overlay,
+                radius,
+            } => project_format::Layer::Xray {
+                base: base
+                    .as_ref()
+                    .expect("checked complete above")
+                    .display()
+                    .to_string(),
                 overlay: overlay
                     .as_ref()
                     .expect("checked complete above")
@@ -405,14 +442,32 @@ fn build_preview_project(layers: &[EditorLayer]) -> Option<project_format::Proje
                 radius: *radius,
             },
             EditorLayer::Gif { path } => project_format::Layer::Gif {
-                path: path.as_ref().expect("checked complete above").display().to_string(),
+                path: path
+                    .as_ref()
+                    .expect("checked complete above")
+                    .display()
+                    .to_string(),
             },
-            EditorLayer::Parallax { path, strength, smoothing } => project_format::Layer::Parallax {
-                path: path.as_ref().expect("checked complete above").display().to_string(),
+            EditorLayer::Parallax {
+                path,
+                strength,
+                smoothing,
+            } => project_format::Layer::Parallax {
+                path: path
+                    .as_ref()
+                    .expect("checked complete above")
+                    .display()
+                    .to_string(),
                 strength: *strength,
                 smoothing: *smoothing,
             },
-            EditorLayer::Text { x, y, font_size, color, source } => project_format::Layer::Text {
+            EditorLayer::Text {
+                x,
+                y,
+                font_size,
+                color,
+                source,
+            } => project_format::Layer::Text {
                 x: *x,
                 y: *y,
                 font_size: *font_size,
@@ -538,7 +593,11 @@ impl eframe::App for EditorApp {
                         return None;
                     }
                     let size = m.size();
-                    Some(MonitorInfo { name, width: size.width, height: size.height })
+                    Some(MonitorInfo {
+                        name,
+                        width: size.width,
+                        height: size.height,
+                    })
                 })
                 .collect();
         }
@@ -610,7 +669,8 @@ impl EditorApp {
     /// startup even if it's not running right now), and try to push it to
     /// a currently-running render-server so the change applies live.
     fn assign(&mut self, monitor_id: &str, project_dir: &Path) {
-        self.assignments.insert(monitor_id.to_string(), project_dir.to_path_buf());
+        self.assignments
+            .insert(monitor_id.to_string(), project_dir.to_path_buf());
         if let Err(e) = monitors_config::save(&self.assignments) {
             self.status = format!("Failed to save monitor assignment: {e}");
             return;
@@ -618,8 +678,7 @@ impl EditorApp {
         match self.pusher.push(monitor_id, project_dir) {
             Ok(()) => self.status = format!("Assigned {monitor_id} -> {}", project_dir.display()),
             Err(e) => {
-                self.status =
-                    format!("Assigned locally, but couldn't reach render-server: {e}");
+                self.status = format!("Assigned locally, but couldn't reach render-server: {e}");
             }
         }
     }
@@ -657,22 +716,34 @@ impl EditorApp {
     /// always-visible Редактировать/Применить icon buttons pinned to its
     /// top-right corner.
     fn show_wallpaper_tile(&mut self, ui: &mut eframe::egui::Ui, entry: &library::LibraryEntry) {
-        let display_name = if entry.name.is_empty() { entry.id.as_str() } else { entry.name.as_str() };
+        let display_name = if entry.name.is_empty() {
+            entry.id.as_str()
+        } else {
+            entry.name.as_str()
+        };
 
-        let hover_text = format!("{display_name} -- {} layer(s), {} fps", entry.layer_count, entry.fps);
+        let hover_text = format!(
+            "{display_name} -- {} layer(s), {} fps",
+            entry.layer_count, entry.fps
+        );
 
         ui.vertical(|ui| {
             ui.set_width(WALLPAPER_TILE_SIZE.x);
-            let (rect, response) = ui.allocate_exact_size(WALLPAPER_TILE_SIZE, eframe::egui::Sense::hover());
+            let (rect, response) =
+                ui.allocate_exact_size(WALLPAPER_TILE_SIZE, eframe::egui::Sense::hover());
 
             if let Some(preview_path) = &entry.preview_path {
                 let texture = self
                     .thumbnails
                     .entry(preview_path.clone())
                     .or_insert_with(|| load_thumbnail_texture(ui.ctx(), preview_path));
-                ui.put(rect, eframe::egui::Image::from_texture((texture.id(), WALLPAPER_TILE_SIZE)));
+                ui.put(
+                    rect,
+                    eframe::egui::Image::from_texture((texture.id(), WALLPAPER_TILE_SIZE)),
+                );
             } else {
-                ui.painter().rect_filled(rect, 4.0, ui.visuals().faint_bg_color);
+                ui.painter()
+                    .rect_filled(rect, 4.0, ui.visuals().faint_bg_color);
             }
             response.on_hover_text(hover_text);
 
@@ -697,10 +768,18 @@ impl EditorApp {
                 apply_rect.min - eframe::egui::vec2(WALLPAPER_ICON_GAP + WALLPAPER_ICON_SIZE, 0.0),
                 icon_size,
             );
-            if ui.put(edit_rect, eframe::egui::Button::new("✏")).on_hover_text("Редактировать").clicked() {
+            if ui
+                .put(edit_rect, eframe::egui::Button::new("✏"))
+                .on_hover_text("Редактировать")
+                .clicked()
+            {
                 self.open_library_entry(entry);
             }
-            if ui.put(apply_rect, eframe::egui::Button::new("🖥")).on_hover_text("Применить").clicked() {
+            if ui
+                .put(apply_rect, eframe::egui::Button::new("🖥"))
+                .on_hover_text("Применить")
+                .clicked()
+            {
                 self.apply_overlay = Some(entry.dir.clone());
             }
 
@@ -726,7 +805,13 @@ impl EditorApp {
                     ui.label("No monitors detected.");
                 }
                 for monitor in self.monitors.clone() {
-                    if ui.button(format!("{} ({}x{})", monitor.name, monitor.width, monitor.height)).clicked() {
+                    if ui
+                        .button(format!(
+                            "{} ({}x{})",
+                            monitor.name, monitor.width, monitor.height
+                        ))
+                        .clicked()
+                    {
                         self.assign(&monitor.name, &dir);
                         self.apply_overlay = None;
                     }
@@ -763,273 +848,181 @@ impl EditorApp {
     }
 
     fn show_editor_tab(&mut self, ui: &mut eframe::egui::Ui) {
-            ui.heading("New wallpaper project");
-            ui.label("Layers are drawn bottom to top -- the first one in the list is furthest back.");
-            ui.add_space(8.0);
+        ui.heading("New wallpaper project");
+        ui.label("Layers are drawn bottom to top -- the first one in the list is furthest back.");
+        ui.add_space(8.0);
 
-            ui.horizontal(|ui| {
-                ui.menu_button("Open project...", |ui| {
-                    if self.library.is_empty() {
-                        ui.label("Library is empty.");
+        ui.horizontal(|ui| {
+            ui.menu_button("Open project...", |ui| {
+                if self.library.is_empty() {
+                    ui.label("Library is empty.");
+                }
+                for entry in self.library.clone() {
+                    let display_name = if entry.name.is_empty() {
+                        entry.id.clone()
+                    } else {
+                        entry.name.clone()
+                    };
+                    if ui.button(display_name).clicked() {
+                        self.open_library_entry(&entry);
+                        ui.close();
                     }
-                    for entry in self.library.clone() {
-                        let display_name =
-                            if entry.name.is_empty() { entry.id.clone() } else { entry.name.clone() };
-                        if ui.button(display_name).clicked() {
-                            self.open_library_entry(&entry);
-                            ui.close();
-                        }
-                    }
-                });
+                }
             });
+        });
 
-            ui.add_space(8.0);
+        ui.add_space(8.0);
 
-            ui.horizontal(|ui| {
+        ui.horizontal(|ui| {
                 ui.label("Target FPS (animated/cursor layers only):")
                     .on_hover_text("Used by render-server once this project is loaded there -- doesn't affect the preview on the left, which always redraws at a fixed rate.");
                 ui.add(eframe::egui::Slider::new(&mut self.fps, 1..=60));
             });
 
-            ui.add_space(8.0);
+        ui.add_space(8.0);
 
-            ui.horizontal(|ui| {
-                if ui.button("+ Image").clicked() {
-                    self.layers.push(EditorLayer::Image { path: None });
-                }
-                if ui.button("+ Xray").clicked() {
-                    self.layers.push(EditorLayer::Xray {
-                        base: None,
-                        overlay: None,
-                        radius: 200.0,
-                    });
-                }
-                if ui.button("+ Gif").clicked() {
-                    self.layers.push(EditorLayer::Gif { path: None });
-                }
-                if ui.button("+ Parallax").clicked() {
-                    self.layers.push(EditorLayer::Parallax {
-                        path: None,
-                        strength: 0.05,
-                        smoothing: 0.15,
-                    });
-                }
-                if ui.button("+ Text").clicked() {
-                    self.layers.push(EditorLayer::Text {
-                        x: 0.5,
-                        y: 0.5,
-                        font_size: 0.05,
-                        color: [1.0, 1.0, 1.0, 1.0],
-                        source: EditorTextSource::Literal(String::new()),
-                    });
-                }
-            });
-
-            ui.add_space(8.0);
-
-            let mut move_up = None;
-            let mut move_down = None;
-            let mut remove = None;
-
-            for (index, layer) in self.layers.iter_mut().enumerate() {
-                ui.group(|ui| {
-                    // Match the group to whatever width the (resizable)
-                    // panel actually has instead of sizing to content --
-                    // otherwise a group can only ever grow to fit its
-                    // widest child and never shrinks back down when the
-                    // window is narrowed.
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        ui.strong(format!("#{} {}", index + 1, layer.label()));
-                        if ui.small_button("up").clicked() {
-                            move_up = Some(index);
-                        }
-                        if ui.small_button("down").clicked() {
-                            move_down = Some(index);
-                        }
-                        if ui.small_button("remove").clicked() {
-                            remove = Some(index);
-                        }
-                    });
-
-                    match layer {
-                        EditorLayer::Image { path } => {
-                            path_picker(ui, "Picture", path, &["png", "jpg", "jpeg", "webp"]);
-                        }
-                        EditorLayer::Xray {
-                            base,
-                            overlay,
-                            radius,
-                        } => {
-                            path_picker(ui, "Base picture", base, &["png", "jpg", "jpeg", "webp"]);
-                            path_picker(
-                                ui,
-                                "Overlay picture (shown near cursor)",
-                                overlay,
-                                &["png", "jpg", "jpeg", "webp"],
-                            );
-                            ui.horizontal(|ui| {
-                                ui.label("Radius (px):");
-                                ui.add(eframe::egui::Slider::new(radius, 20.0..=800.0));
-                            });
-                        }
-                        EditorLayer::Gif { path } => {
-                            path_picker(ui, "Gif file", path, &["gif"]);
-                        }
-                        EditorLayer::Parallax { path, strength, smoothing } => {
-                            path_picker(
-                                ui,
-                                "Picture (bigger than your desktop resolution works best)",
-                                path,
-                                &["png", "jpg", "jpeg", "webp"],
-                            );
-                            ui.horizontal(|ui| {
-                                ui.label("Strength:")
-                                    .on_hover_text("How far the layer pans at the screen edge, as a fraction of its own size. Negative pans towards the cursor instead of away from it.");
-                                ui.add(eframe::egui::Slider::new(strength, -0.4..=0.4));
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("Smoothing (s):")
-                                    .on_hover_text("How long the pan takes to ease towards the cursor. 0 = track instantly.");
-                                ui.add(eframe::egui::Slider::new(smoothing, 0.0..=1.0));
-                            });
-                        }
-                        EditorLayer::Text { x, y, font_size, color, source } => {
-                            ui.horizontal(|ui| {
-                                ui.label("Source:");
-                                let is_literal = matches!(source, EditorTextSource::Literal(_));
-                                if ui.selectable_label(is_literal, "Текст").clicked() && !is_literal {
-                                    *source = EditorTextSource::Literal(String::new());
-                                }
-                                let is_clock = matches!(source, EditorTextSource::Clock { .. });
-                                if ui.selectable_label(is_clock, "Часы").clicked() && !is_clock {
-                                    *source = EditorTextSource::Clock { format: "%H:%M".to_string() };
-                                }
-                                let is_command = source.is_command();
-                                if ui.selectable_label(is_command, "Команда").clicked() && !is_command {
-                                    *source = EditorTextSource::Command {
-                                        command: String::new(),
-                                        interval_secs: 60,
-                                    };
-                                }
-                            });
-                            match source {
-                                EditorTextSource::Literal(text) => {
-                                    ui.horizontal(|ui| {
-                                        ui.label("Text:");
-                                        ui.text_edit_singleline(text);
-                                    });
-                                }
-                                EditorTextSource::Clock { format } => {
-                                    ui.horizontal(|ui| {
-                                        ui.label("Format:").on_hover_text(
-                                            "strftime-style -- e.g. %H:%M for a 24h clock, %Y-%m-%d for a date.",
-                                        );
-                                        ui.text_edit_singleline(format);
-                                    });
-                                }
-                                EditorTextSource::Command { command, interval_secs } => {
-                                    ui.horizontal(|ui| {
-                                        ui.label("Command:").on_hover_text(
-                                            "Run through sh -c. Failure, timeout (5s) or empty \
-                                             output all just show \"NULL\" -- check render-server's \
-                                             own log for the real reason if that happens.",
-                                        );
-                                        ui.text_edit_singleline(command);
-                                    });
-                                    ui.horizontal(|ui| {
-                                        ui.label("Interval (s):");
-                                        ui.add(eframe::egui::DragValue::new(interval_secs).range(1..=86400));
-                                    });
-                                }
-                            }
-                            ui.horizontal(|ui| {
-                                ui.label("Font size:")
-                                    .on_hover_text("Fraction of canvas height -- resolution-independent.");
-                                ui.add(eframe::egui::Slider::new(font_size, 0.01..=0.3));
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("Color:");
-                                ui.color_edit_button_rgba_unmultiplied(color);
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("X:");
-                                ui.add(eframe::egui::Slider::new(x, 0.0..=1.0));
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("Y:");
-                                ui.add(eframe::egui::Slider::new(y, 0.0..=1.0));
-                            });
-                        }
-                    }
+        ui.horizontal(|ui| {
+            if ui.button("+ Image").clicked() {
+                self.layers.push(EditorLayer::Image { path: None });
+            }
+            if ui.button("+ Xray").clicked() {
+                self.layers.push(EditorLayer::Xray {
+                    base: None,
+                    overlay: None,
+                    radius: 200.0,
                 });
             }
-
-            if let Some(index) = remove {
-                self.layers.remove(index);
+            if ui.button("+ Gif").clicked() {
+                self.layers.push(EditorLayer::Gif { path: None });
             }
-            if let Some(index) = move_up {
-                if index > 0 {
-                    self.layers.swap(index, index - 1);
-                }
+            if ui.button("+ Parallax").clicked() {
+                self.layers.push(EditorLayer::Parallax {
+                    path: None,
+                    strength: 0.05,
+                    smoothing: 0.15,
+                });
             }
-            if let Some(index) = move_down {
-                if index + 1 < self.layers.len() {
-                    self.layers.swap(index, index + 1);
-                }
+            if ui.button("+ Text").clicked() {
+                self.layers.push(EditorLayer::Text {
+                    x: 0.5,
+                    y: 0.5,
+                    font_size: 0.05,
+                    color: [1.0, 1.0, 1.0, 1.0],
+                    source: EditorTextSource::Literal(String::new()),
+                });
             }
+        });
 
-            ui.add_space(16.0);
-            ui.separator();
-            ui.add_space(8.0);
+        ui.add_space(8.0);
 
-            ui.horizontal(|ui| {
-                ui.label("Name:");
-                ui.text_edit_singleline(&mut self.current_project_name);
+        let mut move_up = None;
+        let mut move_down = None;
+        let mut remove = None;
+
+        for (index, layer) in self.layers.iter_mut().enumerate() {
+            ui.group(|ui| {
+                // Match the group to whatever width the (resizable)
+                // panel actually has instead of sizing to content --
+                // otherwise a group can only ever grow to fit its
+                // widest child and never shrinks back down when the
+                // window is narrowed.
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.strong(format!("#{} {}", index + 1, layer.label()));
+                    if ui.small_button("up").clicked() {
+                        move_up = Some(index);
+                    }
+                    if ui.small_button("down").clicked() {
+                        move_down = Some(index);
+                    }
+                    if ui.small_button("remove").clicked() {
+                        remove = Some(index);
+                    }
+                });
+
+                show_layer_panel(ui, layer);
             });
-            ui.add_space(8.0);
+        }
 
-            let can_save = !self.layers.is_empty() && self.layers.iter().all(EditorLayer::is_complete);
-            let save_label = if self.current_project_id.is_some() { "Save" } else { "Save (new)" };
-            if ui.add_enabled(can_save, eframe::egui::Button::new(save_label)).clicked() {
-                let id = self.current_project_id.clone().unwrap_or_else(library::new_project_id);
-                let dir = library::project_dir(&id);
-                match save_project(&dir, &self.layers, self.fps, &self.current_project_name) {
-                    Ok(()) => {
-                        // Auto-trust: the user just typed this command
-                        // themselves and saved it, which is exactly the
-                        // self-authoring context that makes a separate
-                        // consent dialog unnecessary in this pass (see
-                        // `trust_store`'s module doc comment). Without
-                        // this, render-server would refuse to ever run
-                        // it, even though it was authored here.
-                        let has_command_layer = self.layers.iter().any(|layer| {
+        if let Some(index) = remove {
+            self.layers.remove(index);
+        }
+        if let Some(index) = move_up
+            && index > 0
+        {
+            self.layers.swap(index, index - 1);
+        }
+        if let Some(index) = move_down
+            && index + 1 < self.layers.len()
+        {
+            self.layers.swap(index, index + 1);
+        }
+
+        ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        ui.horizontal(|ui| {
+            ui.label("Name:");
+            ui.text_edit_singleline(&mut self.current_project_name);
+        });
+        ui.add_space(8.0);
+
+        let can_save = !self.layers.is_empty() && self.layers.iter().all(EditorLayer::is_complete);
+        let save_label = if self.current_project_id.is_some() {
+            "Save"
+        } else {
+            "Save (new)"
+        };
+        if ui
+            .add_enabled(can_save, eframe::egui::Button::new(save_label))
+            .clicked()
+        {
+            let id = self
+                .current_project_id
+                .clone()
+                .unwrap_or_else(library::new_project_id);
+            let dir = library::project_dir(&id);
+            match save_project(&dir, &self.layers, self.fps, &self.current_project_name) {
+                Ok(()) => {
+                    // Auto-trust: the user just typed this command
+                    // themselves and saved it, which is exactly the
+                    // self-authoring context that makes a separate
+                    // consent dialog unnecessary in this pass (see
+                    // `trust_store`'s module doc comment). Without
+                    // this, render-server would refuse to ever run
+                    // it, even though it was authored here.
+                    let has_command_layer = self.layers.iter().any(|layer| {
                             matches!(layer, EditorLayer::Text { source, .. } if source.is_command())
                         });
-                        if has_command_layer && let Err(e) = trust_store::mark_trusted(&id) {
-                            eprintln!("editor: failed to update the trust store for {id:?}: {e}");
-                        }
-                        self.current_project_id = Some(id);
-                        if let Some(preview) = &self.preview
-                            && let Err(e) =
-                                generate_thumbnail(preview, &dir.join(library::PREVIEW_FILE_NAME))
-                        {
-                            eprintln!("editor: failed to generate thumbnail for {dir:?}: {e}");
-                        }
-                        self.rescan_library();
-                        self.status = format!("Saved to {}", dir.display());
+                    if has_command_layer && let Err(e) = trust_store::mark_trusted(&id) {
+                        eprintln!("editor: failed to update the trust store for {id:?}: {e}");
                     }
-                    Err(e) => self.status = format!("Failed to save: {e}"),
+                    self.current_project_id = Some(id);
+                    if let Some(preview) = &self.preview
+                        && let Err(e) =
+                            generate_thumbnail(preview, &dir.join(library::PREVIEW_FILE_NAME))
+                    {
+                        eprintln!("editor: failed to generate thumbnail for {dir:?}: {e}");
+                    }
+                    self.rescan_library();
+                    self.status = format!("Saved to {}", dir.display());
                 }
+                Err(e) => self.status = format!("Failed to save: {e}"),
             }
+        }
 
-            if !self.status.is_empty() {
-                ui.add_space(8.0);
-                ui.label(&self.status);
-            }
+        if !self.status.is_empty() {
+            ui.add_space(8.0);
+            ui.label(&self.status);
+        }
     }
 
-    fn show_preview(&mut self, ui: &mut eframe::egui::Ui, render_state: Option<&eframe::egui_wgpu::RenderState>) {
+    fn show_preview(
+        &mut self,
+        ui: &mut eframe::egui::Ui,
+        render_state: Option<&eframe::egui_wgpu::RenderState>,
+    ) {
         ui.heading("Preview");
         ui.add_space(4.0);
 
@@ -1038,7 +1031,9 @@ impl EditorApp {
             return;
         };
 
-        let preview = self.preview.get_or_insert_with(|| Preview::new(render_state));
+        let preview = self
+            .preview
+            .get_or_insert_with(|| Preview::new(render_state));
 
         match preview.ensure_scene(render_state, &self.layers) {
             Ok(()) => self.preview_error = None,
@@ -1061,7 +1056,10 @@ impl EditorApp {
             } else {
                 eframe::egui::vec2(available.y * aspect, available.y)
             };
-            let response = ui.add(eframe::egui::Image::from_texture((preview.texture_id, display_size)));
+            let response = ui.add(eframe::egui::Image::from_texture((
+                preview.texture_id,
+                display_size,
+            )));
 
             // Displayed size and actual texture size differ (the image is
             // stretched to fill the panel), so a hover position in screen
@@ -1088,6 +1086,165 @@ impl EditorApp {
     }
 }
 
+/// Property panel for one layer in the editor's layer list --
+/// dispatches to a per-variant panel below, mirroring `EditorLayer`'s
+/// own shape one level down.
+fn show_layer_panel(ui: &mut eframe::egui::Ui, layer: &mut EditorLayer) {
+    match layer {
+        EditorLayer::Image { path } => show_image_panel(ui, path),
+        EditorLayer::Xray {
+            base,
+            overlay,
+            radius,
+        } => show_xray_panel(ui, base, overlay, radius),
+        EditorLayer::Gif { path } => show_gif_panel(ui, path),
+        EditorLayer::Parallax {
+            path,
+            strength,
+            smoothing,
+        } => show_parallax_panel(ui, path, strength, smoothing),
+        EditorLayer::Text {
+            x,
+            y,
+            font_size,
+            color,
+            source,
+        } => show_text_panel(ui, x, y, font_size, color, source),
+    }
+}
+
+fn show_image_panel(ui: &mut eframe::egui::Ui, path: &mut Option<PathBuf>) {
+    path_picker(ui, "Picture", path, &["png", "jpg", "jpeg", "webp"]);
+}
+
+fn show_xray_panel(
+    ui: &mut eframe::egui::Ui,
+    base: &mut Option<PathBuf>,
+    overlay: &mut Option<PathBuf>,
+    radius: &mut f32,
+) {
+    path_picker(ui, "Base picture", base, &["png", "jpg", "jpeg", "webp"]);
+    path_picker(
+        ui,
+        "Overlay picture (shown near cursor)",
+        overlay,
+        &["png", "jpg", "jpeg", "webp"],
+    );
+    ui.horizontal(|ui| {
+        ui.label("Radius (px):");
+        ui.add(eframe::egui::Slider::new(radius, 20.0..=800.0));
+    });
+}
+
+fn show_gif_panel(ui: &mut eframe::egui::Ui, path: &mut Option<PathBuf>) {
+    path_picker(ui, "Gif file", path, &["gif"]);
+}
+
+fn show_parallax_panel(
+    ui: &mut eframe::egui::Ui,
+    path: &mut Option<PathBuf>,
+    strength: &mut f32,
+    smoothing: &mut f32,
+) {
+    path_picker(
+        ui,
+        "Picture (bigger than your desktop resolution works best)",
+        path,
+        &["png", "jpg", "jpeg", "webp"],
+    );
+    ui.horizontal(|ui| {
+        ui.label("Strength:")
+            .on_hover_text("How far the layer pans at the screen edge, as a fraction of its own size. Negative pans towards the cursor instead of away from it.");
+        ui.add(eframe::egui::Slider::new(strength, -0.4..=0.4));
+    });
+    ui.horizontal(|ui| {
+        ui.label("Smoothing (s):").on_hover_text(
+            "How long the pan takes to ease towards the cursor. 0 = track instantly.",
+        );
+        ui.add(eframe::egui::Slider::new(smoothing, 0.0..=1.0));
+    });
+}
+
+fn show_text_panel(
+    ui: &mut eframe::egui::Ui,
+    x: &mut f32,
+    y: &mut f32,
+    font_size: &mut f32,
+    color: &mut [f32; 4],
+    source: &mut EditorTextSource,
+) {
+    ui.horizontal(|ui| {
+        ui.label("Source:");
+        let is_literal = matches!(source, EditorTextSource::Literal(_));
+        if ui.selectable_label(is_literal, "Текст").clicked() && !is_literal {
+            *source = EditorTextSource::Literal(String::new());
+        }
+        let is_clock = matches!(source, EditorTextSource::Clock { .. });
+        if ui.selectable_label(is_clock, "Часы").clicked() && !is_clock {
+            *source = EditorTextSource::Clock {
+                format: "%H:%M".to_string(),
+            };
+        }
+        let is_command = source.is_command();
+        if ui.selectable_label(is_command, "Команда").clicked() && !is_command {
+            *source = EditorTextSource::Command {
+                command: String::new(),
+                interval_secs: 60,
+            };
+        }
+    });
+    match source {
+        EditorTextSource::Literal(text) => {
+            ui.horizontal(|ui| {
+                ui.label("Text:");
+                ui.text_edit_singleline(text);
+            });
+        }
+        EditorTextSource::Clock { format } => {
+            ui.horizontal(|ui| {
+                ui.label("Format:").on_hover_text(
+                    "strftime-style -- e.g. %H:%M for a 24h clock, %Y-%m-%d for a date.",
+                );
+                ui.text_edit_singleline(format);
+            });
+        }
+        EditorTextSource::Command {
+            command,
+            interval_secs,
+        } => {
+            ui.horizontal(|ui| {
+                ui.label("Command:").on_hover_text(
+                    "Run through sh -c. Failure, timeout (5s) or empty \
+                     output all just show \"NULL\" -- check render-server's \
+                     own log for the real reason if that happens.",
+                );
+                ui.text_edit_singleline(command);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Interval (s):");
+                ui.add(eframe::egui::DragValue::new(interval_secs).range(1..=86400));
+            });
+        }
+    }
+    ui.horizontal(|ui| {
+        ui.label("Font size:")
+            .on_hover_text("Fraction of canvas height -- resolution-independent.");
+        ui.add(eframe::egui::Slider::new(font_size, 0.01..=0.3));
+    });
+    ui.horizontal(|ui| {
+        ui.label("Color:");
+        ui.color_edit_button_rgba_unmultiplied(color);
+    });
+    ui.horizontal(|ui| {
+        ui.label("X:");
+        ui.add(eframe::egui::Slider::new(x, 0.0..=1.0));
+    });
+    ui.horizontal(|ui| {
+        ui.label("Y:");
+        ui.add(eframe::egui::Slider::new(y, 0.0..=1.0));
+    });
+}
+
 /// Thumbnails saved into the library -- deliberately smaller than the
 /// live preview texture, since these only need to look decent shrunk down
 /// to a picker button, never fill a resizable panel.
@@ -1109,22 +1266,32 @@ fn generate_thumbnail(preview: &Preview, dest: &Path) -> Result<(), String> {
     if preview.layers.is_empty() {
         return Err("no scene loaded".to_string());
     }
-    let (natural_width, natural_height) =
-        preview.layers.first().map(LoadedLayer::size).unwrap_or((16, 9));
+    let (natural_width, natural_height) = preview
+        .layers
+        .first()
+        .map(LoadedLayer::size)
+        .unwrap_or((16, 9));
     let width = THUMBNAIL_WIDTH.min(natural_width).max(1);
     let height =
         ((width as u64 * natural_height as u64) / natural_width.max(1) as u64).max(1) as u32;
 
-    let texture = preview.renderer.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("editor-thumbnail"),
-        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: player::OFFSCREEN_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
+    let texture = preview
+        .renderer
+        .device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("editor-thumbnail"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: player::OFFSCREEN_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
     // Rows in a copy-to-buffer destination must be padded to a multiple
@@ -1135,18 +1302,26 @@ fn generate_thumbnail(preview: &Preview, dest: &Path) -> Result<(), String> {
         % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
     let padded_bytes_per_row = unpadded_bytes_per_row + padding;
 
-    let readback_buffer = preview.renderer.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("editor-thumbnail-readback"),
-        size: (padded_bytes_per_row * height) as u64,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
+    let readback_buffer = preview
+        .renderer
+        .device
+        .create_buffer(&wgpu::BufferDescriptor {
+            label: Some("editor-thumbnail-readback"),
+            size: (padded_bytes_per_row * height) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
 
     let mut encoder = preview
         .renderer
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    preview.renderer.record_draw(&mut encoder, &view, &preview.layers, wgpu::Color::TRANSPARENT);
+    preview.renderer.record_draw(
+        &mut encoder,
+        &view,
+        &preview.layers,
+        wgpu::Color::TRANSPARENT,
+    );
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture: &texture,
@@ -1162,7 +1337,11 @@ fn generate_thumbnail(preview: &Preview, dest: &Path) -> Result<(), String> {
                 rows_per_image: Some(height),
             },
         },
-        wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
     );
     preview.renderer.queue.submit(Some(encoder.finish()));
 
@@ -1170,8 +1349,14 @@ fn generate_thumbnail(preview: &Preview, dest: &Path) -> Result<(), String> {
     readback_buffer.map_async(wgpu::MapMode::Read, .., move |result| {
         let _ = tx.send(result);
     });
-    preview.renderer.device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll failed");
-    rx.recv().expect("map_async callback never fired").expect("failed to map readback buffer");
+    preview
+        .renderer
+        .device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("device poll failed");
+    rx.recv()
+        .expect("map_async callback never fired")
+        .expect("failed to map readback buffer");
 
     let mut pixels = Vec::with_capacity((unpadded_bytes_per_row * height) as usize);
     {
@@ -1199,7 +1384,11 @@ fn load_thumbnail_texture(ctx: &eframe::egui::Context, path: &Path) -> eframe::e
         .unwrap_or_else(|_| image::RgbaImage::new(1, 1));
     let size = [rgba.width() as usize, rgba.height() as usize];
     let color_image = eframe::egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-    ctx.load_texture(path.display().to_string(), color_image, eframe::egui::TextureOptions::default())
+    ctx.load_texture(
+        path.display().to_string(),
+        color_image,
+        eframe::egui::TextureOptions::default(),
+    )
 }
 
 /// Shows `label`, a Browse button, and the chosen file's name -- full
@@ -1210,13 +1399,20 @@ fn load_thumbnail_texture(ctx: &eframe::egui::Context, path: &Path) -> eframe::e
 /// whatever's left in the row instead of its own unbounded natural
 /// width) and elides with "..." instead of pushing the row wider; the
 /// full path is still available as a tooltip on hover.
-fn path_picker(ui: &mut eframe::egui::Ui, label: &str, path: &mut Option<PathBuf>, filter: &[&str]) {
+fn path_picker(
+    ui: &mut eframe::egui::Ui,
+    label: &str,
+    path: &mut Option<PathBuf>,
+    filter: &[&str],
+) {
     ui.horizontal(|ui| {
         ui.label(label);
-        if ui.button("Browse...").clicked() {
-            if let Some(chosen) = rfd::FileDialog::new().add_filter("Files", filter).pick_file() {
-                *path = Some(chosen);
-            }
+        if ui.button("Browse...").clicked()
+            && let Some(chosen) = rfd::FileDialog::new()
+                .add_filter("Files", filter)
+                .pick_file()
+        {
+            *path = Some(chosen);
         }
         let name = path
             .as_ref()
@@ -1257,12 +1453,22 @@ fn open_project(project_dir: &Path) -> Result<(Vec<EditorLayer>, u32), String> {
             project_format::Layer::Gif { path } => EditorLayer::Gif {
                 path: Some(project_dir.join(path)),
             },
-            project_format::Layer::Parallax { path, strength, smoothing } => EditorLayer::Parallax {
+            project_format::Layer::Parallax {
+                path,
+                strength,
+                smoothing,
+            } => EditorLayer::Parallax {
                 path: Some(project_dir.join(path)),
                 strength,
                 smoothing,
             },
-            project_format::Layer::Text { x, y, font_size, color, source } => EditorLayer::Text {
+            project_format::Layer::Text {
+                x,
+                y,
+                font_size,
+                color,
+                source,
+            } => EditorLayer::Text {
                 x,
                 y,
                 font_size,
@@ -1289,7 +1495,12 @@ fn open_project(project_dir: &Path) -> Result<(Vec<EditorLayer>, u32), String> {
 /// losing that layer's picture. Staging first means every source is
 /// safely read into the scratch directory before any final name is
 /// touched, so the order layers happen to be processed in can't matter.
-fn save_project(project_dir: &Path, layers: &[EditorLayer], fps: u32, name: &str) -> Result<(), String> {
+fn save_project(
+    project_dir: &Path,
+    layers: &[EditorLayer],
+    fps: u32,
+    name: &str,
+) -> Result<(), String> {
     std::fs::create_dir_all(project_dir).map_err(|e| e.to_string())?;
 
     let staging_dir = project_dir.join(".wplinux-staging");
@@ -1331,7 +1542,11 @@ fn save_project(project_dir: &Path, layers: &[EditorLayer], fps: u32, name: &str
                     let file_name = stage(path, &format!("layer_{index}_anim"))?;
                     project_format::Layer::Gif { path: file_name }
                 }
-                EditorLayer::Parallax { path, strength, smoothing } => {
+                EditorLayer::Parallax {
+                    path,
+                    strength,
+                    smoothing,
+                } => {
                     let path = path.as_ref().expect("save is disabled until complete");
                     let file_name = stage(path, &format!("layer_{index}_parallax"))?;
                     project_format::Layer::Parallax {
@@ -1341,7 +1556,13 @@ fn save_project(project_dir: &Path, layers: &[EditorLayer], fps: u32, name: &str
                     }
                 }
                 // No asset to stage.
-                EditorLayer::Text { x, y, font_size, color, source } => project_format::Layer::Text {
+                EditorLayer::Text {
+                    x,
+                    y,
+                    font_size,
+                    color,
+                    source,
+                } => project_format::Layer::Text {
                     x: *x,
                     y: *y,
                     font_size: *font_size,
@@ -1431,9 +1652,15 @@ mod tests {
         // Rotate: what was layer 2 moves to index 0, layer 0 moves to
         // index 1, layer 1 moves to index 2.
         let reordered = vec![
-            EditorLayer::Image { path: Some(project_dir.join("layer_2_image.png")) },
-            EditorLayer::Image { path: Some(project_dir.join("layer_0_image.png")) },
-            EditorLayer::Image { path: Some(project_dir.join("layer_1_image.png")) },
+            EditorLayer::Image {
+                path: Some(project_dir.join("layer_2_image.png")),
+            },
+            EditorLayer::Image {
+                path: Some(project_dir.join("layer_0_image.png")),
+            },
+            EditorLayer::Image {
+                path: Some(project_dir.join("layer_1_image.png")),
+            },
         ];
 
         save_project(&project_dir, &reordered, 30, "Test Project").expect("save_project failed");
@@ -1441,9 +1668,18 @@ mod tests {
         // Each index's *new* final name should hold whatever that layer's
         // source actually was, not whatever the earlier single-pass copy
         // happened to leave behind.
-        assert_eq!(std::fs::read(project_dir.join("layer_0_image.png")).unwrap(), b"CCCC");
-        assert_eq!(std::fs::read(project_dir.join("layer_1_image.png")).unwrap(), b"AAAA");
-        assert_eq!(std::fs::read(project_dir.join("layer_2_image.png")).unwrap(), b"BBBB");
+        assert_eq!(
+            std::fs::read(project_dir.join("layer_0_image.png")).unwrap(),
+            b"CCCC"
+        );
+        assert_eq!(
+            std::fs::read(project_dir.join("layer_1_image.png")).unwrap(),
+            b"AAAA"
+        );
+        assert_eq!(
+            std::fs::read(project_dir.join("layer_2_image.png")).unwrap(),
+            b"BBBB"
+        );
 
         std::fs::remove_dir_all(&project_dir).ok();
     }

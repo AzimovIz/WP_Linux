@@ -52,8 +52,8 @@ use std::time::{Duration, Instant};
 
 use player::{LoadedLayer, SceneRenderer};
 use project_format::{Layer, Project};
-use renderer::{Canvas, CANVAS_FORMAT};
-use tiny_http::{Method, Response, Server};
+use renderer::{CANVAS_FORMAT, Canvas};
+use tiny_http::{Method, Request, Response, Server};
 use zbus::blocking::connection;
 
 const CURSOR_BUS_NAME: &str = "dev.wplinux.CursorBridge";
@@ -345,7 +345,9 @@ fn ensure_kwin_cursor_script_loaded() {
     };
 
     match load() {
-        Ok(true) => eprintln!("render-server: loaded and started kwin cursor script from {SCRIPT_PATH}"),
+        Ok(true) => {
+            eprintln!("render-server: loaded and started kwin cursor script from {SCRIPT_PATH}")
+        }
         Ok(false) => eprintln!("render-server: kwin cursor script already loaded"),
         Err(e) => eprintln!(
             "render-server: could not auto-load kwin cursor script ({e}) -- \
@@ -409,7 +411,9 @@ fn main() {
     }
 
     eprintln!("render-server: initializing wgpu...");
-    let renderer = Arc::new(pollster::block_on(SceneRenderer::new_headless(CANVAS_FORMAT)));
+    let renderer = Arc::new(pollster::block_on(SceneRenderer::new_headless(
+        CANVAS_FORMAT,
+    )));
     eprintln!("render-server: wgpu ready");
 
     {
@@ -432,7 +436,7 @@ fn main() {
 
     eprintln!("render-server: serving http://{HTTP_ADDR} (no project loaded yet)");
 
-    for mut request in server.incoming_requests() {
+    for request in server.incoming_requests() {
         let method = request.method().clone();
         // request.url() is the raw request-target and includes the query
         // string (e.g. "/frame?t=123&monitor=DP-1"); split path (for
@@ -443,126 +447,132 @@ fn main() {
         let monitor_id = query_param(query, "monitor");
 
         match (&method, path) {
-            (Method::Post, "/project") => {
-                let Some(monitor_id) = monitor_id else {
-                    let _ = request.respond(missing_monitor_response());
-                    continue;
-                };
-                let mut body = String::new();
-                if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                    let _ =
-                        request.respond(text_response(400, &format!("bad request body: {e}")));
-                    continue;
-                }
-                let project_dir = PathBuf::from(body.trim());
-                eprintln!("render-server: received /project {project_dir:?} for monitor {monitor_id:?}");
-                state
-                    .pending_project
-                    .lock()
-                    .unwrap()
-                    .insert(monitor_id.to_string(), project_dir);
-                let _ = request.respond(text_response(200, "ok"));
-            }
-            (Method::Post, "/geometry") => {
-                let Some(monitor_id) = monitor_id else {
-                    let _ = request.respond(missing_monitor_response());
-                    continue;
-                };
-                let mut body = String::new();
-                let _ = request.as_reader().read_to_string(&mut body);
-                match parse_geometry(body.trim()) {
-                    // Only overwrite this monitor's geometry on a
-                    // successfully parsed body -- a malformed POST
-                    // (shouldn't happen, but was previously handled by
-                    // silently blanking geometry to `None`) now just
-                    // leaves whatever geometry this monitor already had,
-                    // so a bad request can't regress a working cursor.
-                    Some(geometry) => {
-                        eprintln!(
-                            "render-server: received /geometry {geometry:?} for monitor {monitor_id:?}"
-                        );
-                        state
-                            .geometry
-                            .lock()
-                            .unwrap()
-                            .insert(monitor_id.to_string(), geometry);
-                        let _ = request.respond(text_response(200, "ok"));
-                    }
-                    None => {
-                        eprintln!(
-                            "render-server: bad /geometry body {body:?} for monitor {monitor_id:?}"
-                        );
-                        let _ = request.respond(text_response(400, "bad geometry body"));
-                    }
-                }
-            }
-            (Method::Get, "/frame") => {
-                let Some(monitor_id) = monitor_id else {
-                    let _ = request.respond(missing_monitor_response());
-                    continue;
-                };
-                let output = state.output.lock().unwrap();
-                match output.get(monitor_id) {
-                    Some(output) if !output.frame_bytes.is_empty() => {
-                        let response =
-                            Response::from_data(output.frame_bytes.clone()).with_header(
-                                tiny_http::Header::from_bytes(
-                                    &b"Content-Type"[..],
-                                    output.frame_content_type.as_bytes(),
-                                )
-                                .unwrap(),
-                            );
-                        let _ = request.respond(response);
-                    }
-                    _ => {
-                        let _ = request
-                            .respond(text_response(404, "no project loaded for this monitor"));
-                    }
-                }
-            }
-            (Method::Get, "/meta") => {
-                let Some(monitor_id) = monitor_id else {
-                    let _ = request.respond(missing_monitor_response());
-                    continue;
-                };
-                // No entry yet (monitor never loaded / render-server was
-                // restarted) reports the same all-defaults "not ready"
-                // shape a fresh `FrameOutput::default()` always did --
-                // still a 200, not a 404, so QML's "resend the project
-                // path until it sticks" retry in `sceneMeta.poll()` keeps
-                // working exactly as it did for the single-project case.
-                let (ready, frame_id, needs_cursor, fps) = {
-                    let output = state.output.lock().unwrap();
-                    let entry = output.get(monitor_id);
-                    (
-                        entry.is_some_and(|o| o.ready),
-                        entry.map_or(0, |o| o.frame_id),
-                        entry.is_some_and(|o| o.needs_cursor),
-                        entry.map_or(0, |o| o.fps),
-                    )
-                };
-                // Same idea as the project-path retry mentioned above, but
-                // for `/geometry`: it's normally pushed once, reactively,
-                // by QML (see main.qml), with no retry of its own. Telling
-                // QML here whether we actually have geometry on file for
-                // this monitor lets its poll loop resend if a one-shot
-                // push got lost (e.g. it fired before this process had
-                // even bound its HTTP port yet).
-                let has_geometry = state.geometry.lock().unwrap().contains_key(monitor_id);
-                let body = format!(
-                    "{{\"ready\":{ready},\"frame_id\":{frame_id},\"needs_cursor\":{needs_cursor},\"fps\":{fps},\"has_geometry\":{has_geometry}}}"
-                );
-                let response = Response::from_string(body).with_header(
-                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
-                        .unwrap(),
-                );
-                let _ = request.respond(response);
-            }
+            (Method::Post, "/project") => handle_project(request, monitor_id, &state),
+            (Method::Post, "/geometry") => handle_geometry(request, monitor_id, &state),
+            (Method::Get, "/frame") => handle_frame(request, monitor_id, &state),
+            (Method::Get, "/meta") => handle_meta(request, monitor_id, &state),
             _ => {
                 let _ = request.respond(text_response(404, "not found"));
             }
         }
     }
+}
+
+/// `POST /project?monitor=ID`, body = absolute path to a project
+/// directory. Only records the path for the render thread to pick up on
+/// its next tick (see `render_tick_loop`) -- never touches the GPU on
+/// the HTTP thread.
+fn handle_project(mut request: Request, monitor_id: Option<&str>, state: &SharedState) {
+    let Some(monitor_id) = monitor_id else {
+        let _ = request.respond(missing_monitor_response());
+        return;
+    };
+    let mut body = String::new();
+    if let Err(e) = request.as_reader().read_to_string(&mut body) {
+        let _ = request.respond(text_response(400, &format!("bad request body: {e}")));
+        return;
+    }
+    let project_dir = PathBuf::from(body.trim());
+    eprintln!("render-server: received /project {project_dir:?} for monitor {monitor_id:?}");
+    state
+        .pending_project
+        .lock()
+        .unwrap()
+        .insert(monitor_id.to_string(), project_dir);
+    let _ = request.respond(text_response(200, "ok"));
+}
+
+/// `POST /geometry?monitor=ID`, body = "virtualX,virtualY,width,height".
+fn handle_geometry(mut request: Request, monitor_id: Option<&str>, state: &SharedState) {
+    let Some(monitor_id) = monitor_id else {
+        let _ = request.respond(missing_monitor_response());
+        return;
+    };
+    let mut body = String::new();
+    let _ = request.as_reader().read_to_string(&mut body);
+    match parse_geometry(body.trim()) {
+        // Only overwrite this monitor's geometry on a successfully
+        // parsed body -- a malformed POST (shouldn't happen, but was
+        // previously handled by silently blanking geometry to `None`)
+        // now just leaves whatever geometry this monitor already had, so
+        // a bad request can't regress a working cursor.
+        Some(geometry) => {
+            eprintln!("render-server: received /geometry {geometry:?} for monitor {monitor_id:?}");
+            state
+                .geometry
+                .lock()
+                .unwrap()
+                .insert(monitor_id.to_string(), geometry);
+            let _ = request.respond(text_response(200, "ok"));
+        }
+        None => {
+            eprintln!("render-server: bad /geometry body {body:?} for monitor {monitor_id:?}");
+            let _ = request.respond(text_response(400, "bad geometry body"));
+        }
+    }
+}
+
+/// `GET /frame?monitor=ID` -> current frame, PNG (static project) or BMP
+/// (dynamic), or 404 if nothing has ever rendered for this monitor yet.
+fn handle_frame(request: Request, monitor_id: Option<&str>, state: &SharedState) {
+    let Some(monitor_id) = monitor_id else {
+        let _ = request.respond(missing_monitor_response());
+        return;
+    };
+    let output = state.output.lock().unwrap();
+    match output.get(monitor_id) {
+        Some(output) if !output.frame_bytes.is_empty() => {
+            let response = Response::from_data(output.frame_bytes.clone()).with_header(
+                tiny_http::Header::from_bytes(
+                    &b"Content-Type"[..],
+                    output.frame_content_type.as_bytes(),
+                )
+                .unwrap(),
+            );
+            let _ = request.respond(response);
+        }
+        _ => {
+            let _ = request.respond(text_response(404, "no project loaded for this monitor"));
+        }
+    }
+}
+
+/// `GET /meta?monitor=ID` -> `{"ready", "frame_id", "needs_cursor", "fps", "has_geometry"}`.
+fn handle_meta(request: Request, monitor_id: Option<&str>, state: &SharedState) {
+    let Some(monitor_id) = monitor_id else {
+        let _ = request.respond(missing_monitor_response());
+        return;
+    };
+    // No entry yet (monitor never loaded / render-server was restarted)
+    // reports the same all-defaults "not ready" shape a fresh
+    // `FrameOutput::default()` always did -- still a 200, not a 404, so
+    // QML's "resend the project path until it sticks" retry in
+    // `sceneMeta.poll()` keeps working exactly as it did for the
+    // single-project case.
+    let (ready, frame_id, needs_cursor, fps) = {
+        let output = state.output.lock().unwrap();
+        let entry = output.get(monitor_id);
+        (
+            entry.is_some_and(|o| o.ready),
+            entry.map_or(0, |o| o.frame_id),
+            entry.is_some_and(|o| o.needs_cursor),
+            entry.map_or(0, |o| o.fps),
+        )
+    };
+    // Same idea as the project-path retry mentioned above, but for
+    // `/geometry`: it's normally pushed once, reactively, by QML (see
+    // main.qml), with no retry of its own. Telling QML here whether we
+    // actually have geometry on file for this monitor lets its poll loop
+    // resend if a one-shot push got lost (e.g. it fired before this
+    // process had even bound its HTTP port yet).
+    let has_geometry = state.geometry.lock().unwrap().contains_key(monitor_id);
+    let body = format!(
+        "{{\"ready\":{ready},\"frame_id\":{frame_id},\"needs_cursor\":{needs_cursor},\"fps\":{fps},\"has_geometry\":{has_geometry}}}"
+    );
+    let response = Response::from_string(body).with_header(
+        tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap(),
+    );
+    let _ = request.respond(response);
 }
 
 /// Extracts the value of `key` from a raw query string
@@ -693,13 +703,19 @@ fn render_tick_loop(renderer: &SceneRenderer, state: &SharedState) {
                 let elapsed_ms = project.loaded_at.elapsed().as_millis() as u64;
                 let dt_ms = elapsed_ms.saturating_sub(project.last_parallax_update_ms);
                 project.last_parallax_update_ms = elapsed_ms;
-                let cursor_px = cursor_px_from_uv(cursor_uv, project.canvas_width, project.canvas_height);
+                let cursor_px =
+                    cursor_px_from_uv(cursor_uv, project.canvas_width, project.canvas_height);
                 renderer.update_parallax(&mut project.layers, cursor_px, dt_ms)
             } else {
                 false
             };
 
-            if project.needs_render || gif_changed || cursor_changed || parallax_changed || text_changed {
+            if project.needs_render
+                || gif_changed
+                || cursor_changed
+                || parallax_changed
+                || text_changed
+            {
                 project.last_rendered_cursor_uv = cursor_uv;
 
                 let (frame_bytes, content_type) = compose_and_encode(renderer, project, cursor_uv);
@@ -736,7 +752,11 @@ fn render_tick_loop(renderer: &SceneRenderer, state: &SharedState) {
 /// currently isn't one (matches `player`'s own convention for "cursor
 /// isn't anywhere near this layer" -- see `App::pointer_frame`'s `Leave`
 /// handling).
-fn cursor_px_from_uv(cursor_uv: Option<(f32, f32)>, canvas_width: u32, canvas_height: u32) -> (f32, f32) {
+fn cursor_px_from_uv(
+    cursor_uv: Option<(f32, f32)>,
+    canvas_width: u32,
+    canvas_height: u32,
+) -> (f32, f32) {
     cursor_uv
         .map(|(u, v)| (u * canvas_width as f32, v * canvas_height as f32))
         .unwrap_or((-1.0e6, -1.0e6))
@@ -778,7 +798,10 @@ fn load_project(renderer: &SceneRenderer, project_dir: &Path) -> Result<LoadedPr
     // The library's own convention is already "id = the project
     // directory's own name" -- reusing it here means trust doesn't need
     // a dedicated id field threaded through `Project`/the HTTP endpoint.
-    let project_id = project_dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let project_id = project_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
     let allow_commands = trust_store::is_trusted(project_id);
 
     let mut loaded_layers = renderer.load_scene(&project_dir, &project, allow_commands)?;
@@ -921,7 +944,12 @@ mod tests {
         let rgba: Vec<u8> = (0..(width * height))
             .flat_map(|i| {
                 let i = i as u8;
-                [i, i.wrapping_add(50), i.wrapping_add(100), i.wrapping_add(150)]
+                [
+                    i,
+                    i.wrapping_add(50),
+                    i.wrapping_add(100),
+                    i.wrapping_add(150),
+                ]
             })
             .collect();
 

@@ -51,17 +51,26 @@ fn push_project(monitor_id: &str, project_dir: &Path) -> Result<(), String> {
         body.len(),
     );
 
-    let addr = RENDER_SERVER_ADDR.parse().map_err(|e| format!("bad address: {e}"))?;
+    let addr = RENDER_SERVER_ADDR
+        .parse()
+        .map_err(|e| format!("bad address: {e}"))?;
     let mut stream =
         TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| format!("connect: {e}"))?;
-    stream.write_all(request.as_bytes()).map_err(|e| format!("write: {e}"))?;
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("write: {e}"))?;
 
     let mut response = String::new();
-    stream.read_to_string(&mut response).map_err(|e| format!("read: {e}"))?;
+    stream
+        .read_to_string(&mut response)
+        .map_err(|e| format!("read: {e}"))?;
     if response.starts_with("HTTP/1.1 200") {
         Ok(())
     } else {
-        Err(format!("render-server responded: {}", response.lines().next().unwrap_or("")))
+        Err(format!(
+            "render-server responded: {}",
+            response.lines().next().unwrap_or("")
+        ))
     }
 }
 
@@ -82,7 +91,10 @@ pub mod test_support {
 
     impl ProjectPusher for RecordingPusher {
         fn push(&self, monitor_id: &str, project_dir: &Path) -> Result<(), String> {
-            self.calls.lock().unwrap().push((monitor_id.to_string(), project_dir.to_path_buf()));
+            self.calls
+                .lock()
+                .unwrap()
+                .push((monitor_id.to_string(), project_dir.to_path_buf()));
             Ok(())
         }
     }
@@ -90,15 +102,19 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::RecordingPusher;
     use super::ProjectPusher;
+    use super::test_support::RecordingPusher;
     use std::path::PathBuf;
 
     #[test]
     fn recording_pusher_records_calls_without_touching_the_network() {
         let pusher = RecordingPusher::default();
-        pusher.push("DP-1", &PathBuf::from("/tmp/some/project")).unwrap();
-        pusher.push("HDMI-A-1", &PathBuf::from("/tmp/other/project")).unwrap();
+        pusher
+            .push("DP-1", &PathBuf::from("/tmp/some/project"))
+            .unwrap();
+        pusher
+            .push("HDMI-A-1", &PathBuf::from("/tmp/other/project"))
+            .unwrap();
 
         let calls = pusher.calls.lock().unwrap();
         assert_eq!(
