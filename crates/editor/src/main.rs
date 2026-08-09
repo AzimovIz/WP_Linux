@@ -122,13 +122,6 @@ const WALLPAPER_ICON_SIZE: f32 = 24.0;
 const WALLPAPER_ICON_MARGIN: f32 = 6.0;
 const WALLPAPER_ICON_GAP: f32 = 4.0;
 
-/// Rough estimate of `show_editor_tab`'s fixed footer (separator, name
-/// field, save button, status line, spacing) below the scrollable layer
-/// list -- just needs to be in the right neighborhood, not pixel-exact,
-/// since it only caps how tall the scroll area is allowed to grow before
-/// it starts scrolling instead of pushing the footer further down.
-const EDITOR_FOOTER_RESERVED_HEIGHT: f32 = 140.0;
-
 enum EditorLayer {
     Image {
         path: Option<PathBuf>,
@@ -533,8 +526,10 @@ fn build_preview_project(layers: &[EditorLayer]) -> Option<project_format::Proje
         .collect();
     Some(project_format::Project {
         // Irrelevant to the preview itself -- this `Project` only exists
-        // to hand to `load_scene`, which never reads `name` at all.
+        // to hand to `load_scene`, which never reads `name`/`description`
+        // at all.
         name: String::new(),
+        description: String::new(),
         layers: converted,
         // Irrelevant to the preview itself (see `PREVIEW_REPAINT_INTERVAL`)
         // -- this `Project` only exists to hand to `load_scene`, which
@@ -603,6 +598,7 @@ struct EditorApp {
     /// dialog with no memory of what was last opened.
     current_project_id: Option<String>,
     current_project_name: String,
+    current_project_description: String,
 }
 
 impl Default for EditorApp {
@@ -623,6 +619,7 @@ impl Default for EditorApp {
             preview_error: None,
             current_project_id: None,
             current_project_name: String::new(),
+            current_project_description: String::new(),
         }
     }
 }
@@ -888,11 +885,12 @@ impl EditorApp {
     /// Editor tab's own "Open project..." picker.
     fn open_library_entry(&mut self, entry: &library::LibraryEntry) {
         match open_project(&entry.dir) {
-            Ok((layers, fps)) => {
+            Ok((layers, fps, description)) => {
                 self.layers = layers;
                 self.fps = fps;
                 self.current_project_id = Some(entry.id.clone());
                 self.current_project_name = entry.name.clone();
+                self.current_project_description = description;
                 self.status = format!("Opened {}", entry.dir.display());
                 self.tab = Tab::Editor;
             }
@@ -904,9 +902,10 @@ impl EditorApp {
 
     fn show_editor_tab(&mut self, ui: &mut eframe::egui::Ui) {
         ui.heading("New wallpaper project");
-        ui.label("Layers are drawn bottom to top -- the first one in the list is furthest back.");
         ui.add_space(8.0);
 
+        // Open/Save first -- the two actions that load or persist
+        // everything below them, so they lead rather than trail the form.
         ui.horizontal(|ui| {
             ui.menu_button("Open project...", |ui| {
                 if self.library.is_empty() {
@@ -924,7 +923,88 @@ impl EditorApp {
                     }
                 }
             });
+
+            let can_save =
+                !self.layers.is_empty() && self.layers.iter().all(EditorLayer::is_complete);
+            let save_label = if self.current_project_id.is_some() {
+                "Save"
+            } else {
+                "Save (new)"
+            };
+            if ui
+                .add_enabled(can_save, eframe::egui::Button::new(save_label))
+                .clicked()
+            {
+                let id = self
+                    .current_project_id
+                    .clone()
+                    .unwrap_or_else(library::new_project_id);
+                let dir = library::project_dir(&id);
+                match save_project(
+                    &dir,
+                    &self.layers,
+                    self.fps,
+                    &self.current_project_name,
+                    &self.current_project_description,
+                ) {
+                    Ok(()) => {
+                        // Auto-trust: the user just typed this command
+                        // themselves and saved it, which is exactly the
+                        // self-authoring context that makes a separate
+                        // consent dialog unnecessary in this pass (see
+                        // `trust_store`'s module doc comment). Without
+                        // this, render-server would refuse to ever run
+                        // it, even though it was authored here.
+                        let has_command_layer = self.layers.iter().any(|layer| {
+                            matches!(layer, EditorLayer::Text { source, .. } if source.is_command())
+                        });
+                        if has_command_layer && let Err(e) = trust_store::mark_trusted(&id) {
+                            eprintln!("editor: failed to update the trust store for {id:?}: {e}");
+                        }
+                        self.current_project_id = Some(id);
+                        if let Some(preview) = &self.preview
+                            && let Err(e) =
+                                generate_thumbnail(preview, &dir.join(library::PREVIEW_FILE_NAME))
+                        {
+                            eprintln!("editor: failed to generate thumbnail for {dir:?}: {e}");
+                        }
+                        self.rescan_library();
+                        self.status = format!("Saved to {}", dir.display());
+                    }
+                    Err(e) => self.status = format!("Failed to save: {e}"),
+                }
+            }
         });
+
+        ui.add_space(8.0);
+
+        ui.horizontal(|ui| {
+            ui.label("Name:");
+            ui.text_edit_singleline(&mut self.current_project_name);
+        });
+
+        ui.add_space(8.0);
+
+        ui.label("Description:");
+        // Capped to ~4 lines regardless of how much text is in there --
+        // `TextEdit::multiline` alone has no such limit (it just grows to
+        // fit everything typed into it), so the cap comes from wrapping
+        // it in its own small `ScrollArea` instead. The height is an
+        // approximation of 4 rows plus the text edit's own frame margin,
+        // not pixel-exact -- being off by a line or two here just means
+        // the 5th line peeks in before scrolling kicks in, not a real
+        // layout problem the way the footer's old fixed-height guess was.
+        eframe::egui::ScrollArea::vertical()
+            .id_salt("description_scroll")
+            .max_height(ui.text_style_height(&eframe::egui::TextStyle::Body) * 4.5)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.add(
+                    eframe::egui::TextEdit::multiline(&mut self.current_project_description)
+                        .desired_rows(4)
+                        .desired_width(f32::INFINITY),
+                );
+            });
 
         ui.add_space(8.0);
 
@@ -935,6 +1015,8 @@ impl EditorApp {
             });
 
         ui.add_space(8.0);
+        ui.label("Layers are drawn bottom to top -- the first one in the list is furthest back.");
+        ui.add_space(4.0);
 
         ui.horizontal(|ui| {
             if ui.button("+ Image").clicked() {
@@ -970,21 +1052,33 @@ impl EditorApp {
 
         ui.add_space(8.0);
 
+        // A `Panel`, not a fixed pixel guess -- it measures its own
+        // content's actual height each frame and reserves exactly that
+        // much, so the status line it holds always stays fully visible
+        // and pinned to the bottom regardless of the window's size (a
+        // hand-picked constant here previously drifted out of sync the
+        // moment spacing/padding changed, e.g. from `apply_style`,
+        // silently clipping it below the window). Declared *before* the
+        // layer list below on purpose: like every other `Panel`, it
+        // claims its slice of `ui`'s remaining space first, leaving
+        // whatever's left to the list's `ScrollArea`.
+        eframe::egui::Panel::bottom("editor_footer")
+            .show_separator_line(false)
+            .show(ui, |ui| {
+                if !self.status.is_empty() {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    ui.label(&self.status);
+                    ui.add_space(4.0);
+                }
+            });
+
         let mut move_up = None;
         let mut move_down = None;
         let mut remove = None;
 
-        // Capped, not unbounded, so a project with many layers scrolls
-        // internally instead of pushing the name/save section below the
-        // window's bottom edge (previously the only fix was resizing the
-        // whole window). `EDITOR_FOOTER_RESERVED_HEIGHT` is a rough
-        // estimate of everything below this scroll area, not pixel-exact
-        // -- `auto_shrink`'s `true` on the y-axis means a short layer
-        // list still shrinks the area down to its own content instead of
-        // always eating the full cap.
-        let list_max_height = (ui.available_height() - EDITOR_FOOTER_RESERVED_HEIGHT).max(120.0);
         eframe::egui::ScrollArea::vertical()
-            .max_height(list_max_height)
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 for (index, layer) in self.layers.iter_mut().enumerate() {
@@ -1026,65 +1120,6 @@ impl EditorApp {
             && index + 1 < self.layers.len()
         {
             self.layers.swap(index, index + 1);
-        }
-
-        ui.add_space(16.0);
-        ui.separator();
-        ui.add_space(8.0);
-
-        ui.horizontal(|ui| {
-            ui.label("Name:");
-            ui.text_edit_singleline(&mut self.current_project_name);
-        });
-        ui.add_space(8.0);
-
-        let can_save = !self.layers.is_empty() && self.layers.iter().all(EditorLayer::is_complete);
-        let save_label = if self.current_project_id.is_some() {
-            "Save"
-        } else {
-            "Save (new)"
-        };
-        if ui
-            .add_enabled(can_save, eframe::egui::Button::new(save_label))
-            .clicked()
-        {
-            let id = self
-                .current_project_id
-                .clone()
-                .unwrap_or_else(library::new_project_id);
-            let dir = library::project_dir(&id);
-            match save_project(&dir, &self.layers, self.fps, &self.current_project_name) {
-                Ok(()) => {
-                    // Auto-trust: the user just typed this command
-                    // themselves and saved it, which is exactly the
-                    // self-authoring context that makes a separate
-                    // consent dialog unnecessary in this pass (see
-                    // `trust_store`'s module doc comment). Without
-                    // this, render-server would refuse to ever run
-                    // it, even though it was authored here.
-                    let has_command_layer = self.layers.iter().any(|layer| {
-                            matches!(layer, EditorLayer::Text { source, .. } if source.is_command())
-                        });
-                    if has_command_layer && let Err(e) = trust_store::mark_trusted(&id) {
-                        eprintln!("editor: failed to update the trust store for {id:?}: {e}");
-                    }
-                    self.current_project_id = Some(id);
-                    if let Some(preview) = &self.preview
-                        && let Err(e) =
-                            generate_thumbnail(preview, &dir.join(library::PREVIEW_FILE_NAME))
-                    {
-                        eprintln!("editor: failed to generate thumbnail for {dir:?}: {e}");
-                    }
-                    self.rescan_library();
-                    self.status = format!("Saved to {}", dir.display());
-                }
-                Err(e) => self.status = format!("Failed to save: {e}"),
-            }
-        }
-
-        if !self.status.is_empty() {
-            ui.add_space(8.0);
-            ui.label(&self.status);
         }
     }
 
@@ -1461,13 +1496,19 @@ fn load_thumbnail_texture(ctx: &eframe::egui::Context, path: &Path) -> eframe::e
     )
 }
 
-/// A `Slider` that also responds to the mouse wheel while hovered.
-/// Stock egui sliders only move by click/drag, and dragging across a
-/// ~180px-wide slider to hit one of, say, 780 possible values (radius
-/// 20..=800) is nearly impossible by mouse movement alone. Scrolling
-/// maps 1:1 to the same distance dragging would: scrolling the slider's
-/// own on-screen width across moves it end to end, so short wheel
-/// notches give fine control near the current value.
+/// A `Slider` that also responds to the mouse wheel while hovered, as a
+/// deliberately small nudge -- one thousandth of the value per scroll
+/// input (one whole unit for integer sliders, e.g. FPS), never a jump
+/// proportional to the slider's range or on-screen width. This is
+/// "fine-tuning" only, for the last bit of precision a ~180px-wide
+/// slider spanning a wide range can't give by mouse movement alone;
+/// bigger moves are still a drag.
+///
+/// The value display is a separate `DragValue` placed after the slider
+/// rather than the slider's own built-in one (`Slider::show_value`,
+/// disabled here) specifically so hovering *it* -- as opposed to the
+/// slider track/handle itself -- is unaffected by any of this and stays
+/// a plain drag/type-to-edit field.
 ///
 /// Consumes the scroll delta it acts on (see the `smooth_scroll_delta`
 /// reset below) so it doesn't *also* get read by an enclosing
@@ -1479,18 +1520,19 @@ fn scroll_slider<Num: eframe::egui::emath::Numeric>(
     value: &mut Num,
     range: std::ops::RangeInclusive<Num>,
 ) -> eframe::egui::Response {
-    let response = ui.add(eframe::egui::Slider::new(value, range.clone()));
-    if response.hovered() {
+    let slider_response = ui.add(eframe::egui::Slider::new(value, range.clone()).show_value(false));
+    if slider_response.hovered() {
         let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
         if scroll_y != 0.0 {
+            let step = if Num::INTEGRAL { 1.0 } else { 0.001 };
             let (min, max) = (range.start().to_f64(), range.end().to_f64());
-            let value_per_pixel = (max - min) / response.rect.width().max(1.0) as f64;
-            let new_value = (value.to_f64() + scroll_y as f64 * value_per_pixel).clamp(min, max);
+            let new_value = (value.to_f64() + step * scroll_y.signum() as f64).clamp(min, max);
             *value = Num::from_f64(new_value);
             ui.input_mut(|i| i.smooth_scroll_delta.y = 0.0);
         }
     }
-    response
+    ui.add(eframe::egui::DragValue::new(value));
+    slider_response
 }
 
 /// Shows `label`, a Browse button, and the chosen file's name -- full
@@ -1532,7 +1574,7 @@ fn path_picker(
 /// Loads an existing project folder back into the editor's layer list,
 /// resolving each layer's relative asset paths to absolute ones so
 /// `path_picker` has something to display.
-fn open_project(project_dir: &Path) -> Result<(Vec<EditorLayer>, u32), String> {
+fn open_project(project_dir: &Path) -> Result<(Vec<EditorLayer>, u32, String), String> {
     let (project, project_dir) =
         project_format::Project::load(project_dir).map_err(|e| e.to_string())?;
 
@@ -1580,7 +1622,7 @@ fn open_project(project_dir: &Path) -> Result<(Vec<EditorLayer>, u32), String> {
         })
         .collect();
 
-    Ok((layers, project.fps))
+    Ok((layers, project.fps, project.description))
 }
 
 /// Saves in two passes -- stage every source asset into a scratch
@@ -1602,6 +1644,7 @@ fn save_project(
     layers: &[EditorLayer],
     fps: u32,
     name: &str,
+    description: &str,
 ) -> Result<(), String> {
     std::fs::create_dir_all(project_dir).map_err(|e| e.to_string())?;
 
@@ -1686,6 +1729,7 @@ fn save_project(
 
         let project = project_format::Project {
             name: name.to_string(),
+            description: description.to_string(),
             layers: saved_layers,
             fps,
         };
@@ -1765,7 +1809,8 @@ mod tests {
             },
         ];
 
-        save_project(&project_dir, &reordered, 30, "Test Project").expect("save_project failed");
+        save_project(&project_dir, &reordered, 30, "Test Project", "")
+            .expect("save_project failed");
 
         // Each index's *new* final name should hold whatever that layer's
         // source actually was, not whatever the earlier single-pass copy

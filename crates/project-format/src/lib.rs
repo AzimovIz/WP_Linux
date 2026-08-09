@@ -17,6 +17,12 @@ pub struct Project {
     /// project.json that predates this field.
     #[serde(default)]
     pub name: String,
+    /// Free-form notes about the project (e.g. source/license of the
+    /// pictures used) -- purely descriptive, never read by player or
+    /// render-server. Empty for any project.json that predates this
+    /// field.
+    #[serde(default)]
+    pub description: String,
     /// Layers, bottom to top -- rendered in this order and alpha-blended
     /// on top of one another.
     pub layers: Vec<Layer>,
