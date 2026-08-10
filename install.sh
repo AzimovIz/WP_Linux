@@ -127,7 +127,10 @@ if command -v unzip >/dev/null 2>&1; then
         warn "failed to download example wallpapers -- skipping (get them by hand, see README)"
     fi
 else
-    warn "'unzip' not found -- skipping example wallpapers (install unzip and rerun, or get them by hand, see README)"
+    warn "'unzip' not found -- skipping example wallpapers."
+    warn "install unzip and rerun, or download them by hand from:"
+    warn "  https://github.com/${REPO}/releases/tag/WallpaperExamples"
+    warn "and unzip into ${WALLPAPERS_DIR}"
 fi
 
 if ! command -v editor >/dev/null 2>&1; then
