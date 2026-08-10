@@ -18,6 +18,7 @@ mod trust_store;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use player::wgpu;
@@ -36,6 +37,28 @@ const PREVIEW_MAX_WIDTH: u32 = 480;
 fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default().with_inner_size([1200.0, 600.0]),
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(
+                eframe::egui_wgpu::WgpuSetupCreateNew {
+                    // Avoids waking (and rendering through) a runtime-suspended
+                    // discrete GPU on hybrid-GPU laptops -- confirmed fix for a
+                    // real bug where the editor's whole window would render
+                    // corrupted after sitting backgrounded for a while, once
+                    // something (e.g. another window's minimize animation)
+                    // caused the compositor to touch it again. Same reasoning
+                    // as `player::pick_adapter`, which render-server already
+                    // uses for this -- kept separate rather than shared since
+                    // this one has to run synchronously over the adapter list
+                    // egui_wgpu already enumerated, and has to defer to it for
+                    // surface-compatibility filtering instead of picking an
+                    // adapter blind.
+                    power_preference: wgpu::PowerPreference::LowPower,
+                    native_adapter_selector: gpu_override_from_env(),
+                    ..eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle()
+                },
+            ),
+            ..Default::default()
+        },
         ..Default::default()
     };
     eframe::run_native(
@@ -46,6 +69,50 @@ fn main() -> eframe::Result {
             Ok(Box::new(EditorApp::default()))
         }),
     )
+}
+
+/// `WPLINUX_GPU=<substring>` forces a specific adapter (case-insensitive
+/// match against its name) instead of the default `LowPower` preference --
+/// same env var `player::pick_adapter`'s doc comment documents for
+/// render-server, so a user comparing GPUs only has to learn it once.
+/// Returns `None` when unset, which leaves selection to `power_preference`
+/// via egui_wgpu's normal (surface-compatibility-aware) adapter request.
+fn gpu_override_from_env() -> Option<eframe::egui_wgpu::NativeAdapterSelectorMethod> {
+    let want = std::env::var("WPLINUX_GPU").ok()?;
+    let want_lower = want.to_lowercase();
+    Some(Arc::new(
+        move |adapters: &[wgpu::Adapter], _surface: Option<&wgpu::Surface<'_>>| {
+            if let Some(adapter) = adapters
+                .iter()
+                .find(|a| a.get_info().name.to_lowercase().contains(&want_lower))
+            {
+                return Ok(adapter.clone());
+            }
+            eprintln!(
+                "wp_linux_editor: WPLINUX_GPU={want:?} matched no candidate adapter, \
+                 falling back to the integrated GPU if available"
+            );
+            adapters
+                .iter()
+                .min_by_key(|a| adapter_rank(a.get_info().device_type))
+                .cloned()
+                .ok_or_else(|| "no GPU adapters available".to_string())
+        },
+    ))
+}
+
+/// Lower sorts first, i.e. gets picked -- integrated over discrete over
+/// everything else, software/CPU dead last. Mirrors
+/// `player::pick_adapter`'s `adapter_rank`, kept local rather than shared
+/// (see `gpu_override_from_env`'s doc comment).
+fn adapter_rank(device_type: wgpu::DeviceType) -> u8 {
+    match device_type {
+        wgpu::DeviceType::IntegratedGpu => 0,
+        wgpu::DeviceType::DiscreteGpu => 1,
+        wgpu::DeviceType::VirtualGpu => 2,
+        wgpu::DeviceType::Other => 3,
+        wgpu::DeviceType::Cpu => 4,
+    }
 }
 
 /// Softens up egui's stock look (sharp corners, tight spacing) into
