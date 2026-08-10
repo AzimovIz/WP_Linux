@@ -34,6 +34,15 @@ use push::{ProjectPusher, TcpPusher};
 /// showing it at native size.
 const PREVIEW_MAX_WIDTH: u32 = 480;
 
+/// Release tag this binary was built from, e.g. `2026.08.10` -- `"dev"`
+/// for local/dev builds (see `build.rs`). Shown in the About window.
+const APP_VERSION: &str = env!("WP_LINUX_VERSION");
+
+/// Short hash of the commit this binary was built from, or `"unknown"`
+/// if `build.rs` couldn't run `git` (see `build.rs`). Shown in the About
+/// window.
+const APP_GIT_HASH: &str = env!("WP_LINUX_GIT_HASH");
+
 fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default().with_inner_size([1200.0, 600.0]),
@@ -647,6 +656,14 @@ struct EditorApp {
     tab: Tab,
     previous_tab: Tab,
 
+    // -- About window state --
+    /// Toggled by the "?" button and F1; the window closes itself
+    /// (writes `false` back) when its own close button is clicked.
+    show_about: bool,
+    /// Lazily loaded on first open rather than eagerly at startup, since
+    /// most sessions never open the About window at all.
+    about_icon: Option<eframe::egui::TextureHandle>,
+
     // -- "Wallpapers" tab state --
     monitors: Vec<MonitorInfo>,
     /// Mirrors `monitors_config`'s on-disk file -- monitor id -> project dir.
@@ -681,6 +698,8 @@ impl Default for EditorApp {
         Self {
             tab: Tab::Wallpapers,
             previous_tab: Tab::Wallpapers,
+            show_about: false,
+            about_icon: None,
             monitors: Vec::new(),
             assignments: monitors_config::load(),
             library: library::scan(),
@@ -703,6 +722,10 @@ impl Default for EditorApp {
 impl eframe::App for EditorApp {
     fn ui(&mut self, ui: &mut eframe::egui::Ui, frame: &mut eframe::Frame) {
         let render_state = frame.wgpu_render_state().cloned();
+
+        if ui.ctx().input(|i| i.key_pressed(eframe::egui::Key::F1)) {
+            self.show_about = !self.show_about;
+        }
 
         // Cheap (no IPC round trip -- just already-known compositor state)
         // to recompute every frame, so monitor hot-plug just shows up on
@@ -736,9 +759,24 @@ impl eframe::App for EditorApp {
                 ui.selectable_value(&mut self.tab, Tab::Wallpapers, "Wallpapers");
                 ui.selectable_value(&mut self.tab, Tab::Discover, "Discover");
                 ui.selectable_value(&mut self.tab, Tab::Editor, "Editor");
+
+                ui.with_layout(
+                    eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
+                    |ui| {
+                        if ui
+                            .button("?")
+                            .on_hover_text("About WP Linux (F1)")
+                            .clicked()
+                        {
+                            self.show_about = true;
+                        }
+                    },
+                );
             });
             ui.add_space(4.0);
         });
+
+        self.show_about_window(ui.ctx());
 
         // Auto-rescan whenever the Wallpapers tab gains focus (e.g. a
         // project was dropped into the library by hand while this tab
@@ -778,6 +816,48 @@ impl eframe::App for EditorApp {
 }
 
 impl EditorApp {
+    /// Renders the About window when `show_about` is set (a no-op
+    /// otherwise -- `egui::Window::open` skips the contents closure
+    /// entirely when its `open` flag is already false). Called every
+    /// frame from `ui` rather than gated by an `if`, so the window's own
+    /// close button and F1 both just flip `show_about` and this picks it
+    /// up next frame either way.
+    fn show_about_window(&mut self, ctx: &eframe::egui::Context) {
+        let icon = self
+            .about_icon
+            .get_or_insert_with(|| load_about_icon(ctx));
+        let icon_id = icon.id();
+
+        let mut open = self.show_about;
+        eframe::egui::Window::new("About WP Linux")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add(eframe::egui::Image::from_texture((
+                        icon_id,
+                        eframe::egui::Vec2::splat(96.0),
+                    )));
+                    ui.add_space(8.0);
+                    ui.heading("WP Linux Editor");
+                    ui.label(
+                        "An animated, interactive wallpaper engine for KDE Plasma 6 on Wayland.",
+                    );
+                    ui.add_space(8.0);
+                    ui.label(format!("Version {APP_VERSION} ({APP_GIT_HASH})"));
+                    ui.label("License: MIT");
+                    ui.add_space(8.0);
+                    ui.hyperlink_to("Repository", "https://github.com/AzimovIz/WP_Linux");
+                    ui.hyperlink_to(
+                        "Report an issue",
+                        "https://github.com/AzimovIz/WP_Linux/issues",
+                    );
+                });
+            });
+        self.show_about = open;
+    }
+
     fn show_discover_tab(&mut self, ui: &mut eframe::egui::Ui) {
         ui.centered_and_justified(|ui| {
             ui.heading("Discover — coming soon");
@@ -1668,6 +1748,24 @@ fn generate_thumbnail(preview: &Preview, dest: &Path) -> Result<(), String> {
         .ok_or_else(|| "bad thumbnail dimensions".to_string())?
         .save(dest)
         .map_err(|e| e.to_string())
+}
+
+/// Loads the app icon for the About window. Bundled into the binary via
+/// `include_bytes!` (rather than read from an installed data path at
+/// runtime, like `load_thumbnail_texture` does) since this asset always
+/// ships with the binary and has no meaningful "missing" case to handle.
+fn load_about_icon(ctx: &eframe::egui::Context) -> eframe::egui::TextureHandle {
+    const ICON_BYTES: &[u8] = include_bytes!("../../../assets/wp_linux_editor_128.png");
+    let rgba = image::load_from_memory(ICON_BYTES)
+        .expect("bundled about-icon PNG should always decode")
+        .into_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let color_image = eframe::egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+    ctx.load_texture(
+        "about-icon",
+        color_image,
+        eframe::egui::TextureOptions::default(),
+    )
 }
 
 /// Loads a library entry's `preview.png` as an egui texture for the

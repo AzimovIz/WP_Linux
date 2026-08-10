@@ -166,4 +166,4 @@ kpackagetool6 --type=KWin/Script --install plasma/kwin-script/package
 
 ## Лицензия
 
-MIT (файл LICENSE будет добавлен).
+[MIT](LICENSE)

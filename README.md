@@ -159,4 +159,4 @@ more robust option either way.)
 
 ## License
 
-MIT (LICENSE file to be added).
+[MIT](LICENSE)

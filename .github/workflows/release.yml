@@ -27,12 +27,9 @@ jobs:
       - name: Cache cargo/target
         uses: Swatinem/rust-cache@v2
 
-      # Everything Wayland/Vulkan/D-Bus-related is dlopen'd at runtime,
-      # not linked at build time (see `ldd` on any built binary) -- no
-      # apt packages needed here, just the Rust toolchain.
-      - name: Build release binaries
-        run: cargo build --release --workspace
-
+      # Resolved before the build (rather than after, like the archive
+      # staging below) so wp_linux_editor's build.rs can bake it into the
+      # binary as WP_LINUX_RELEASE_TAG -- shown in the About window.
       - name: Resolve release tag
         id: tag
         run: |
@@ -41,6 +38,14 @@ jobs:
           else
             echo "tag=$(date -u +%Y.%m.%d)" >> "$GITHUB_OUTPUT"
           fi
+
+      # Everything Wayland/Vulkan/D-Bus-related is dlopen'd at runtime,
+      # not linked at build time (see `ldd` on any built binary) -- no
+      # apt packages needed here, just the Rust toolchain.
+      - name: Build release binaries
+        run: cargo build --release --workspace
+        env:
+          WP_LINUX_RELEASE_TAG: ${{ steps.tag.outputs.tag }}
 
       # Single archive, laid out the way install.sh/PKGBUILD expect:
       #   bin/{render-server,player,wp_linux_editor}
