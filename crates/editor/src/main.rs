@@ -111,10 +111,16 @@ struct MonitorInfo {
     height: u32,
 }
 
-/// Number of tiles per row in the "Wallpapers" tab's wallpaper grid.
+/// Number of tiles per row in the "Wallpapers" tab's wallpaper grid --
+/// always exactly this many, regardless of window width: tiles resize
+/// (see `show_wallpapers_tab`'s per-frame `tile_size` calculation) to
+/// fill whatever width is available instead of the column count
+/// changing.
 const WALLPAPER_GRID_COLUMNS: usize = 4;
-/// Size of each tile's preview image (name label sits below it, outside
-/// this rect).
+/// Reference aspect ratio for a tile's preview image (name label sits
+/// below it, outside this rect) -- the actual on-screen size is derived
+/// from this ratio and the available width each frame, not used
+/// directly.
 const WALLPAPER_TILE_SIZE: eframe::egui::Vec2 = eframe::egui::Vec2::new(220.0, 130.0);
 /// Size of each tile's always-visible Edit/Apply icon
 /// buttons, pinned to the top-right corner of the thumbnail.
@@ -749,11 +755,25 @@ impl EditorApp {
         }
 
         eframe::egui::ScrollArea::vertical().show(ui, |ui| {
+            // Always exactly `WALLPAPER_GRID_COLUMNS` tiles per row, but
+            // resized every frame to fill the actually available width
+            // instead of a fixed pixel size -- that fixed size used to
+            // leave empty space on the right in a wide window and push
+            // tiles past the right edge in a narrow one. Height scales
+            // with width to keep `WALLPAPER_TILE_SIZE`'s aspect ratio.
+            let columns = WALLPAPER_GRID_COLUMNS as f32;
+            let spacing = ui.spacing().item_spacing.x;
+            let tile_width = (ui.available_width() - spacing * (columns - 1.0)) / columns;
+            let tile_size = eframe::egui::vec2(
+                tile_width,
+                tile_width * (WALLPAPER_TILE_SIZE.y / WALLPAPER_TILE_SIZE.x),
+            );
+
             let entries = self.library.clone();
             for row in entries.chunks(WALLPAPER_GRID_COLUMNS) {
                 ui.horizontal(|ui| {
                     for entry in row {
-                        self.show_wallpaper_tile(ui, entry);
+                        self.show_wallpaper_tile(ui, entry, tile_size);
                     }
                 });
                 ui.add_space(12.0);
@@ -763,11 +783,16 @@ impl EditorApp {
         self.show_apply_overlay(ui.ctx());
     }
 
-    /// One tile in the "Wallpapers" grid: a fixed-size preview (or a plain
-    /// placeholder if this entry has no `preview.png` yet) with
+    /// One tile in the "Wallpapers" grid: a `tile_size`-sized preview (or
+    /// a plain placeholder if this entry has no `preview.png` yet) with
     /// always-visible Edit/Apply icon buttons pinned to its
     /// top-right corner.
-    fn show_wallpaper_tile(&mut self, ui: &mut eframe::egui::Ui, entry: &library::LibraryEntry) {
+    fn show_wallpaper_tile(
+        &mut self,
+        ui: &mut eframe::egui::Ui,
+        entry: &library::LibraryEntry,
+        tile_size: eframe::egui::Vec2,
+    ) {
         let display_name = if entry.name.is_empty() {
             entry.id.as_str()
         } else {
@@ -780,9 +805,9 @@ impl EditorApp {
         );
 
         ui.vertical(|ui| {
-            ui.set_width(WALLPAPER_TILE_SIZE.x);
+            ui.set_width(tile_size.x);
             let (rect, response) =
-                ui.allocate_exact_size(WALLPAPER_TILE_SIZE, eframe::egui::Sense::hover());
+                ui.allocate_exact_size(tile_size, eframe::egui::Sense::hover());
 
             if let Some(preview_path) = &entry.preview_path {
                 let texture = self
@@ -791,7 +816,7 @@ impl EditorApp {
                     .or_insert_with(|| load_thumbnail_texture(ui.ctx(), preview_path));
                 ui.put(
                     rect,
-                    eframe::egui::Image::from_texture((texture.id(), WALLPAPER_TILE_SIZE)),
+                    eframe::egui::Image::from_texture((texture.id(), tile_size)),
                 );
             } else {
                 ui.painter()
@@ -834,6 +859,18 @@ impl EditorApp {
             {
                 self.apply_overlay = Some(entry.dir.clone());
             }
+
+            // Each `ui.put()` above (being an absolutely-positioned
+            // child ui) advances this `ui`'s cursor to *its own* rect,
+            // not the image's -- egui's cursor placement isn't clamped
+            // to "never move backward", so after the icon buttons
+            // (small rects near the *top* of the image) the cursor is
+            // left sitting inside the image rather than below it. Left
+            // alone, the label added next would start from there,
+            // landing near the middle of the thumbnail instead of under
+            // it. Re-advancing past the full image `rect` one more time
+            // puts the cursor back where it belongs first.
+            ui.advance_cursor_after_rect(rect);
 
             ui.label(display_name);
         });
