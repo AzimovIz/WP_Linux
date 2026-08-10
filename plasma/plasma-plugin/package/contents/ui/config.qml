@@ -21,16 +21,22 @@ ColumnLayout {
     // path with no validation. This page is just a launcher for it.
     //
     // Shelling out via the "executable" data engine is the standard
-    // Plasma-applet pattern for launching an external command from QML --
-    // ⚠ unverified in this environment (no KDE/Wayland session to test
-    // against): confirm the import above resolves on the target Plasma/KF6
-    // version, and that `kioclient` (going through the installed .desktop
-    // file, dev.wplinux.editor.desktop, rather than a bare binary name) is
-    // actually on PATH for the plasmashell process. install.sh installs
-    // the binary itself to ~/.local/bin, which is NOT guaranteed to be on
-    // plasmashell's PATH -- see its own comment about the user needing to
-    // add it to their shell's PATH -- so launching through the desktop
-    // file is the more robust choice here, not a stylistic preference.
+    // Plasma-applet pattern for launching an external command from QML.
+    // Launching through the installed .desktop file (dev.wplinux.editor.desktop)
+    // rather than a bare binary name is deliberate: install.sh puts the
+    // binary itself in ~/.local/bin, which is NOT guaranteed to be on
+    // plasmashell's PATH (see its own comment about the user needing to
+    // add it to their shell's PATH).
+    //
+    // `kioclient exec` wants the .desktop file's real filesystem path here,
+    // not a KIO `applications:` URL -- that scheme is a virtual tree of
+    // menu *categories* (`applications:/Graphics/`, etc.), and treats a
+    // bare `applications:<id>.desktop` as an unresolvable folder name
+    // ("Unknown application folder"), not a lookup by desktop-file id. The
+    // desktop file lands in one of two places depending on how WP Linux
+    // was installed -- ~/.local/share/applications (install.sh) or
+    // /usr/share/applications (PKGBUILD) -- so try the user path first and
+    // fall back to the system one.
     Plasma5Support.DataSource {
         id: launcher
         engine: "executable"
@@ -48,7 +54,11 @@ ColumnLayout {
         }
         Controls.Button {
             text: "Open WP Linux…"
-            onClicked: launcher.run("kioclient exec applications:dev.wplinux.editor.desktop")
+            onClicked: launcher.run(
+                "f=\"$HOME/.local/share/applications/dev.wplinux.editor.desktop\"; " +
+                "[ -f \"$f\" ] || f=\"/usr/share/applications/dev.wplinux.editor.desktop\"; " +
+                "kioclient exec \"$f\""
+            )
         }
     }
 }
