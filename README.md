@@ -14,6 +14,7 @@ small GPU-accelerated editor, then run it as your desktop wallpaper.
 ## Screenshots
 
 <p align="center">
+  <img src="assets/main_window.png" alt="The main window where you can apply a wallpaper to the desktop. " width="49%">
   <img src="assets/editor.png" alt="Building a layer stack in the WP Linux editor, with the live GPU preview on the left" width="49%">
   <img src="assets/KDE_settings.png" alt="Picking WP Linux Wallpaper in KDE System Settings" width="49%">
 </p>

@@ -15,6 +15,7 @@
 ## Скриншоты
 
 <p align="center">
+  <img src="assets/main_window.png" alt="Главное окно в котором можно применить обои к рабочему столу. " width="49%">
   <img src="assets/editor.png" alt="Сборка стека слоёв в редакторе WP Linux, слева -- живое GPU-превью" width="49%">
   <img src="assets/KDE_settings.png" alt="Выбор WP Linux Wallpaper в системных настройках KDE" width="49%">
 </p>
