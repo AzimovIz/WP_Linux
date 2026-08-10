@@ -591,6 +591,8 @@ struct EditorApp {
     /// Project dir of the wallpaper whose "Apply" overlay (monitor
     /// picker) is currently open, if any.
     apply_overlay: Option<PathBuf>,
+    /// Project dir of the wallpaper pending delete confirmation, if any.
+    delete_overlay: Option<PathBuf>,
 
     // -- "Editor" tab state --
     layers: Vec<EditorLayer>,
@@ -618,6 +620,7 @@ impl Default for EditorApp {
             thumbnails: HashMap::new(),
             pusher: Box::new(TcpPusher),
             apply_overlay: None,
+            delete_overlay: None,
             layers: Vec::new(),
             fps: 30,
             status: String::new(),
@@ -781,6 +784,7 @@ impl EditorApp {
         });
 
         self.show_apply_overlay(ui.ctx());
+        self.show_delete_overlay(ui.ctx());
     }
 
     /// One tile in the "Wallpapers" grid: a `tile_size`-sized preview (or
@@ -845,6 +849,17 @@ impl EditorApp {
                 apply_rect.min - eframe::egui::vec2(WALLPAPER_ICON_GAP + WALLPAPER_ICON_SIZE, 0.0),
                 icon_size,
             );
+            let delete_rect = eframe::egui::Rect::from_min_size(
+                edit_rect.min - eframe::egui::vec2(WALLPAPER_ICON_GAP + WALLPAPER_ICON_SIZE, 0.0),
+                icon_size,
+            );
+            if ui
+                .put(delete_rect, eframe::egui::Button::new("🗑"))
+                .on_hover_text("Delete")
+                .clicked()
+            {
+                self.delete_overlay = Some(entry.dir.clone());
+            }
             if ui
                 .put(edit_rect, eframe::egui::Button::new("✏"))
                 .on_hover_text("Edit")
@@ -914,6 +929,61 @@ impl EditorApp {
 
         if modal_response.should_close() {
             self.apply_overlay = None;
+        }
+    }
+
+    /// The delete confirmation modal: asks before permanently removing
+    /// `self.delete_overlay`'s project directory from disk. Closes without
+    /// deleting on Cancel, on a backdrop click, or on Escape (via
+    /// `Modal`'s own `should_close`).
+    fn show_delete_overlay(&mut self, ctx: &eframe::egui::Context) {
+        let Some(dir) = self.delete_overlay.clone() else {
+            return;
+        };
+
+        let display_name = self
+            .library
+            .iter()
+            .find(|entry| entry.dir == dir)
+            .map(|entry| {
+                if entry.name.is_empty() {
+                    entry.id.clone()
+                } else {
+                    entry.name.clone()
+                }
+            })
+            .unwrap_or_else(|| dir.display().to_string());
+
+        let modal_response =
+            eframe::egui::Modal::new(eframe::egui::Id::new("delete_overlay")).show(ctx, |ui| {
+                ui.heading("Delete wallpaper?");
+                ui.add_space(8.0);
+                ui.label(format!(
+                    "\"{display_name}\" will be permanently deleted from disk. This can't be undone."
+                ));
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        self.delete_overlay = None;
+                    }
+                    if ui.button("Delete").clicked() {
+                        match library::delete(&dir) {
+                            Ok(()) => {
+                                self.status = format!("Deleted {}", dir.display());
+                                self.rescan_library();
+                            }
+                            Err(e) => {
+                                self.status = format!("Failed to delete {}: {e}", dir.display());
+                            }
+                        }
+                        self.delete_overlay = None;
+                    }
+                });
+            });
+
+        if modal_response.should_close() {
+            self.delete_overlay = None;
         }
     }
 

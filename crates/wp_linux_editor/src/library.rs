@@ -84,6 +84,13 @@ fn scan_dir(root: &Path) -> Vec<LibraryEntry> {
     entries
 }
 
+/// Permanently deletes a project's whole directory from the library.
+/// Callers are expected to confirm with the user first -- this does not
+/// ask again.
+pub fn delete(dir: &Path) -> std::io::Result<()> {
+    std::fs::remove_dir_all(dir)
+}
+
 /// Mints a fresh, stable id for a brand-new project -- never renamed once
 /// assigned. A short hex string derived from the current time is enough:
 /// this is a single-user, local app, so real collision risk is a
@@ -162,6 +169,19 @@ mod tests {
         let entries = scan_dir(&root);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn delete_removes_the_project_directory() {
+        let root = unique_temp_dir();
+        let dir = root.join("to-delete");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("project.json"), r#"{"layers":[],"fps":30}"#).unwrap();
+
+        delete(&dir).unwrap();
+        assert!(!dir.exists());
 
         std::fs::remove_dir_all(&root).ok();
     }
