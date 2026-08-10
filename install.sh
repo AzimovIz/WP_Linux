@@ -20,7 +20,7 @@ BIN_DIR="${HOME}/.local/bin"
 SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
 APPLICATIONS_DIR="${HOME}/.local/share/applications"
 ICON_THEME_DIR="${HOME}/.local/share/icons/hicolor"
-# Matches crates/editor/src/library.rs's LIBRARY_SUBDIR / dirs::data_dir().
+# Matches crates/wp_linux_editor/src/library.rs's LIBRARY_SUBDIR / dirs::data_dir().
 WALLPAPERS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/wp_linux/wallpapers"
 PLASMA_PLUGIN_ID="dev.wplinux.wallpaper"
 KWIN_SCRIPT_ID="dev.wplinux.cursorbridge"
@@ -50,11 +50,11 @@ pkgroot="$tmpdir/wp-linux"
 
 log "installing binaries to ${BIN_DIR}"
 mkdir -p "$BIN_DIR"
-install -m755 "$pkgroot/bin/render-server" "$pkgroot/bin/player" "$pkgroot/bin/editor" "$BIN_DIR/"
+install -m755 "$pkgroot/bin/render-server" "$pkgroot/bin/player" "$pkgroot/bin/wp_linux_editor" "$BIN_DIR/"
 
 log "installing application menu entry for the editor"
 mkdir -p "$APPLICATIONS_DIR"
-sed "s|@EDITOR_BIN@|${BIN_DIR}/editor|" "$pkgroot/dev.wplinux.editor.desktop" \
+sed "s|@EDITOR_BIN@|${BIN_DIR}/wp_linux_editor|" "$pkgroot/dev.wplinux.editor.desktop" \
     > "$APPLICATIONS_DIR/${DESKTOP_FILE_ID}.desktop"
 
 mkdir -p "$ICON_THEME_DIR/128x128/apps" "$ICON_THEME_DIR/256x256/apps" "$ICON_THEME_DIR/scalable/apps"
@@ -133,13 +133,13 @@ else
     warn "and unzip into ${WALLPAPERS_DIR}"
 fi
 
-if ! command -v editor >/dev/null 2>&1; then
-    warn "'editor' was not found on your PATH (${BIN_DIR} isn't in it)."
-    warn "the menu entry launches it fine either way, but to run 'editor'/'player' by"
+if ! command -v wp_linux_editor >/dev/null 2>&1; then
+    warn "'wp_linux_editor' was not found on your PATH (${BIN_DIR} isn't in it)."
+    warn "the menu entry launches it fine either way, but to run 'wp_linux_editor'/'player' by"
     warn "name from a terminal, add this to your shell profile (~/.bashrc, ~/.zshrc, ...):"
     warn "    export PATH=\"\${HOME}/.local/bin:\$PATH\""
 fi
 
-log "done. Run 'editor' (or launch 'WP Linux Editor' from the application menu) to"
+log "done. Run 'wp_linux_editor' (or launch 'WP Linux Editor' from the application menu) to"
 log "build a project, then pick 'WP Linux Wallpaper' in System Settings > Appearance"
 log "> Wallpaper and point it at the saved project folder."

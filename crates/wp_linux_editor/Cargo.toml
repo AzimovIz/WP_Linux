@@ -1,5 +1,5 @@
 [package]
-name = "editor"
+name = "wp_linux_editor"
 version = "0.1.0"
 edition.workspace = true
 publish = false

@@ -12,7 +12,7 @@ BIN_DIR="${HOME}/.local/bin"
 SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
 APPLICATIONS_DIR="${HOME}/.local/share/applications"
 ICON_THEME_DIR="${HOME}/.local/share/icons/hicolor"
-# Matches crates/editor/src/library.rs's LIBRARY_SUBDIR / dirs::data_dir().
+# Matches crates/wp_linux_editor/src/library.rs's LIBRARY_SUBDIR / dirs::data_dir().
 WALLPAPERS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/wp_linux/wallpapers"
 PLASMA_PLUGIN_ID="dev.wplinux.wallpaper"
 KWIN_SCRIPT_ID="dev.wplinux.cursorbridge"
@@ -44,7 +44,7 @@ else
 fi
 
 log "removing binaries from ${BIN_DIR}"
-rm -f "${BIN_DIR}/render-server" "${BIN_DIR}/player" "${BIN_DIR}/editor"
+rm -f "${BIN_DIR}/render-server" "${BIN_DIR}/player" "${BIN_DIR}/wp_linux_editor"
 
 log "removing application menu entry and icons"
 rm -f "${APPLICATIONS_DIR}/${DESKTOP_FILE_ID}.desktop"

@@ -5,7 +5,7 @@ post_install() {
 ==>   qdbus6 org.kde.KWin /KWin reconfigure
 ==>   systemctl --user daemon-reload
 ==>   systemctl --user enable --now render-server.service
-==> Then run 'editor' to build a project, and pick "WP Linux Wallpaper" in
+==> Then run 'wp_linux_editor' to build a project, and pick "WP Linux Wallpaper" in
 ==> System Settings > Appearance > Wallpaper.
 ==>
 ==> Optional example wallpapers (needs unzip):

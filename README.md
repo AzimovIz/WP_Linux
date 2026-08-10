@@ -15,7 +15,7 @@ small GPU-accelerated editor, then run it as your desktop wallpaper.
 
 <p align="center">
   <img src="assets/main_window.png" alt="The main window where you can apply a wallpaper to the desktop. " width="49%">
-  <img src="assets/editor.png" alt="Building a layer stack in the WP Linux editor, with the live GPU preview on the left" width="49%">
+  <img src="assets/wp_linux_editor.png" alt="Building a layer stack in the WP Linux editor, with the live GPU preview on the left" width="49%">
   <img src="assets/KDE_settings.png" alt="Picking WP Linux Wallpaper in KDE System Settings" width="49%">
 </p>
 
@@ -54,7 +54,7 @@ else (X11, GNOME, other compositors) is supported or planned right now.
   when it switches back -- nothing to pause by hand.
 - Prefers the integrated GPU over a suspended discrete GPU on hybrid-GPU
   laptops, avoiding a multi-hundred-millisecond wake-up on every frame.
-- `editor` has a live GPU preview built from the exact same compositor and
+- `wp_linux_editor` has a live GPU preview built from the exact same compositor and
   shaders `render-server` uses in production, not a separate
   reimplementation -- gif animation and xray cursor reactivity look right
   while you're still editing.
@@ -66,7 +66,7 @@ else (X11, GNOME, other compositors) is supported or planned right now.
 | `crates/project-format` | Shared `project.json` schema (layers + target fps) -- the on-disk wallpaper project format. |
 | `crates/player` | Shared GPU compositor library (`SceneRenderer`) used by everything below, plus its own standalone Wayland/layer-shell test binary. |
 | `crates/render-server` | The actual runtime renderer: a headless wgpu process that serves composited frames to the Plasma plugin over local HTTP, receives the cursor position over D-Bus, and watches the power profile. |
-| `crates/editor` | Desktop app (egui) for building and editing wallpaper projects, with the live preview. |
+| `crates/wp_linux_editor` | Desktop app (egui) for building and editing wallpaper projects, with the live preview. |
 | `plasma/plasma-plugin` | The Plasma "Wallpaper" plugin you pick in System Settings; talks to `render-server`. |
 | `plasma/kwin-script` | KWin script forwarding the true global cursor position to `render-server` over D-Bus. |
 | `systemd/` | User-service unit that keeps `render-server` running in the background. |
@@ -137,7 +137,7 @@ more robust option either way.)
 
 ## Usage
 
-1. Run `editor`, build a layer stack (Image / Gif / Xray / Parallax), and
+1. Run `wp_linux_editor`, build a layer stack (Image / Gif / Xray / Parallax), and
    save it as a project folder.
 2. Make sure `render-server` is running (the install script sets it up as
    a background service; from a source build, run it by hand).

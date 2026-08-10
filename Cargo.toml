@@ -4,7 +4,7 @@ members = [
     "crates/player",
     "crates/project-format",
     "crates/render-server",
-    "crates/editor",
+    "crates/wp_linux_editor",
 ]
 
 [workspace.package]
