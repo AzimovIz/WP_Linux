@@ -2,7 +2,9 @@
 # Reverses install.sh: stops and removes the render-server systemd --user
 # service, removes the two KDE packages, and deletes the three binaries
 # from ~/.local/bin. Does NOT touch any wallpaper projects you saved --
-# those are your data, wherever you put them, and are left alone.
+# those are your data, wherever you put them, and are left alone. This
+# also includes the wallpaper library install.sh populates with the
+# example wallpapers (~/.local/share/wp_linux/wallpapers/ by default).
 
 set -uo pipefail
 
@@ -10,6 +12,8 @@ BIN_DIR="${HOME}/.local/bin"
 SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
 APPLICATIONS_DIR="${HOME}/.local/share/applications"
 ICON_THEME_DIR="${HOME}/.local/share/icons/hicolor"
+# Matches crates/editor/src/library.rs's LIBRARY_SUBDIR / dirs::data_dir().
+WALLPAPERS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/wp_linux/wallpapers"
 PLASMA_PLUGIN_ID="dev.wplinux.wallpaper"
 KWIN_SCRIPT_ID="dev.wplinux.cursorbridge"
 DESKTOP_FILE_ID="dev.wplinux.editor"
@@ -56,3 +60,4 @@ if command -v gtk-update-icon-cache >/dev/null 2>&1; then
 fi
 
 log "done. Your saved wallpaper projects were not touched."
+log "your wallpaper library (including any downloaded examples) is still at ${WALLPAPERS_DIR} -- remove it by hand if you don't want it anymore."

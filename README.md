@@ -101,6 +101,11 @@ curl -fsSL https://github.com/AzimovIz/WP_Linux/releases/latest/download/uninsta
 
 (Your saved wallpaper projects aren't touched by either script.)
 
+The install script also downloads a handful of [example wallpapers](https://github.com/AzimovIz/WP_Linux/releases/tag/WallpaperExamples)
+into `~/.local/share/wp_linux/wallpapers/` so there's something to pick in
+**WP Linux Wallpaper** right away. You can also grab that archive yourself
+and unzip it into the same folder.
+
 ### Option B: Arch Linux / AUR
 
 `packaging/archlinux/PKGBUILD` packages the same release archive for a

@@ -11,7 +11,8 @@ arch=('x86_64')
 url="https://github.com/AzimovIz/WP_Linux"
 license=('MIT')
 depends=('plasma-workspace' 'kwin' 'hicolor-icon-theme')
-optdepends=('power-profiles-daemon: pause rendering automatically in power-saver mode')
+optdepends=('power-profiles-daemon: pause rendering automatically in power-saver mode'
+            'unzip: unpack the example wallpapers from the WallpaperExamples release')
 install="${pkgname}.install"
 source=("https://github.com/AzimovIz/WP_Linux/releases/download/${pkgver}/wp-linux-linux-x86_64.tar.gz")
 sha256sums=('SKIP')

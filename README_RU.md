@@ -107,6 +107,11 @@ curl -fsSL https://github.com/AzimovIz/WP_Linux/releases/latest/download/uninsta
 
 (Сохранённые проекты обоев ни один из скриптов не трогает.)
 
+Скрипт установки также скачивает несколько [примеров обоев](https://github.com/AzimovIz/WP_Linux/releases/tag/WallpaperExamples)
+в `~/.local/share/wp_linux/wallpapers/`, чтобы сразу было из чего выбрать в
+**WP Linux Wallpaper**. Этот же архив можно скачать и распаковать в ту же
+папку вручную.
+
 ### Вариант B: Arch Linux / AUR
 
 `packaging/archlinux/PKGBUILD` упаковывает тот же архив релиза для

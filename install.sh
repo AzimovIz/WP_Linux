@@ -12,10 +12,16 @@ set -euo pipefail
 
 REPO="AzimovIz/WP_Linux"
 ARCHIVE_URL="https://github.com/${REPO}/releases/latest/download/wp-linux-linux-x86_64.tar.gz"
+# Fixed tag, not "latest" -- this release only ever holds the example
+# wallpapers and must stay independent of the app's dated release tags
+# (see release.yml), otherwise it could get picked up by releases/latest.
+EXAMPLES_URL="https://github.com/${REPO}/releases/download/WallpaperExamples/WallpaperExamples.zip"
 BIN_DIR="${HOME}/.local/bin"
 SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
 APPLICATIONS_DIR="${HOME}/.local/share/applications"
 ICON_THEME_DIR="${HOME}/.local/share/icons/hicolor"
+# Matches crates/editor/src/library.rs's LIBRARY_SUBDIR / dirs::data_dir().
+WALLPAPERS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/wp_linux/wallpapers"
 PLASMA_PLUGIN_ID="dev.wplinux.wallpaper"
 KWIN_SCRIPT_ID="dev.wplinux.cursorbridge"
 DESKTOP_FILE_ID="dev.wplinux.editor"
@@ -109,6 +115,19 @@ if command -v systemctl >/dev/null 2>&1; then
     systemctl --user restart render-server.service
 else
     warn "systemctl not found -- start render-server by hand: ${BIN_DIR}/render-server"
+fi
+
+if command -v unzip >/dev/null 2>&1; then
+    log "downloading example wallpapers"
+    if curl -fsSL "$EXAMPLES_URL" -o "$tmpdir/wallpaper-examples.zip"; then
+        mkdir -p "$WALLPAPERS_DIR"
+        unzip -oq "$tmpdir/wallpaper-examples.zip" -d "$WALLPAPERS_DIR"
+        log "installed example wallpapers to ${WALLPAPERS_DIR}"
+    else
+        warn "failed to download example wallpapers -- skipping (get them by hand, see README)"
+    fi
+else
+    warn "'unzip' not found -- skipping example wallpapers (install unzip and rerun, or get them by hand, see README)"
 fi
 
 if ! command -v editor >/dev/null 2>&1; then
