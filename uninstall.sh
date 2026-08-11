@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # Reverses install.sh: stops render-server, removes its autostart entry,
 # the desktop-agnostic core binaries from ~/.local/bin, and whatever
-# desktop adapter install.sh installed -- today that's only ever the two
-# KDE packages (see adapters/kde), removed below via the same
-# `command -v kpackagetool6`/`kwriteconfig6` guards install.sh's KDE step
-# uses, which is why this is safe to run unconditionally regardless of
-# which desktop you're on. This script is distributed standalone (curl
-# | bash, no release archive download), so unlike install.sh it can't
-# hand off to an adapters/<de>/uninstall.sh file -- if a future adapter
-# needs its own cleanup, inline it here the same way, guarded the same
-# way. Does NOT touch any wallpaper projects you saved -- those are your
-# data, wherever you put them, and are left alone. This also includes the
-# wallpaper library install.sh populates with the example wallpapers
+# desktop adapter install.sh installed -- the two KDE packages (see
+# adapters/kde) and/or the GNOME Shell extension (see adapters/gnome),
+# removed below via the same `command -v kpackagetool6`/`kwriteconfig6`/
+# `gnome-extensions` guards install.sh's own adapter steps use, which is
+# why this is safe to run unconditionally regardless of which desktop
+# you're on -- each block below is a no-op on any desktop it doesn't
+# apply to. This script is distributed standalone (curl | bash, no
+# release archive download), so unlike install.sh it can't hand off to an
+# adapters/<de>/uninstall.sh file -- if a future adapter needs its own
+# cleanup, inline it here the same way, guarded the same way. Does NOT
+# touch any wallpaper projects you saved -- those are your data, wherever
+# you put them, and are left alone. This also includes the wallpaper
+# library install.sh populates with the example wallpapers
 # (~/.local/share/wp_linux/wallpapers/ by default).
 
 set -uo pipefail
@@ -25,6 +27,8 @@ ICON_THEME_DIR="${HOME}/.local/share/icons/hicolor"
 WALLPAPERS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/wp_linux/wallpapers"
 PLASMA_PLUGIN_ID="dev.wplinux.wallpaper"
 KWIN_SCRIPT_ID="dev.wplinux.cursorbridge"
+GNOME_EXT_UUID="wp-linux@wplinux.dev"
+GNOME_EXT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/${GNOME_EXT_UUID}"
 DESKTOP_FILE_ID="dev.wplinux.editor"
 
 log()  { echo "uninstall.sh: $*"; }
@@ -55,6 +59,17 @@ if command -v kpackagetool6 >/dev/null 2>&1; then
     kpackagetool6 --type=Plasma/Wallpaper --remove "$PLASMA_PLUGIN_ID" || warn "couldn't remove $PLASMA_PLUGIN_ID (already gone?)"
 else
     warn "kpackagetool6 not found -- skipping KDE package removal."
+fi
+
+# GNOME adapter cleanup (see adapters/gnome) -- no-op on any other desktop
+# since neither gnome-extensions nor GNOME_EXT_DIR will exist there.
+if command -v gnome-extensions >/dev/null 2>&1; then
+    log "disabling WP Linux GNOME Shell extension"
+    gnome-extensions disable "$GNOME_EXT_UUID" >/dev/null 2>&1 || true
+fi
+if [ -d "$GNOME_EXT_DIR" ]; then
+    log "removing GNOME Shell extension from ${GNOME_EXT_DIR}"
+    rm -rf "$GNOME_EXT_DIR"
 fi
 
 log "removing binaries from ${BIN_DIR}"

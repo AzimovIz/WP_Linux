@@ -91,7 +91,7 @@ desktops aren't supported yet.
 
 ## Installation
 
-### Option A: install script (any distro)
+### Install script (any distro)
 
 Downloads the latest release archive and sets everything up under
 `$HOME` -- binaries in `~/.local/bin`, the desktop-specific integration
@@ -119,17 +119,7 @@ into `~/.local/share/wp_linux/wallpapers/` so there's something to pick in
 **WP Linux Wallpaper** right away. You can also grab that archive yourself
 and unzip it into the same folder.
 
-### Option B: Arch Linux / AUR
-
-`packaging/archlinux/PKGBUILD` packages the same release archive for a
-system-wide `pacman` install (binaries in `/usr/bin`, KDE packages under
-`/usr/share`). After installing, finish the per-user setup steps printed
-by the package (enabling the KWin script and the `render-server` user
-service) -- these can't happen automatically from a root install step.
-GNOME isn't packaged here yet (KDE only) -- use Option A on Arch + GNOME
-for now.
-
-### Option C: build from source
+### Build from source
 
 ```sh
 git clone https://github.com/AzimovIz/WP_Linux.git

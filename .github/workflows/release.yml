@@ -47,12 +47,12 @@ jobs:
         env:
           WP_LINUX_RELEASE_TAG: ${{ steps.tag.outputs.tag }}
 
-      # Single archive, laid out the way install.sh/PKGBUILD expect:
+      # Single archive, laid out the way install.sh expects:
       #   bin/{render-server,player,wp_linux_editor}
       #   adapters/kde/{plasma-plugin,kwin-script}/package  (kpackagetool6-ready)
       #   adapters/gnome/extension/  (GNOME Shell extension, gnome-extensions-ready)
       #   dev.wplinux.editor.desktop  (Exec= has an @EDITOR_BIN@ placeholder,
-      #                                 filled in by install.sh/PKGBUILD)
+      #                                 filled in by install.sh)
       #   assets/{wp_linux_editor_128.png,wp_linux_editor_256.png,wp_linux_editor.svg}
       # No systemd unit -- render-server autostarts via an XDG autostart
       # .desktop file that install.sh writes directly (and wp_linux_editor's

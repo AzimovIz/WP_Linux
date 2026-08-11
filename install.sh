@@ -9,9 +9,6 @@
 # installs whatever that desktop needs to actually show the render as
 # your wallpaper (see adapters/kde and adapters/gnome). No root required
 # -- everything lands under $HOME.
-#
-# For Arch Linux, prefer packaging/archlinux/PKGBUILD instead (system-wide
-# install via pacman).
 
 set -euo pipefail
 
