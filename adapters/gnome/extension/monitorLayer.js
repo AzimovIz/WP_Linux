@@ -46,6 +46,11 @@ function sanitizeForFilename(name) {
 }
 
 export class MonitorLayer {
+    /** Read-only: lets overviewBackground.js clone this monitor's rendered output into GNOME's own (otherwise unrelated) Overview workspace-preview background. */
+    get actor() {
+        return this._actor;
+    }
+
     constructor(connector, client) {
         this._connector = connector;
         this._client = client;

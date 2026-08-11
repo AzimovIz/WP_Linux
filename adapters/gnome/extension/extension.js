@@ -10,6 +10,7 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 import {CursorForwarder} from './cursorForwarder.js';
 import {MonitorLayer} from './monitorLayer.js';
+import {OverviewBackgroundPatcher} from './overviewBackground.js';
 import {RenderServerClient} from './renderServerClient.js';
 
 /**
@@ -43,9 +44,19 @@ export default class WpLinuxExtension extends Extension {
         this._monitorsChangedId = Main.layoutManager.connect(
             'monitors-changed', () => this._syncMonitors());
         this._syncMonitors();
+
+        // Cosmetic-only, best-effort (see overviewBackground.js's own
+        // doc comment) -- started last and stopped first so it can never
+        // end up outliving the state (_layers) it reads from.
+        this._overviewPatcher = new OverviewBackgroundPatcher(
+            index => this._layerForMonitorIndex(index));
+        this._overviewPatcher.enable();
     }
 
     disable() {
+        this._overviewPatcher.disable();
+        this._overviewPatcher = null;
+
         if (this._monitorsChangedId) {
             Main.layoutManager.disconnect(this._monitorsChangedId);
             this._monitorsChangedId = null;
@@ -60,6 +71,16 @@ export default class WpLinuxExtension extends Extension {
 
         this._client.destroy();
         this._client = null;
+    }
+
+    _layerForMonitorIndex(index) {
+        let connector;
+        try {
+            connector = connectorForMonitorIndex(index);
+        } catch (e) {
+            return undefined;
+        }
+        return connector ? this._layers.get(connector) : undefined;
     }
 
     _syncMonitors() {
