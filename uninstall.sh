@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
-# Reverses install.sh: stops render-server, removes its autostart entry
-# and the two KDE packages, and deletes the three binaries from
-# ~/.local/bin. Does NOT touch any wallpaper projects you saved -- those
-# are your data, wherever you put them, and are left alone. This also
-# includes the wallpaper library install.sh populates with the example
-# wallpapers (~/.local/share/wp_linux/wallpapers/ by default).
+# Reverses install.sh: stops render-server, removes its autostart entry,
+# the desktop-agnostic core binaries from ~/.local/bin, and whatever
+# desktop adapter install.sh installed -- today that's only ever the two
+# KDE packages (see adapters/kde), removed below via the same
+# `command -v kpackagetool6`/`kwriteconfig6` guards install.sh's KDE step
+# uses, which is why this is safe to run unconditionally regardless of
+# which desktop you're on. This script is distributed standalone (curl
+# | bash, no release archive download), so unlike install.sh it can't
+# hand off to an adapters/<de>/uninstall.sh file -- if a future adapter
+# needs its own cleanup, inline it here the same way, guarded the same
+# way. Does NOT touch any wallpaper projects you saved -- those are your
+# data, wherever you put them, and are left alone. This also includes the
+# wallpaper library install.sh populates with the example wallpapers
+# (~/.local/share/wp_linux/wallpapers/ by default).
 
 set -uo pipefail
 
@@ -34,6 +42,8 @@ if command -v systemctl >/dev/null 2>&1; then
     systemctl --user daemon-reload >/dev/null 2>&1 || true
 fi
 
+# KDE adapter cleanup (see adapters/kde) -- no-op on any other desktop
+# since these commands simply won't exist there.
 if command -v kwriteconfig6 >/dev/null 2>&1; then
     kwriteconfig6 --file kwinrc --group Plugins --key "${KWIN_SCRIPT_ID}Enabled" --type bool false
 fi

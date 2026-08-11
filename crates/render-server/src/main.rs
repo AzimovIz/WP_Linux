@@ -16,11 +16,14 @@
 //!
 //! Cursor position itself does NOT come in over HTTP: this process also
 //! registers the `dev.wplinux.CursorBridge` D-Bus service (formerly a
-//! separate `cursor-bridge` binary) that a companion KWin script feeds
+//! separate `cursor-bridge` binary) that a desktop-specific adapter feeds
 //! with the true, compositor-level pointer position -- see
-//! plasma/kwin-script/package. Folding it in here means one less process to
-//! start by hand, and lets the render loop react to cursor movement
-//! without an HTTP round-trip through QML at all.
+//! adapters/kde/kwin-script/package for KDE's implementation of that (a
+//! KWin script). This process itself has no idea which desktop
+//! environment it's running under -- every DE-specific integration lives
+//! under adapters/, never here. Folding the D-Bus service in here means
+//! one less process to start by hand, and lets the render loop react to
+//! cursor movement without an HTTP round-trip through QML at all.
 //!
 //! Deliberately started by hand for now (autostart is still a TODO).
 //!
@@ -163,9 +166,10 @@ struct SharedState {
     power_saver: AtomicBool,
 }
 
-/// D-Bus object backing `dev.wplinux.CursorBridge` -- the KWin script
-/// (plasma/kwin-script/package) calls `SetCursorPosition` on this every time
-/// `workspace.cursorPosChanged` fires.
+/// D-Bus object backing `dev.wplinux.CursorBridge` -- on KDE, the KWin
+/// script (adapters/kde/kwin-script/package) calls `SetCursorPosition` on
+/// this every time `workspace.cursorPosChanged` fires. Any other
+/// desktop's adapter is free to call the same method the same way.
 struct CursorDbusService {
     state: Arc<SharedState>,
 }
@@ -286,76 +290,6 @@ fn run_power_profile_watcher(state: Arc<SharedState>) {
     }
 }
 
-/// KWin scripts normally need installing as a KPackage
-/// (`kpackagetool6 --type=KWin/Script`) plus enabling in kwinrc. KWin
-/// also exposes `org.kde.kwin.Scripting` on `/Scripting`, meant for
-/// loading an unpackaged script file on the fly (this is how KWin's own
-/// scripting console and dev tools work) -- so we use that instead to
-/// load our companion script straight from the repo checkout, no
-/// packaging/installation step required. Best-effort: if this fails
-/// (e.g. a KWin version where the interface differs), the cursor script
-/// can still be installed the old way by hand.
-fn ensure_kwin_cursor_script_loaded() {
-    const PLUGIN_NAME: &str = "dev.wplinux.cursorbridge";
-    const SCRIPT_PATH: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../plasma/kwin-script/package/contents/code/main.js"
-    );
-
-    if !std::path::Path::new(SCRIPT_PATH).exists() {
-        eprintln!(
-            "render-server: kwin cursor script not found at {SCRIPT_PATH}, skipping auto-load \
-             (install it by hand with kpackagetool6 if you moved this binary elsewhere)"
-        );
-        return;
-    }
-
-    let load = || -> zbus::Result<bool> {
-        let conn = zbus::blocking::Connection::session()?;
-
-        let already_loaded: bool = conn
-            .call_method(
-                Some("org.kde.KWin"),
-                "/Scripting",
-                Some("org.kde.kwin.Scripting"),
-                "isScriptLoaded",
-                &(PLUGIN_NAME,),
-            )?
-            .body()
-            .deserialize()?;
-        if already_loaded {
-            return Ok(false);
-        }
-
-        conn.call_method(
-            Some("org.kde.KWin"),
-            "/Scripting",
-            Some("org.kde.kwin.Scripting"),
-            "loadScript",
-            &(SCRIPT_PATH, PLUGIN_NAME),
-        )?;
-        conn.call_method(
-            Some("org.kde.KWin"),
-            "/Scripting",
-            Some("org.kde.kwin.Scripting"),
-            "start",
-            &(),
-        )?;
-        Ok(true)
-    };
-
-    match load() {
-        Ok(true) => {
-            eprintln!("render-server: loaded and started kwin cursor script from {SCRIPT_PATH}")
-        }
-        Ok(false) => eprintln!("render-server: kwin cursor script already loaded"),
-        Err(e) => eprintln!(
-            "render-server: could not auto-load kwin cursor script ({e}) -- \
-             install it by hand: kpackagetool6 --type=KWin/Script --install plasma/kwin-script/package"
-        ),
-    }
-}
-
 /// Computes the current normalized (0..1) cursor position within one
 /// specific monitor's wallpaper item, from the last-known global cursor
 /// position and that monitor's last-reported screen geometry. `None` if
@@ -431,8 +365,6 @@ fn main() {
         let state = Arc::clone(&state);
         std::thread::spawn(move || run_power_profile_watcher(state));
     }
-
-    ensure_kwin_cursor_script_loaded();
 
     eprintln!("render-server: serving http://{HTTP_ADDR} (no project loaded yet)");
 

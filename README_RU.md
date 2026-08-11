@@ -32,9 +32,10 @@
 
 ## Статус
 
-Ранняя стадия, одна платформа: только **KDE Plasma 6 + KWin/Wayland**.
-Ничего другого (X11, GNOME, другие компоузеры) не поддерживается и пока не
-планируется.
+Ранняя стадия. Рендерер и редактор (`crates/`) не привязаны к конкретному
+DE, но пока реализован только один адаптер под конкретный рабочий стол --
+**KDE Plasma 6 + KWin/Wayland** (`adapters/kde`). Адаптер под GNOME/Wayland
+в разработке (`adapters/gnome`); остальные DE пока не поддерживаются.
 
 ## Возможности
 
@@ -72,8 +73,9 @@
 | `crates/player` | Общая библиотека GPU-компоузера (`SceneRenderer`), используется всем, что ниже, плюс собственный отдельный тестовый бинарник Wayland/layer-shell. |
 | `crates/render-server` | Основной рантайм-рендерер: headless-процесс wgpu, который отдаёт скомпонованные кадры плагину Plasma по локальному HTTP, получает позицию курсора по D-Bus и следит за профилем питания. |
 | `crates/wp_linux_editor` | Десктопное приложение (egui) для сборки и редактирования проектов обоев, с живым превью. |
-| `plasma/plasma-plugin` | Плагин "Wallpaper" для Plasma, который вы выбираете в системных настройках; общается с `render-server`. |
-| `plasma/kwin-script` | Скрипт KWin, пересылающий настоящую глобальную позицию курсора в `render-server` по D-Bus. |
+| `adapters/kde/plasma-plugin` | Плагин "Wallpaper" для Plasma, который вы выбираете в системных настройках; общается с `render-server`. |
+| `adapters/kde/kwin-script` | Скрипт KWin, пересылающий настоящую глобальную позицию курсора в `render-server` по D-Bus. |
+| `adapters/gnome` | Заготовка под адаптер GNOME/Wayland -- пока не реализован. |
 
 ## Требования
 
@@ -135,13 +137,15 @@ cargo build --release --workspace
 `kpackagetool6` прямо на директории:
 
 ```sh
-kpackagetool6 --type=Plasma/Wallpaper --install plasma/plasma-plugin/package
-kpackagetool6 --type=KWin/Script --install plasma/kwin-script/package
+kpackagetool6 --type=Plasma/Wallpaper --install adapters/kde/plasma-plugin/package
+kpackagetool6 --type=KWin/Script --install adapters/kde/kwin-script/package
 ```
 
-(При запуске из исходников `render-server` также умеет сам подгрузить
-скрипт KWin при старте -- установка вручную всё равно работает и в любом
-случае надёжнее.)
+(При разработке из исходников `adapters/kde/dev-load-kwin-script.sh`
+подгружает скрипт KWin прямо из чекаута через D-Bus-интерфейс скриптинга
+KWin, так что не нужно переустанавливать KPackage при каждой правке --
+запускайте его вручную после каждого перезапуска KWin. Для обычной
+установки не нужен -- установки KPackage выше достаточно.)
 
 ## Использование
 

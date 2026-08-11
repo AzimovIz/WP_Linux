@@ -31,8 +31,10 @@ used here for demonstration only -- not original work, all rights remain with it
 
 ## Status
 
-Early stage, single-platform: **KDE Plasma 6 + KWin/Wayland only**. Nothing
-else (X11, GNOME, other compositors) is supported or planned right now.
+Early stage. The renderer and editor (`crates/`) are desktop-agnostic, but
+the only desktop adapter that actually exists yet is **KDE Plasma 6 +
+KWin/Wayland** (`adapters/kde`). A GNOME/Wayland adapter is in progress
+(`adapters/gnome`); other desktops aren't supported yet.
 
 ## Features
 
@@ -67,8 +69,9 @@ else (X11, GNOME, other compositors) is supported or planned right now.
 | `crates/player` | Shared GPU compositor library (`SceneRenderer`) used by everything below, plus its own standalone Wayland/layer-shell test binary. |
 | `crates/render-server` | The actual runtime renderer: a headless wgpu process that serves composited frames to the Plasma plugin over local HTTP, receives the cursor position over D-Bus, and watches the power profile. |
 | `crates/wp_linux_editor` | Desktop app (egui) for building and editing wallpaper projects, with the live preview. |
-| `plasma/plasma-plugin` | The Plasma "Wallpaper" plugin you pick in System Settings; talks to `render-server`. |
-| `plasma/kwin-script` | KWin script forwarding the true global cursor position to `render-server` over D-Bus. |
+| `adapters/kde/plasma-plugin` | The Plasma "Wallpaper" plugin you pick in System Settings; talks to `render-server`. |
+| `adapters/kde/kwin-script` | KWin script forwarding the true global cursor position to `render-server` over D-Bus. |
+| `adapters/gnome` | Placeholder for a GNOME/Wayland adapter -- not implemented yet. |
 
 ## Requirements
 
@@ -128,13 +131,15 @@ Binaries land in `target/release/`. Install the KDE packages by pointing
 `kpackagetool6` at the directories directly:
 
 ```sh
-kpackagetool6 --type=Plasma/Wallpaper --install plasma/plasma-plugin/package
-kpackagetool6 --type=KWin/Script --install plasma/kwin-script/package
+kpackagetool6 --type=Plasma/Wallpaper --install adapters/kde/plasma-plugin/package
+kpackagetool6 --type=KWin/Script --install adapters/kde/kwin-script/package
 ```
 
-(Run from a source checkout, `render-server` can also auto-load the KWin
-script itself on startup -- installing it by hand still works and is the
-more robust option either way.)
+(While developing from a source checkout, `adapters/kde/dev-load-kwin-script.sh`
+loads the KWin script straight from the checkout via KWin's scripting
+D-Bus interface, so you don't need to reinstall the KPackage on every
+change -- run it by hand once per KWin restart. Not needed for a normal
+install, where the KPackage install above is enough.)
 
 ## Usage
 

@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # Installs WP Linux for the current user: downloads the latest release
-# archive, drops the binaries in ~/.local/bin, installs the two KDE
-# packages (Plasma wallpaper plugin + KWin cursor-bridge script), enables
-# the KWin script, and registers render-server to autostart via an
-# XDG Desktop Application Autostart .desktop file (~/.config/autostart/)
-# -- no systemd dependency, works the same regardless of init system.
-# No root required -- everything lands under $HOME.
+# archive, drops the desktop-agnostic core binaries (render-server,
+# wp_linux_editor, player) in ~/.local/bin, registers render-server to
+# autostart via an XDG Desktop Application Autostart .desktop file
+# (~/.config/autostart/) -- no systemd dependency, works the same
+# regardless of init system -- and then hands off to whichever
+# adapters/<desktop>/install.sh matches the desktop you're running, which
+# installs whatever that desktop needs to actually show the render as
+# your wallpaper (see adapters/kde for the one implementation that exists
+# today). No root required -- everything lands under $HOME.
 #
 # For Arch Linux, prefer packaging/archlinux/PKGBUILD instead (system-wide
 # install via pacman).
@@ -25,8 +28,6 @@ APPLICATIONS_DIR="${HOME}/.local/share/applications"
 ICON_THEME_DIR="${HOME}/.local/share/icons/hicolor"
 # Matches crates/wp_linux_editor/src/library.rs's LIBRARY_SUBDIR / dirs::data_dir().
 WALLPAPERS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/wp_linux/wallpapers"
-PLASMA_PLUGIN_ID="dev.wplinux.wallpaper"
-KWIN_SCRIPT_ID="dev.wplinux.cursorbridge"
 DESKTOP_FILE_ID="dev.wplinux.editor"
 
 log()  { echo "install.sh: $*"; }
@@ -39,7 +40,20 @@ need() {
 
 need curl
 need tar
-need kpackagetool6
+
+# Best-effort desktop detection, used only to pick which adapters/<de>
+# script to hand off to below -- nothing above this point (archive
+# download, core binaries) depends on it. $XDG_CURRENT_DESKTOP can list
+# several colon-separated values (e.g. "ubuntu:GNOME"); a substring match
+# is enough since these values are short, well-known identifiers.
+detect_de() {
+    local id="${XDG_CURRENT_DESKTOP:-}${DESKTOP_SESSION:-}"
+    case "$id" in
+        *KDE*|*Plasma*) echo "kde" ;;
+        *GNOME*)        echo "gnome" ;;
+        *)              echo "unknown" ;;
+    esac
+}
 
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
@@ -72,35 +86,20 @@ if command -v gtk-update-icon-cache >/dev/null 2>&1; then
     gtk-update-icon-cache -q -t -f "$ICON_THEME_DIR" >/dev/null 2>&1 || true
 fi
 
-install_kpackage() {
-    local type="$1" id="$2" path="$3"
-    if kpackagetool6 --type="$type" --install "$path" 2>/dev/null; then
-        log "installed $id ($type)"
-    elif kpackagetool6 --type="$type" --upgrade "$path"; then
-        log "upgraded $id ($type)"
-    else
-        die "failed to install/upgrade $id ($type)"
-    fi
-}
-
-log "installing Plasma wallpaper plugin"
-install_kpackage "Plasma/Wallpaper" "$PLASMA_PLUGIN_ID" "$pkgroot/plasma/plasma-plugin/package"
-
-log "installing KWin cursor-bridge script"
-install_kpackage "KWin/Script" "$KWIN_SCRIPT_ID" "$pkgroot/plasma/kwin-script/package"
-
-if command -v kwriteconfig6 >/dev/null 2>&1; then
-    log "enabling KWin cursor-bridge script"
-    kwriteconfig6 --file kwinrc --group Plugins --key "${KWIN_SCRIPT_ID}Enabled" --type bool true
-    if command -v qdbus6 >/dev/null 2>&1; then
-        qdbus6 org.kde.KWin /KWin reconfigure >/dev/null 2>&1 || true
-    elif command -v qdbus >/dev/null 2>&1; then
-        qdbus org.kde.KWin /KWin reconfigure >/dev/null 2>&1 || true
-    else
-        warn "couldn't find qdbus/qdbus6 to reload KWin -- log out and back in for the cursor script to take effect."
-    fi
+de="$(detect_de)"
+# Falls back to "does kpackagetool6 exist" when detection is inconclusive
+# (some KDE session managers don't set $XDG_CURRENT_DESKTOP the same way)
+# -- matches this script's old behavior of always assuming KDE.
+if [ "$de" = "kde" ] || { [ "$de" = "unknown" ] && command -v kpackagetool6 >/dev/null 2>&1; }; then
+    log "detected KDE Plasma -- running its adapter install step"
+    bash "$pkgroot/adapters/kde/install.sh" "$pkgroot"
+elif [ "$de" = "gnome" ]; then
+    warn "GNOME support isn't implemented yet (see adapters/gnome/README.md)."
+    warn "render-server and the editor are installed below, but nothing will show the"
+    warn "wallpaper on your desktop until a GNOME adapter exists."
 else
-    warn "kwriteconfig6 not found -- enable 'WP Linux Cursor Bridge' by hand in System Settings > Window Management > KWin Scripts."
+    warn "no supported desktop adapter for \$XDG_CURRENT_DESKTOP=${XDG_CURRENT_DESKTOP:-<unset>}."
+    warn "render-server and the editor are installed below regardless; see adapters/ for what's supported."
 fi
 
 log "installing autostart entry (${AUTOSTART_DIR})"
@@ -168,5 +167,5 @@ if ! command -v wp_linux_editor >/dev/null 2>&1; then
 fi
 
 log "done. Run 'wp_linux_editor' (or launch 'WP Linux Editor' from the application menu) to"
-log "build a project, then pick 'WP Linux Wallpaper' in System Settings > Appearance"
-log "> Wallpaper and point it at the saved project folder."
+log "build a project. On KDE Plasma, pick 'WP Linux Wallpaper' in System Settings >"
+log "Appearance > Wallpaper and point it at the saved project folder."

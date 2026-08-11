@@ -24,13 +24,16 @@ package() {
     install -Dm755 bin/player "${pkgdir}/usr/bin/player"
     install -Dm755 bin/wp_linux_editor "${pkgdir}/usr/bin/wp_linux_editor"
 
-    # Plasma/KWin auto-discover packages under these system share dirs --
-    # no kpackagetool6 install step needed at package-install time.
+    # KDE adapter (adapters/kde) -- Plasma/KWin auto-discover packages
+    # under these system share dirs, no kpackagetool6 install step needed
+    # at package-install time. This PKGBUILD only packages the KDE
+    # adapter for now; a future GNOME adapter would need its own
+    # packaging step here once adapters/gnome exists for real.
     install -d "${pkgdir}/usr/share/plasma/wallpapers/dev.wplinux.wallpaper"
-    cp -r plasma/plasma-plugin/package/. "${pkgdir}/usr/share/plasma/wallpapers/dev.wplinux.wallpaper/"
+    cp -r adapters/kde/plasma-plugin/package/. "${pkgdir}/usr/share/plasma/wallpapers/dev.wplinux.wallpaper/"
 
     install -d "${pkgdir}/usr/share/kwin/scripts/dev.wplinux.cursorbridge"
-    cp -r plasma/kwin-script/package/. "${pkgdir}/usr/share/kwin/scripts/dev.wplinux.cursorbridge/"
+    cp -r adapters/kde/kwin-script/package/. "${pkgdir}/usr/share/kwin/scripts/dev.wplinux.cursorbridge/"
 
     # No systemd unit and no per-user autostart file installed here --
     # package() can't write into a specific user's $HOME. Autostart is
