@@ -2,8 +2,10 @@
 # Installs WP Linux for the current user: downloads the latest release
 # archive, drops the binaries in ~/.local/bin, installs the two KDE
 # packages (Plasma wallpaper plugin + KWin cursor-bridge script), enables
-# the KWin script, and installs+starts the render-server systemd --user
-# service. No root required -- everything lands under $HOME.
+# the KWin script, and registers render-server to autostart via an
+# XDG Desktop Application Autostart .desktop file (~/.config/autostart/)
+# -- no systemd dependency, works the same regardless of init system.
+# No root required -- everything lands under $HOME.
 #
 # For Arch Linux, prefer packaging/archlinux/PKGBUILD instead (system-wide
 # install via pacman).
@@ -17,7 +19,8 @@ ARCHIVE_URL="https://github.com/${REPO}/releases/latest/download/wp-linux-linux-
 # (see release.yml), otherwise it could get picked up by releases/latest.
 EXAMPLES_URL="https://github.com/${REPO}/releases/download/WallpaperExamples/WallpaperExamples.zip"
 BIN_DIR="${HOME}/.local/bin"
-SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
+AUTOSTART_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
+AUTOSTART_FILE_ID="dev.wplinux.render-server"
 APPLICATIONS_DIR="${HOME}/.local/share/applications"
 ICON_THEME_DIR="${HOME}/.local/share/icons/hicolor"
 # Matches crates/wp_linux_editor/src/library.rs's LIBRARY_SUBDIR / dirs::data_dir().
@@ -100,22 +103,46 @@ else
     warn "kwriteconfig6 not found -- enable 'WP Linux Cursor Bridge' by hand in System Settings > Window Management > KWin Scripts."
 fi
 
+log "installing autostart entry (${AUTOSTART_DIR})"
+mkdir -p "$AUTOSTART_DIR"
+cat > "${AUTOSTART_DIR}/${AUTOSTART_FILE_ID}.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=WP Linux Render Server
+Comment=Renders the WP Linux animated wallpaper in the background
+Exec=${BIN_DIR}/render-server
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+EOF
+# Matches crates/wp_linux_editor/src/autostart.rs's own format byte for
+# byte -- the "Launch at login" checkbox there just overwrites/removes
+# this same file, so a user who unticks it and reticks it later gets
+# back exactly this.
+
+# Leftover from a pre-autostart-spec install: an enabled systemd --user
+# unit pointed at the binary we're about to replace would otherwise keep
+# running the old copy (or double up with the autostart entry above)
+# until the next logout. Best-effort and silent -- most installs never
+# had this.
 if command -v systemctl >/dev/null 2>&1; then
-    log "installing render-server systemd user service"
-    mkdir -p "$SYSTEMD_USER_DIR"
-    cp "$pkgroot/systemd/render-server.service" "$SYSTEMD_USER_DIR/"
-    systemctl --user daemon-reload
-    systemctl --user enable render-server.service
-    # `restart`, not `start`: on a reinstall/update the service is
-    # typically already running, and `start` is a no-op against an
-    # already-active unit -- it would leave the old binary running
-    # until the next reboot/logout instead of picking up the one we
-    # just installed. `restart` starts it either way.
-    log "restarting render-server to pick up the newly installed binary"
-    systemctl --user restart render-server.service
-else
-    warn "systemctl not found -- start render-server by hand: ${BIN_DIR}/render-server"
+    systemctl --user disable --now render-server.service >/dev/null 2>&1 || true
+    rm -f "${HOME}/.config/systemd/user/render-server.service"
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
 fi
+
+log "starting render-server for this session"
+# On a reinstall/update an old copy may already be running (and holding
+# the HTTP port the new one needs) -- kill it first so this actually
+# picks up the binary we just installed, same intent as the old
+# `systemctl restart` this replaced. A brief pause gives it time to
+# release the port before the new one tries to bind it.
+pkill -x render-server >/dev/null 2>&1 || true
+sleep 0.5
+# Backgrounded and detached from this (non-interactive) script's stdio;
+# no job control here to `disown` from, and the child isn't part of any
+# job that would get SIGHUP'd when the script itself exits.
+nohup "${BIN_DIR}/render-server" >/dev/null 2>&1 &
 
 if command -v unzip >/dev/null 2>&1; then
     log "downloading example wallpapers"

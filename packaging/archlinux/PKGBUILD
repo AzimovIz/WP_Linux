@@ -32,15 +32,15 @@ package() {
     install -d "${pkgdir}/usr/share/kwin/scripts/dev.wplinux.cursorbridge"
     cp -r plasma/kwin-script/package/. "${pkgdir}/usr/share/kwin/scripts/dev.wplinux.cursorbridge/"
 
-    # The shipped unit targets ~/.local/bin (matches install.sh); this
-    # package puts the binaries in /usr/bin instead, so repoint it.
-    install -Dm644 systemd/render-server.service "${pkgdir}/usr/lib/systemd/user/render-server.service"
-    sed -i 's|%h/.local/bin/render-server|/usr/bin/render-server|' \
-        "${pkgdir}/usr/lib/systemd/user/render-server.service"
+    # No systemd unit and no per-user autostart file installed here --
+    # package() can't write into a specific user's $HOME. Autostart is
+    # instead handled entirely by wp_linux_editor's own "Launch at login"
+    # checkbox (crates/wp_linux_editor/src/autostart.rs), which resolves
+    # render-server relative to its own executable path (/usr/bin here),
+    # same as install.sh's ~/.local/bin layout.
 
-    # Application menu entry. Same @EDITOR_BIN@ placeholder trick as the
-    # systemd unit above, pointed at the /usr/bin wp_linux_editor installed
-    # here instead of install.sh's ~/.local/bin/wp_linux_editor.
+    # Application menu entry, pointed at the /usr/bin wp_linux_editor
+    # installed here instead of install.sh's ~/.local/bin/wp_linux_editor.
     install -d "${pkgdir}/usr/share/applications"
     sed 's|@EDITOR_BIN@|/usr/bin/wp_linux_editor|' dev.wplinux.editor.desktop \
         > "${pkgdir}/usr/share/applications/dev.wplinux.editor.desktop"

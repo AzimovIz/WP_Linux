@@ -74,7 +74,6 @@
 | `crates/wp_linux_editor` | Десктопное приложение (egui) для сборки и редактирования проектов обоев, с живым превью. |
 | `plasma/plasma-plugin` | Плагин "Wallpaper" для Plasma, который вы выбираете в системных настройках; общается с `render-server`. |
 | `plasma/kwin-script` | Скрипт KWin, пересылающий настоящую глобальную позицию курсора в `render-server` по D-Bus. |
-| `systemd/` | Юнит пользовательского сервиса, который держит `render-server` запущенным в фоне. |
 
 ## Требования
 
@@ -92,9 +91,11 @@
 
 Скачивает последний архив релиза и настраивает всё внутри `$HOME` --
 бинарники в `~/.local/bin`, два пакета KDE через `kpackagetool6`,
-включённый скрипт KWin, и `render-server`, установленный как сервис
-`systemd --user` (`~/.config/systemd/user/`), чтобы он запускался
-автоматически вместе с графической сессией.
+включённый скрипт KWin, и `render-server`, зарегистрированный на
+автозапуск через XDG autostart `.desktop`-файл (`~/.config/autostart/`),
+чтобы он запускался автоматически вместе с графической сессией -- без
+зависимости от systemd. Позже это переключается прямо в `wp_linux_editor`
+чекбоксом "Launch at login" на вкладке Wallpapers.
 
 ```sh
 curl -fsSL https://github.com/AzimovIz/WP_Linux/releases/latest/download/install.sh | bash

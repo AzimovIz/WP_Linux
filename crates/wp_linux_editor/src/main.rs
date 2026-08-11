@@ -11,6 +11,7 @@
 //! render-server uses, not a separate reimplementation that could drift
 //! out of sync with what actually ships.
 
+mod autostart;
 mod library;
 mod monitors_config;
 mod push;
@@ -671,6 +672,10 @@ struct EditorApp {
     library: Vec<library::LibraryEntry>,
     /// Lazily-loaded preview textures, keyed by each entry's `preview_path`.
     thumbnails: HashMap<PathBuf, eframe::egui::TextureHandle>,
+    /// Mirrors whether `autostart::desktop_file_path()` currently exists --
+    /// read once at startup, then only ever changed by the checkbox itself
+    /// (see `show_wallpapers_tab`), never re-polled from disk every frame.
+    autostart_enabled: bool,
     pusher: Box<dyn ProjectPusher>,
     /// Project dir of the wallpaper whose "Apply" overlay (monitor
     /// picker) is currently open, if any.
@@ -704,6 +709,7 @@ impl Default for EditorApp {
             assignments: monitors_config::load(),
             library: library::scan(),
             thumbnails: HashMap::new(),
+            autostart_enabled: autostart::is_enabled(),
             pusher: Box::new(TcpPusher),
             apply_overlay: None,
             delete_overlay: None,
@@ -897,6 +903,27 @@ impl EditorApp {
             if ui.button("Rescan").clicked() {
                 self.rescan_library();
             }
+
+            ui.with_layout(
+                eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
+                |ui| {
+                    let resp = ui
+                        .checkbox(&mut self.autostart_enabled, "Launch at login")
+                        .on_hover_text(
+                            "Adds or removes a .desktop file in ~/.config/autostart so \
+                             render-server starts automatically when you log in.",
+                        );
+                    if resp.changed()
+                        && let Err(e) = autostart::set_enabled(self.autostart_enabled)
+                    {
+                        // Reflect what's actually on disk, not what the
+                        // click asked for -- a failed write/remove
+                        // shouldn't leave the checkbox lying about state.
+                        self.autostart_enabled = autostart::is_enabled();
+                        self.status = format!("Failed to update autostart: {e}");
+                    }
+                },
+            );
         });
         ui.add_space(8.0);
 

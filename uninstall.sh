@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# Reverses install.sh: stops and removes the render-server systemd --user
-# service, removes the two KDE packages, and deletes the three binaries
-# from ~/.local/bin. Does NOT touch any wallpaper projects you saved --
-# those are your data, wherever you put them, and are left alone. This
-# also includes the wallpaper library install.sh populates with the
-# example wallpapers (~/.local/share/wp_linux/wallpapers/ by default).
+# Reverses install.sh: stops render-server, removes its autostart entry
+# and the two KDE packages, and deletes the three binaries from
+# ~/.local/bin. Does NOT touch any wallpaper projects you saved -- those
+# are your data, wherever you put them, and are left alone. This also
+# includes the wallpaper library install.sh populates with the example
+# wallpapers (~/.local/share/wp_linux/wallpapers/ by default).
 
 set -uo pipefail
 
 BIN_DIR="${HOME}/.local/bin"
-SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
+AUTOSTART_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
+AUTOSTART_FILE_ID="dev.wplinux.render-server"
 APPLICATIONS_DIR="${HOME}/.local/share/applications"
 ICON_THEME_DIR="${HOME}/.local/share/icons/hicolor"
 # Matches crates/wp_linux_editor/src/library.rs's LIBRARY_SUBDIR / dirs::data_dir().
@@ -21,13 +22,16 @@ DESKTOP_FILE_ID="dev.wplinux.editor"
 log()  { echo "uninstall.sh: $*"; }
 warn() { echo "uninstall.sh: warning: $*" >&2; }
 
+log "removing autostart entry and stopping render-server"
+rm -f "${AUTOSTART_DIR}/${AUTOSTART_FILE_ID}.desktop"
+pkill -x render-server >/dev/null 2>&1 || true
+
+# Leftover from a pre-autostart-spec install (see install.sh) -- harmless
+# no-op if this was never set up.
 if command -v systemctl >/dev/null 2>&1; then
-    log "stopping render-server service"
-    systemctl --user disable --now render-server.service >/dev/null 2>&1
-    rm -f "${SYSTEMD_USER_DIR}/render-server.service"
-    systemctl --user daemon-reload >/dev/null 2>&1
-else
-    warn "systemctl not found -- skipping service removal."
+    systemctl --user disable --now render-server.service >/dev/null 2>&1 || true
+    rm -f "${HOME}/.config/systemd/user/render-server.service"
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
 fi
 
 if command -v kwriteconfig6 >/dev/null 2>&1; then

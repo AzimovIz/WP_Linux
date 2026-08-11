@@ -3,9 +3,10 @@ post_install() {
 ==> WP Linux installed. As your normal user (not root), finish setup with:
 ==>   kwriteconfig6 --file kwinrc --group Plugins --key dev.wplinux.cursorbridgeEnabled --type bool true
 ==>   qdbus6 org.kde.KWin /KWin reconfigure
-==>   systemctl --user daemon-reload
-==>   systemctl --user enable --now render-server.service
-==> Then run 'wp_linux_editor' to build a project, and pick "WP Linux Wallpaper" in
+==> Then run 'wp_linux_editor', tick "Launch at login" (top right of the
+==> Wallpapers tab) so render-server starts automatically from now on,
+==> and start it once by hand for this session: render-server &
+==> Finally, build a project and pick "WP Linux Wallpaper" in
 ==> System Settings > Appearance > Wallpaper.
 ==>
 ==> Optional example wallpapers (needs unzip):
@@ -18,18 +19,18 @@ EOF
 post_upgrade() {
     cat <<EOF
 ==> WP Linux upgraded. As your normal user (not root), pick up the new
-==> render-server binary with:
-==>   systemctl --user daemon-reload
-==>   systemctl --user restart render-server.service
-==> ('restart', not 'start'/'enable --now' -- the service is already
-==> running from before, so those would leave the old binary in place.)
+==> render-server binary for this session with:
+==>   pkill -x render-server; render-server &
+==> (Already-ticked "Launch at login" needs no changes -- it just points
+==> at /usr/bin/render-server, which is now the new binary.)
 EOF
 }
 
 pre_remove() {
     cat <<EOF
 ==> To fully remove WP Linux, also run as your normal user:
-==>   systemctl --user disable --now render-server.service
+==>   pkill -x render-server
+==>   rm -f ~/.config/autostart/dev.wplinux.render-server.desktop
 ==>   kwriteconfig6 --file kwinrc --group Plugins --key dev.wplinux.cursorbridgeEnabled --type bool false
 EOF
 }

@@ -69,7 +69,6 @@ else (X11, GNOME, other compositors) is supported or planned right now.
 | `crates/wp_linux_editor` | Desktop app (egui) for building and editing wallpaper projects, with the live preview. |
 | `plasma/plasma-plugin` | The Plasma "Wallpaper" plugin you pick in System Settings; talks to `render-server`. |
 | `plasma/kwin-script` | KWin script forwarding the true global cursor position to `render-server` over D-Bus. |
-| `systemd/` | User-service unit that keeps `render-server` running in the background. |
 
 ## Requirements
 
@@ -86,9 +85,11 @@ else (X11, GNOME, other compositors) is supported or planned right now.
 
 Downloads the latest release archive and sets everything up under
 `$HOME` -- binaries in `~/.local/bin`, the two KDE packages via
-`kpackagetool6`, the KWin script enabled, and `render-server` installed
-as a `systemd --user` service (`~/.config/systemd/user/`) so it starts
-automatically with your graphical session.
+`kpackagetool6`, the KWin script enabled, and `render-server` registered
+to autostart via an XDG autostart `.desktop` file (`~/.config/autostart/`)
+so it starts automatically with your graphical session -- no systemd
+dependency. Toggle this later from `wp_linux_editor` itself with the
+"Launch at login" checkbox on the Wallpapers tab.
 
 ```sh
 curl -fsSL https://github.com/AzimovIz/WP_Linux/releases/latest/download/install.sh | bash
