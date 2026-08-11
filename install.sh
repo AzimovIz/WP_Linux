@@ -7,8 +7,8 @@
 # regardless of init system -- and then hands off to whichever
 # adapters/<desktop>/install.sh matches the desktop you're running, which
 # installs whatever that desktop needs to actually show the render as
-# your wallpaper (see adapters/kde for the one implementation that exists
-# today). No root required -- everything lands under $HOME.
+# your wallpaper (see adapters/kde and adapters/gnome). No root required
+# -- everything lands under $HOME.
 #
 # For Arch Linux, prefer packaging/archlinux/PKGBUILD instead (system-wide
 # install via pacman).
@@ -93,10 +93,9 @@ de="$(detect_de)"
 if [ "$de" = "kde" ] || { [ "$de" = "unknown" ] && command -v kpackagetool6 >/dev/null 2>&1; }; then
     log "detected KDE Plasma -- running its adapter install step"
     bash "$pkgroot/adapters/kde/install.sh" "$pkgroot"
-elif [ "$de" = "gnome" ]; then
-    warn "GNOME support isn't implemented yet (see adapters/gnome/README.md)."
-    warn "render-server and the editor are installed below, but nothing will show the"
-    warn "wallpaper on your desktop until a GNOME adapter exists."
+elif [ "$de" = "gnome" ] || { [ "$de" = "unknown" ] && command -v gnome-extensions >/dev/null 2>&1; }; then
+    log "detected GNOME -- running its adapter install step"
+    bash "$pkgroot/adapters/gnome/install.sh" "$pkgroot"
 else
     warn "no supported desktop adapter for \$XDG_CURRENT_DESKTOP=${XDG_CURRENT_DESKTOP:-<unset>}."
     warn "render-server and the editor are installed below regardless; see adapters/ for what's supported."

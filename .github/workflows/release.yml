@@ -50,7 +50,7 @@ jobs:
       # Single archive, laid out the way install.sh/PKGBUILD expect:
       #   bin/{render-server,player,wp_linux_editor}
       #   adapters/kde/{plasma-plugin,kwin-script}/package  (kpackagetool6-ready)
-      #   adapters/gnome/  (placeholder, no adapter implemented yet)
+      #   adapters/gnome/extension/  (GNOME Shell extension, gnome-extensions-ready)
       #   dev.wplinux.editor.desktop  (Exec= has an @EDITOR_BIN@ placeholder,
       #                                 filled in by install.sh/PKGBUILD)
       #   assets/{wp_linux_editor_128.png,wp_linux_editor_256.png,wp_linux_editor.svg}

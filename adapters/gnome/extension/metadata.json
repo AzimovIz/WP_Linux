@@ -1,0 +1,14 @@
+{
+    "uuid": "wp-linux@wplinux.dev",
+    "name": "WP Linux Wallpaper",
+    "description": "Displays an animated or cursor-reactive wallpaper project (built with the WP Linux editor) rendered by render-server, behind desktop windows, and forwards the cursor position to it. GNOME Shell equivalent of adapters/kde's Plasma wallpaper plugin + KWin cursor-bridge script.",
+    "url": "https://github.com/AzimovIz/WP_Linux",
+    "version-name": "0.1.0",
+    "shell-version": [
+        "45",
+        "46",
+        "47",
+        "48",
+        "49"
+    ]
+}
