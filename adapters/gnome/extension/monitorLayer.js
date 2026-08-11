@@ -1,24 +1,32 @@
-// One instance per connected monitor -- owns the Clutter actor that
-// shows that monitor's render-server output, and drives the same three
-// jobs adapters/kde/plasma-plugin's main.qml does per wallpaper item:
-// push this monitor's placement (`/geometry`), poll whether a new frame
-// is ready (`/meta`), and fetch+display it (`/frame`) when it is.
+// One instance per connected monitor -- owns the widget that shows that
+// monitor's render-server output, and drives the same three jobs
+// adapters/kde/plasma-plugin's main.qml does per wallpaper item: push
+// this monitor's placement (`/geometry`), poll whether a new frame is
+// ready (`/meta`), and fetch+display it (`/frame`) when it is.
 //
 // Unlike main.qml, there's no separate "xray needs the true global
 // cursor" wiring here -- that's cursorForwarder.js, shared by every
 // monitor, same as adapters/kde splits it into a separate KWin script.
+//
+// Frames are written to a temp file and shown via St's CSS
+// `background-image`, not `Clutter.Image`/raw `Cogl` pixel upload --
+// `new Clutter.Image()` throws "not a constructor" on GNOME Shell 50
+// (confirmed on real hardware), i.e. that low-level content API isn't
+// stable across Mutter versions. `St.Widget.set_style()` +
+// `background-image`/`background-size` is the same mechanism GNOME
+// Shell's own theming uses everywhere and has been stable for a very
+// long time, at the cost of a disk write per frame (see _fetchFrame).
 
-import Clutter from 'gi://Clutter';
-import Cogl from 'gi://Cogl';
 import Gio from 'gi://Gio';
-import GdkPixbuf from 'gi://GdkPixbuf';
+import GLib from 'gi://GLib';
+import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 const DEFAULT_FPS = 30;
 const MIN_POLL_INTERVAL_MS = 8;
 
 /**
- * Where to insert each monitor's render actor. `_backgroundGroup` sits
+ * Where to insert each monitor's render widget. `_backgroundGroup` sits
  * below `global.window_group` (real windows) but above nothing else --
  * i.e. exactly where GNOME Shell's own desktop background lives, which
  * is the same "behind everything, itself opaque" spot
@@ -32,20 +40,17 @@ function backgroundContainer() {
     return Main.layoutManager._backgroundGroup;
 }
 
+/** Filesystem-safe version of a connector name for use in a temp filename -- connector names are normally already plain (`DP-1`, `eDP-1`, `Virtual-1`), this is just insurance against a stranger one. */
+function sanitizeForFilename(name) {
+    return name.replace(/[^A-Za-z0-9_-]/g, '_');
+}
+
 export class MonitorLayer {
     constructor(connector, client) {
         this._connector = connector;
         this._client = client;
 
-        // RESIZE_FILL stretches to the actor's exact allocated size rather
-        // than cropping like main.qml's Image.PreserveAspectCrop does --
-        // Clutter has no built-in "cover" gravity. Only visibly differs
-        // from KDE when a project's canvas resolution doesn't match this
-        // monitor's, which normally doesn't happen (projects are authored
-        // for a specific monitor's resolution).
-        this._actor = new Clutter.Actor({
-            content_gravity: Clutter.ContentGravity.RESIZE_FILL,
-        });
+        this._actor = new St.Widget();
         backgroundContainer().add_child(this._actor);
 
         this._rect = null; // {x, y, width, height}, last pushed to render-server
@@ -57,6 +62,19 @@ export class MonitorLayer {
         this._frameInFlight = false;
         this._cancellable = new Gio.Cancellable();
         this._destroyed = false;
+
+        // Two on-disk slots, ping-ponged so a frame currently referenced
+        // by the actor's style is never the one being overwritten --
+        // same reasoning as main.qml's imgA/imgB double buffer, just one
+        // level down (files instead of Image elements) since St's CSS
+        // background-image loader has no equivalent of Qt Quick's
+        // asynchronous decode-then-swap.
+        const runtimeDir = GLib.get_user_runtime_dir();
+        const base = sanitizeForFilename(connector);
+        this._frameSlotPaths = [0, 1].map(
+            i => GLib.build_filenamev([runtimeDir, `wp-linux-frame-${base}-${i}.tmp`]));
+        this._activeSlot = 0;
+        this._haveFrame = false;
 
         this._schedulePoll();
         // Don't wait a full interval for the first /meta -- matches
@@ -70,6 +88,13 @@ export class MonitorLayer {
         if (this._pollIntervalId) {
             clearInterval(this._pollIntervalId);
             this._pollIntervalId = null;
+        }
+        for (const path of this._frameSlotPaths) {
+            try {
+                Gio.File.new_for_path(path).delete(null);
+            } catch (e) {
+                // Never written, or already gone -- fine either way.
+            }
         }
         this._actor.destroy();
     }
@@ -86,9 +111,16 @@ export class MonitorLayer {
         const unchanged = this._rect
             && this._rect.x === rect.x && this._rect.y === rect.y
             && this._rect.width === rect.width && this._rect.height === rect.height;
+        const sizeChanged = !this._rect
+            || this._rect.width !== rect.width || this._rect.height !== rect.height;
         this._rect = rect;
         if (!unchanged)
             this._pushGeometry();
+        // Resize target changed -- reapply so the currently-shown frame
+        // (if any) stretches to the new size instead of the old one
+        // until the next frame happens to arrive.
+        if (sizeChanged && this._haveFrame)
+            this._applyStyle(this._frameSlotPaths[this._activeSlot]);
     }
 
     _pushGeometry() {
@@ -99,6 +131,22 @@ export class MonitorLayer {
             `/geometry?monitor=${encodeURIComponent(this._connector)}`,
             `${x},${y},${width},${height}`,
             this._cancellable);
+    }
+
+    _applyStyle(path) {
+        const uri = GLib.filename_to_uri(path, null);
+        // Plain pixel dimensions rather than the `cover`/`100%` CSS
+        // keywords -- St's CSS engine is a limited subset of real CSS
+        // and length values are the one thing every version of it is
+        // certain to support. Stretches rather than crops, same
+        // documented tradeoff as before (no built-in "cover" here
+        // either); only visibly differs from KDE's PreserveAspectCrop
+        // when a project's canvas resolution doesn't match this
+        // monitor's.
+        const size = this._rect
+            ? `${Math.round(this._rect.width)}px ${Math.round(this._rect.height)}px` : 'contain';
+        this._actor.set_style(
+            `background-image: url("${uri}"); background-size: ${size};`);
     }
 
     _schedulePoll() {
@@ -152,10 +200,10 @@ export class MonitorLayer {
 
     async _fetchFrame() {
         // Dropping a refresh request while the previous one is still
-        // being fetched/decoded just means the next poll tick offers the
+        // being fetched/written just means the next poll tick offers the
         // (by then newer) frame again -- same tradeoff main.qml's
         // framePoll.refresh() makes, for the same reason: never let
-        // fetches pile up faster than they can be decoded.
+        // fetches pile up faster than they can be handled.
         if (this._frameInFlight)
             return;
         this._frameInFlight = true;
@@ -166,14 +214,20 @@ export class MonitorLayer {
             if (this._destroyed || !bytes)
                 return;
 
-            const image = imageFromEncodedBytes(bytes);
-            if (image) {
-                try {
-                    this._actor.set_content(image);
-                } catch (e) {
-                    console.error(`wp-linux: set_content failed for monitor ${this._connector}: ${e}`);
-                }
+            const targetSlot = 1 - this._activeSlot;
+            const path = this._frameSlotPaths[targetSlot];
+            try {
+                Gio.File.new_for_path(path).replace_contents(
+                    bytes.get_data(), null, false,
+                    Gio.FileCreateFlags.REPLACE_DESTINATION, null);
+            } catch (e) {
+                console.error(`wp-linux: couldn't write frame to ${path}: ${e}`);
+                return;
             }
+
+            this._activeSlot = targetSlot;
+            this._haveFrame = true;
+            this._applyStyle(path);
         } catch (e) {
             // getBytes() itself never rejects -- this is here so a bug
             // anywhere else in this function surfaces as a logged error
@@ -184,33 +238,4 @@ export class MonitorLayer {
             this._frameInFlight = false;
         }
     }
-}
-
-/** Decodes a PNG (static project) or BMP (dynamic project) frame -- see main.rs's `/frame` doc comment for which -- into a `Clutter.Image` ready to hand to `Clutter.Actor.set_content()`. GdkPixbuf sniffs the format itself, so the caller never needs to know which one it got. */
-function imageFromEncodedBytes(bytes) {
-    let pixbuf;
-    try {
-        const loader = new GdkPixbuf.PixbufLoader();
-        loader.write_bytes(bytes);
-        loader.close();
-        pixbuf = loader.get_pixbuf();
-    } catch (e) {
-        console.error(`wp-linux: couldn't decode frame bytes (PNG/BMP): ${e}`);
-        return null;
-    }
-    if (!pixbuf)
-        return null;
-
-    const image = new Clutter.Image();
-    const format = pixbuf.get_has_alpha()
-        ? Cogl.PixelFormat.RGBA_8888 : Cogl.PixelFormat.RGB_888;
-    try {
-        image.set_bytes(
-            pixbuf.read_pixel_bytes(), format,
-            pixbuf.get_width(), pixbuf.get_height(), pixbuf.get_rowstride());
-    } catch (e) {
-        console.error(`wp-linux: Clutter.Image.set_bytes failed: ${e}`);
-        return null;
-    }
-    return image;
 }
