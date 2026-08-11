@@ -59,18 +59,22 @@ export class CursorForwarder {
         if (this._callCount % 30 === 0)
             console.debug(`wp-linux cursorbridge: sending ${x},${y} (call #${this._callCount})`);
 
-        this._connection.call(
-            BUS_NAME, OBJECT_PATH, INTERFACE_NAME, 'SetCursorPosition',
-            new GLib.Variant('(ii)', [x, y]),
-            null, Gio.DBusCallFlags.NONE, -1, null,
-            (connection, result) => {
-                try {
-                    connection.call_finish(result);
-                } catch (e) {
-                    // render-server may not be running (yet) -- best
-                    // effort, exactly like the KWin script's own
-                    // callDBus try/catch.
-                }
-            });
+        try {
+            this._connection.call(
+                BUS_NAME, OBJECT_PATH, INTERFACE_NAME, 'SetCursorPosition',
+                new GLib.Variant('(ii)', [x, y]),
+                null, Gio.DBusCallFlags.NONE, -1, null,
+                (connection, result) => {
+                    try {
+                        connection.call_finish(result);
+                    } catch (e) {
+                        // render-server may not be running (yet) -- best
+                        // effort, exactly like the KWin script's own
+                        // callDBus try/catch.
+                    }
+                });
+        } catch (e) {
+            console.error(`wp-linux cursorbridge: call() threw: ${e}`);
+        }
     }
 }

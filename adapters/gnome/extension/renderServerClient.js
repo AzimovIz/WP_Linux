@@ -25,37 +25,53 @@ export class RenderServerClient {
     /**
      * GET `path` (already including any query string) and resolve with
      * the response body as `GLib.Bytes`, or `null` on any failure
-     * (connection refused, non-200 status, cancellation). Never rejects
-     * -- every caller here treats "couldn't fetch" as "try again next
-     * poll", same as main.qml's XHR error handling.
+     * (connection refused, non-200 status, cancellation, or an
+     * unexpected exception building/sending the request -- logged via
+     * console.error in that last case, since it points at a bug here
+     * rather than an ordinary "render-server isn't up yet"). Never
+     * rejects -- every caller here treats "couldn't fetch" as "try
+     * again next poll", same as main.qml's XHR error handling.
      */
     getBytes(path, cancellable = null) {
         if (!this._session)
             return Promise.resolve(null);
 
-        const message = Soup.Message.new('GET', `${BASE_URL}${path}`);
-        if (!message)
-            return Promise.resolve(null);
+        try {
+            const message = Soup.Message.new('GET', `${BASE_URL}${path}`);
+            if (!message)
+                return Promise.resolve(null);
 
-        return new Promise(resolve => {
-            this._session.send_and_read_async(
-                message, GLib.PRIORITY_DEFAULT, cancellable,
-                (session, result) => {
-                    try {
-                        const bytes = session.send_and_read_finish(result);
-                        if (message.get_status() !== Soup.Status.OK) {
-                            resolve(null);
-                            return;
-                        }
-                        resolve(bytes);
-                    } catch (e) {
-                        // Includes Gio.IOErrorEnum.CANCELLED -- callers
-                        // that pass a cancellable already know to ignore
-                        // a `null` result in that case.
-                        resolve(null);
-                    }
-                });
-        });
+            return new Promise(resolve => {
+                try {
+                    this._session.send_and_read_async(
+                        message, GLib.PRIORITY_DEFAULT, cancellable,
+                        (session, result) => {
+                            try {
+                                const bytes = session.send_and_read_finish(result);
+                                if (message.get_status() !== Soup.Status.OK) {
+                                    resolve(null);
+                                    return;
+                                }
+                                resolve(bytes);
+                            } catch (e) {
+                                // Includes Gio.IOErrorEnum.CANCELLED --
+                                // callers that pass a cancellable already
+                                // know to ignore a `null` result in that
+                                // case; anything else here is just
+                                // render-server being unreachable this
+                                // tick, not worth logging every poll.
+                                resolve(null);
+                            }
+                        });
+                } catch (e) {
+                    console.error(`wp-linux: GET ${path} threw calling send_and_read_async: ${e}`);
+                    resolve(null);
+                }
+            });
+        } catch (e) {
+            console.error(`wp-linux: GET ${path} threw building the request: ${e}`);
+            return Promise.resolve(null);
+        }
     }
 
     async getJson(path, cancellable = null) {
@@ -65,6 +81,7 @@ export class RenderServerClient {
         try {
             return JSON.parse(new TextDecoder().decode(bytes.get_data()));
         } catch (e) {
+            console.error(`wp-linux: couldn't parse JSON from ${path}: ${e}`);
             return null;
         }
     }
@@ -74,23 +91,33 @@ export class RenderServerClient {
         if (!this._session)
             return Promise.resolve();
 
-        const message = Soup.Message.new('POST', `${BASE_URL}${path}`);
-        if (!message)
-            return Promise.resolve();
-        message.set_request_body_from_bytes(
-            'text/plain', GLib.Bytes.new(new TextEncoder().encode(body)));
+        try {
+            const message = Soup.Message.new('POST', `${BASE_URL}${path}`);
+            if (!message)
+                return Promise.resolve();
+            message.set_request_body_from_bytes(
+                'text/plain', GLib.Bytes.new(new TextEncoder().encode(body)));
 
-        return new Promise(resolve => {
-            this._session.send_and_read_async(
-                message, GLib.PRIORITY_DEFAULT, cancellable,
-                (session, result) => {
-                    try {
-                        session.send_and_read_finish(result);
-                    } catch (e) {
-                        // best-effort, see class doc comment
-                    }
+            return new Promise(resolve => {
+                try {
+                    this._session.send_and_read_async(
+                        message, GLib.PRIORITY_DEFAULT, cancellable,
+                        (session, result) => {
+                            try {
+                                session.send_and_read_finish(result);
+                            } catch (e) {
+                                // best-effort, see method doc comment
+                            }
+                            resolve();
+                        });
+                } catch (e) {
+                    console.error(`wp-linux: POST ${path} threw calling send_and_read_async: ${e}`);
                     resolve();
-                });
-        });
+                }
+            });
+        } catch (e) {
+            console.error(`wp-linux: POST ${path} threw building the request: ${e}`);
+            return Promise.resolve();
+        }
     }
 }

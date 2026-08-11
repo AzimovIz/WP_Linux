@@ -140,6 +140,11 @@ export class MonitorLayer {
                 this._lastFrameId = meta.frame_id;
                 this._fetchFrame();
             }
+        } catch (e) {
+            // Shouldn't happen -- getJson() itself never rejects -- but
+            // catch here too rather than let it become a silent unhandled
+            // rejection (see _fetchFrame's own doc comment on the same).
+            console.error(`wp-linux: _poll for monitor ${this._connector} threw: ${e}`);
         } finally {
             this._pollInFlight = false;
         }
@@ -162,8 +167,19 @@ export class MonitorLayer {
                 return;
 
             const image = imageFromEncodedBytes(bytes);
-            if (image)
-                this._actor.set_content(image);
+            if (image) {
+                try {
+                    this._actor.set_content(image);
+                } catch (e) {
+                    console.error(`wp-linux: set_content failed for monitor ${this._connector}: ${e}`);
+                }
+            }
+        } catch (e) {
+            // getBytes() itself never rejects -- this is here so a bug
+            // anywhere else in this function surfaces as a logged error
+            // instead of a bare "Unhandled promise rejection" with no
+            // message (this method isn't awaited by its caller, _poll).
+            console.error(`wp-linux: _fetchFrame for monitor ${this._connector} threw: ${e}`);
         } finally {
             this._frameInFlight = false;
         }
@@ -179,6 +195,7 @@ function imageFromEncodedBytes(bytes) {
         loader.close();
         pixbuf = loader.get_pixbuf();
     } catch (e) {
+        console.error(`wp-linux: couldn't decode frame bytes (PNG/BMP): ${e}`);
         return null;
     }
     if (!pixbuf)
@@ -192,6 +209,7 @@ function imageFromEncodedBytes(bytes) {
             pixbuf.read_pixel_bytes(), format,
             pixbuf.get_width(), pixbuf.get_height(), pixbuf.get_rowstride());
     } catch (e) {
+        console.error(`wp-linux: Clutter.Image.set_bytes failed: ${e}`);
         return null;
     }
     return image;
