@@ -7,9 +7,10 @@
 </p>
 
 An animated, interactive wallpaper engine for Linux -- a Wallpaper Engine-style
-alternative for **KDE Plasma 6 on Wayland (KWin)**. Build a layer stack
-(static pictures, looping GIFs, cursor-reactive "xray"/parallax overlays) in a
-small GPU-accelerated editor, then run it as your desktop wallpaper.
+alternative for **KDE Plasma 6 on Wayland (KWin)**, with experimental
+**GNOME Shell 45+ (Wayland)** support. Build a layer stack (static pictures,
+looping GIFs, cursor-reactive "xray"/parallax overlays) in a small
+GPU-accelerated editor, then run it as your desktop wallpaper.
 
 ## Screenshots
 
@@ -31,10 +32,13 @@ used here for demonstration only -- not original work, all rights remain with it
 
 ## Status
 
-Early stage. The renderer and editor (`crates/`) are desktop-agnostic, but
-the only desktop adapter that actually exists yet is **KDE Plasma 6 +
-KWin/Wayland** (`adapters/kde`). A GNOME/Wayland adapter is in progress
-(`adapters/gnome`); other desktops aren't supported yet.
+Early stage. The renderer and editor (`crates/`) are desktop-agnostic.
+**KDE Plasma 6 + KWin/Wayland** (`adapters/kde`) is the stable, well-exercised
+adapter. **GNOME Shell 45+ on Wayland** (`adapters/gnome`) also works now, but
+is new and comes with real rough edges -- see
+[adapters/gnome/README.md](adapters/gnome/README.md) and this file's own
+[Known limitations](#known-limitations) below before relying on it. Other
+desktops aren't supported yet.
 
 ## Features
 
@@ -71,13 +75,16 @@ KWin/Wayland** (`adapters/kde`). A GNOME/Wayland adapter is in progress
 | `crates/wp_linux_editor` | Desktop app (egui) for building and editing wallpaper projects, with the live preview. |
 | `adapters/kde/plasma-plugin` | The Plasma "Wallpaper" plugin you pick in System Settings; talks to `render-server`. |
 | `adapters/kde/kwin-script` | KWin script forwarding the true global cursor position to `render-server` over D-Bus. |
-| `adapters/gnome` | Placeholder for a GNOME/Wayland adapter -- not implemented yet. |
+| `adapters/gnome/extension` | GNOME Shell extension doing both of the above jobs in one process (GJS) -- see [adapters/gnome/README.md](adapters/gnome/README.md). |
 
 ## Requirements
 
-- KDE Plasma 6 running on Wayland (KWin).
+- **KDE Plasma 6 on Wayland (KWin)**, or **GNOME Shell 45+ on Wayland**
+  (experimental -- see [Known limitations](#known-limitations)).
 - A GPU with Vulkan or OpenGL/EGL support.
-- `kpackagetool6` (ships with Plasma) to install the two KDE packages below.
+- KDE: `kpackagetool6` (ships with Plasma) to install the two KDE packages.
+- GNOME: `gnome-extensions` (ships with GNOME Shell) to install/enable the
+  extension.
 - Optional: `power-profiles-daemon`, for the automatic power-saver freeze --
   without it `render-server` just always renders continuously.
 - To build from source: a recent stable Rust toolchain (edition 2024).
@@ -87,12 +94,13 @@ KWin/Wayland** (`adapters/kde`). A GNOME/Wayland adapter is in progress
 ### Option A: install script (any distro)
 
 Downloads the latest release archive and sets everything up under
-`$HOME` -- binaries in `~/.local/bin`, the two KDE packages via
-`kpackagetool6`, the KWin script enabled, and `render-server` registered
-to autostart via an XDG autostart `.desktop` file (`~/.config/autostart/`)
-so it starts automatically with your graphical session -- no systemd
-dependency. Toggle this later from `wp_linux_editor` itself with the
-"Launch at login" checkbox on the Wallpapers tab.
+`$HOME` -- binaries in `~/.local/bin`, the desktop-specific integration
+(KDE: the two Plasma/KWin packages via `kpackagetool6`; GNOME: the Shell
+extension via `gnome-extensions`, auto-detected from `$XDG_CURRENT_DESKTOP`),
+and `render-server` registered to autostart via an XDG autostart `.desktop`
+file (`~/.config/autostart/`) so it starts automatically with your graphical
+session -- no systemd dependency. Toggle this later from `wp_linux_editor`
+itself with the "Launch at login" checkbox on the Wallpapers tab.
 
 ```sh
 curl -fsSL https://github.com/AzimovIz/WP_Linux/releases/latest/download/install.sh | bash
@@ -118,6 +126,8 @@ system-wide `pacman` install (binaries in `/usr/bin`, KDE packages under
 `/usr/share`). After installing, finish the per-user setup steps printed
 by the package (enabling the KWin script and the `render-server` user
 service) -- these can't happen automatically from a root install step.
+GNOME isn't packaged here yet (KDE only) -- use Option A on Arch + GNOME
+for now.
 
 ### Option C: build from source
 
@@ -141,18 +151,41 @@ D-Bus interface, so you don't need to reinstall the KPackage on every
 change -- run it by hand once per KWin restart. Not needed for a normal
 install, where the KPackage install above is enough.)
 
+On GNOME, install the extension by copying it into place and enabling it
+(there's no `dev-load`-style script yet -- see
+[adapters/gnome/README.md](adapters/gnome/README.md#development)):
+
+```sh
+mkdir -p ~/.local/share/gnome-shell/extensions/wp-linux@wplinux.dev
+cp -r adapters/gnome/extension/. ~/.local/share/gnome-shell/extensions/wp-linux@wplinux.dev/
+gnome-extensions enable wp-linux@wplinux.dev
+```
+
+Log out and back in afterwards -- GNOME Shell only picks up a brand new
+extension on a fresh start.
+
 ## Usage
 
 1. Run `wp_linux_editor`, build a layer stack (Image / Gif / Xray / Parallax), and
    save it as a project folder.
 2. Make sure `render-server` is running (the install script sets it up as
    a background service; from a source build, run it by hand).
-3. Right-click the desktop -> **Configure Desktop and Wallpaper** (or
-   **System Settings -> Appearance -> Wallpaper**), choose **WP Linux
+3. **KDE**: Right-click the desktop -> **Configure Desktop and Wallpaper**
+   (or **System Settings -> Appearance -> Wallpaper**), choose **WP Linux
    Wallpaper**, then point it at the project folder you saved. Each
    monitor has its own wallpaper config in Plasma, so different screens
    can point at entirely different projects (e.g. parallax on one,
    xray on another).
+
+   **GNOME**: nothing to pick on the desktop side -- there's no wallpaper
+   picker UI. As long as the extension is enabled (the install script does
+   this for you), assigning a project to a monitor from `wp_linux_editor`'s
+   Wallpapers tab is enough; the extension shows whatever render-server has
+   loaded for each monitor. To turn a GNOME wallpaper back off, disable the
+   whole extension for now (Extensions app, or
+   `gnome-extensions disable wp-linux@wplinux.dev`) -- see
+   [adapters/gnome/README.md](adapters/gnome/README.md) for why there's no
+   finer-grained toggle yet.
 
 ## Known limitations
 
@@ -162,6 +195,12 @@ install, where the KPackage install above is enough.)
   shares one cursor position across every output it draws to, unlike
   `render-server` which tracks each monitor's project and cursor
   independently.
+- The GNOME adapter (`adapters/gnome`) is new and experimental -- see
+  [adapters/gnome/README.md](adapters/gnome/README.md) for its full list of
+  known issues (no aspect-ratio-correct cropping, frames round-trip through
+  a temp file, `metadata.json` needs a version bump on every new GNOME
+  release, the Overview workspace preview integration is best-effort and can
+  silently stop working, and more).
 
 ## License
 
