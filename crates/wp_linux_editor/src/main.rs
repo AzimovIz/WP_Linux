@@ -1536,6 +1536,35 @@ impl EditorApp {
         ui: &mut eframe::egui::Ui,
         render_state: Option<&eframe::egui_wgpu::RenderState>,
     ) {
+        // Reserved as a bottom panel *before* the central content below is
+        // laid out, so the status line stays pinned to the bottom of the
+        // preview column with the image sized to whatever's left above it,
+        // rather than trailing immediately after the image with a ragged
+        // gap underneath (the previous plain top-down `ui.label` did the
+        // latter).
+        if !self.status.is_empty() {
+            eframe::egui::Panel::bottom("preview_status")
+                .show_separator_line(false)
+                .show(ui, |ui| {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    ui.label(&self.status);
+                });
+        }
+
+        eframe::egui::CentralPanel::default()
+            .frame(eframe::egui::Frame::NONE)
+            .show(ui, |ui| {
+                self.show_preview_content(ui, render_state);
+            });
+    }
+
+    fn show_preview_content(
+        &mut self,
+        ui: &mut eframe::egui::Ui,
+        render_state: Option<&eframe::egui_wgpu::RenderState>,
+    ) {
         ui.heading("Preview");
         ui.add_space(4.0);
 
@@ -1697,16 +1726,6 @@ impl EditorApp {
         if let Some(err) = &self.preview_error {
             ui.add_space(4.0);
             ui.colored_label(eframe::egui::Color32::RED, err);
-        }
-
-        // Last New/Open/Save result -- shown under the preview rather
-        // than under the sidebar's layer list/settings, so it stays
-        // visible regardless of how tall those get.
-        if !self.status.is_empty() {
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(8.0);
-            ui.label(&self.status);
         }
     }
 }
