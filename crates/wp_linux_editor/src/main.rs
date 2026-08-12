@@ -1470,87 +1470,23 @@ impl EditorApp {
     /// regardless of how many sliders (and, once M4 lands, how deep an
     /// effect stack) any single layer's own settings need.
     fn show_layers_panel(&mut self, ui: &mut eframe::egui::Ui) {
-        // New/Open/Save first -- the actions that reset, load, or persist
-        // everything below them, so they lead rather than trail the form.
-        ui.horizontal(|ui| {
-            if ui.button("New").clicked() {
-                self.new_project();
-            }
-
-            ui.menu_button("Open", |ui| {
-                if self.library.is_empty() {
-                    ui.label("Library is empty.");
-                }
-                for entry in self.library.clone() {
-                    let display_name = if entry.name.is_empty() {
-                        entry.id.clone()
-                    } else {
-                        entry.name.clone()
-                    };
-                    if ui.button(display_name).clicked() {
-                        self.open_library_entry(&entry);
-                        ui.close();
-                    }
-                }
-            });
-
-            let can_save =
-                !self.layers.is_empty() && self.layers.iter().all(EditorLayer::is_complete);
-            let save_label = if self.current_project_id.is_some() {
-                "Save"
-            } else {
-                "Save (new)"
-            };
-            if ui
-                .add_enabled(can_save, eframe::egui::Button::new(save_label))
-                .clicked()
-            {
-                let id = self
-                    .current_project_id
-                    .clone()
-                    .unwrap_or_else(library::new_project_id);
-                let dir = library::project_dir(&id);
-                match save_project(
-                    &dir,
-                    &self.layers,
-                    self.fps,
-                    &self.current_project_name,
-                    &self.current_project_description,
-                ) {
-                    Ok(()) => {
-                        // Auto-trust: the user just typed this command
-                        // themselves and saved it, which is exactly the
-                        // self-authoring context that makes a separate
-                        // consent dialog unnecessary in this pass (see
-                        // `trust_store`'s module doc comment). Without
-                        // this, render-server would refuse to ever run
-                        // it, even though it was authored here.
-                        let has_command_layer = self.layers.iter().any(|layer| {
-                            matches!(layer, EditorLayer::Text { source, .. } if source.is_command())
-                        });
-                        if has_command_layer && let Err(e) = trust_store::mark_trusted(&id) {
-                            eprintln!("editor: failed to update the trust store for {id:?}: {e}");
-                        }
-                        self.current_project_id = Some(id);
-                        if let Some(preview) = &self.preview
-                            && let Err(e) =
-                                generate_thumbnail(preview, &dir.join(library::PREVIEW_FILE_NAME))
-                        {
-                            eprintln!("editor: failed to generate thumbnail for {dir:?}: {e}");
-                        }
-                        self.rescan_library();
-                        self.status = format!("Saved to {}", dir.display());
-                    }
-                    Err(e) => self.status = format!("Failed to save: {e}"),
-                }
-            }
-        });
-
-        ui.add_space(8.0);
-
+        // Name and FPS share a row -- FPS's label shortened to just
+        // "FPS" (the fuller explanation moved to a tooltip, so nothing
+        // is actually lost) since there's no longer room for its old
+        // "Target FPS (animated/cursor layers only):" wording next to
+        // Name on the same line. New/Open/Save used to lead here, but
+        // moved up to sit level with the "Preview" heading instead (see
+        // `show_preview_content`) -- freeing this whole row was the
+        // point, not just relabeling FPS.
         ui.horizontal(|ui| {
             ui.label("Name:");
-            ui.text_edit_singleline(&mut self.current_project_name);
+            ui.add(
+                eframe::egui::TextEdit::singleline(&mut self.current_project_name)
+                    .desired_width(120.0),
+            );
+            ui.add_space(8.0);
+            ui.label("FPS:").on_hover_text("Used by render-server once this project is loaded there -- doesn't affect the preview on the left, which always redraws at a fixed rate.");
+            scroll_slider(ui, &mut self.fps, 1..=60);
         });
 
         ui.add_space(2.0);
@@ -1576,17 +1512,9 @@ impl EditorApp {
                 );
             });
 
-        ui.add_space(2.0);
-
-        ui.horizontal(|ui| {
-                ui.label("Target FPS (animated/cursor layers only):")
-                    .on_hover_text("Used by render-server once this project is loaded there -- doesn't affect the preview on the left, which always redraws at a fixed rate.");
-                scroll_slider(ui, &mut self.fps, 1..=60);
-            });
-
-        ui.add_space(8.0);
-        ui.label("Layers are drawn bottom to top -- the first one in the list is furthest back.");
         ui.add_space(4.0);
+        ui.label("Layers are drawn bottom to top -- the first one in the list is furthest back.");
+        ui.add_space(2.0);
 
         // Wrapped, not a plain `horizontal` -- five un-wrapped buttons
         // would need more width than this panel's own configured
@@ -1647,11 +1575,19 @@ impl EditorApp {
             }
         });
 
-        ui.add_space(8.0);
+        ui.add_space(4.0);
 
         let mut move_up = None;
         let mut move_down = None;
         let mut remove = None;
+
+        // Tighter than the ambient default (`ui.spacing().item_spacing.y`,
+        // ~3px) -- with only ~4 rows visible at once before scrolling,
+        // every pixel of gap between them is one the user has to scroll
+        // an extra layer's worth to get back. `list_height` uses the
+        // same constant so the ScrollArea's own height stays sized for
+        // exactly 4 rows at this tighter spacing, not the looser default.
+        const LAYER_LIST_ROW_SPACING: f32 = 1.0;
 
         // Capped to ~4 rows regardless of how many layers there are --
         // same reasoning and the same kind of approximation as the
@@ -1667,13 +1603,14 @@ impl EditorApp {
             .interact_size
             .y
             .max(ui.text_style_height(&eframe::egui::TextStyle::Body));
-        let list_height = (row_height + ui.spacing().item_spacing.y) * 4.0;
+        let list_height = (row_height + LAYER_LIST_ROW_SPACING) * 4.0;
 
         eframe::egui::ScrollArea::vertical()
             .id_salt("layer_list_scroll")
             .max_height(list_height)
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = LAYER_LIST_ROW_SPACING;
                 // `iter()`, not `iter_mut()` -- this row no longer draws
                 // the layer's own settings (that moved to
                 // `show_layer_settings_panel`), so nothing here needs to
@@ -1752,9 +1689,9 @@ impl EditorApp {
             };
         }
 
-        ui.add_space(8.0);
+        ui.add_space(2.0);
         ui.separator();
-        ui.add_space(8.0);
+        ui.add_space(2.0);
 
         // Settings for whichever layer is selected above -- stacked
         // below the list in this same sidebar column (master-detail),
@@ -1771,23 +1708,29 @@ impl EditorApp {
     /// `show_layers_panel`) shows a prompt instead of a panicking
     /// `layers[index]`.
     fn show_layer_settings_panel(&mut self, ui: &mut eframe::egui::Ui) {
-        ui.heading("Layer settings");
-        ui.add_space(4.0);
-
         let Some(index) = self.selected else {
+            ui.heading("Layer settings");
+            ui.add_space(2.0);
             ui.label("Select a layer on the left to edit its settings.");
             return;
         };
         let Some(layer) = self.layers.get_mut(index) else {
             self.selected = None;
+            ui.heading("Layer settings");
+            ui.add_space(2.0);
             ui.label("Select a layer on the left to edit its settings.");
             return;
         };
 
-        ui.strong(format!("#{} {}", index + 1, layer.label()));
-        ui.add_space(4.0);
+        // Combined into one heading (rather than a generic "Layer
+        // settings" heading followed by a separate "#N Kind" line) --
+        // the layer list above already shows which one's selected, so
+        // repeating it on its own line was just extra vertical space
+        // for no new information.
+        ui.heading(format!("Layer settings \u{2014} #{} {}", index + 1, layer.label()));
+        ui.add_space(2.0);
         ui.separator();
-        ui.add_space(8.0);
+        ui.add_space(2.0);
 
         // Fills whatever's left in the sidebar column (`auto_shrink`'s
         // height axis is `false`, not `true`) rather than shrinking to
@@ -1835,7 +1778,88 @@ impl EditorApp {
         ui: &mut eframe::egui::Ui,
         render_state: Option<&eframe::egui_wgpu::RenderState>,
     ) {
-        ui.heading("Preview");
+        // New/Open/Save share the heading's row now, rather than
+        // leading `show_layers_panel`'s own column below -- they used
+        // to cost that column a whole row, which mattered once the
+        // sidebar started running out of vertical room for the layer
+        // list/settings/effects. The actions themselves (reset, load,
+        // persist everything in `self.layers`) are unchanged, just
+        // relocated.
+        ui.horizontal(|ui| {
+            ui.heading("Preview");
+            ui.add_space(12.0);
+            if ui.button("New").clicked() {
+                self.new_project();
+            }
+
+            ui.menu_button("Open", |ui| {
+                if self.library.is_empty() {
+                    ui.label("Library is empty.");
+                }
+                for entry in self.library.clone() {
+                    let display_name = if entry.name.is_empty() {
+                        entry.id.clone()
+                    } else {
+                        entry.name.clone()
+                    };
+                    if ui.button(display_name).clicked() {
+                        self.open_library_entry(&entry);
+                        ui.close();
+                    }
+                }
+            });
+
+            let can_save =
+                !self.layers.is_empty() && self.layers.iter().all(EditorLayer::is_complete);
+            let save_label = if self.current_project_id.is_some() {
+                "Save"
+            } else {
+                "Save (new)"
+            };
+            if ui
+                .add_enabled(can_save, eframe::egui::Button::new(save_label))
+                .clicked()
+            {
+                let id = self
+                    .current_project_id
+                    .clone()
+                    .unwrap_or_else(library::new_project_id);
+                let dir = library::project_dir(&id);
+                match save_project(
+                    &dir,
+                    &self.layers,
+                    self.fps,
+                    &self.current_project_name,
+                    &self.current_project_description,
+                ) {
+                    Ok(()) => {
+                        // Auto-trust: the user just typed this command
+                        // themselves and saved it, which is exactly the
+                        // self-authoring context that makes a separate
+                        // consent dialog unnecessary in this pass (see
+                        // `trust_store`'s module doc comment). Without
+                        // this, render-server would refuse to ever run
+                        // it, even though it was authored here.
+                        let has_command_layer = self.layers.iter().any(|layer| {
+                            matches!(layer, EditorLayer::Text { source, .. } if source.is_command())
+                        });
+                        if has_command_layer && let Err(e) = trust_store::mark_trusted(&id) {
+                            eprintln!("editor: failed to update the trust store for {id:?}: {e}");
+                        }
+                        self.current_project_id = Some(id);
+                        if let Some(preview) = &self.preview
+                            && let Err(e) =
+                                generate_thumbnail(preview, &dir.join(library::PREVIEW_FILE_NAME))
+                        {
+                            eprintln!("editor: failed to generate thumbnail for {dir:?}: {e}");
+                        }
+                        self.rescan_library();
+                        self.status = format!("Saved to {}", dir.display());
+                    }
+                    Err(e) => self.status = format!("Failed to save: {e}"),
+                }
+            }
+        });
         ui.add_space(4.0);
 
         let Some(render_state) = render_state else {
@@ -2302,11 +2326,11 @@ fn show_effects_panel(
     effects: &mut Vec<EditorEffect>,
     selected_effect: &mut Option<usize>,
 ) {
-    ui.add_space(8.0);
+    ui.add_space(2.0);
     ui.separator();
-    ui.add_space(8.0);
+    ui.add_space(2.0);
     ui.strong("Effects");
-    ui.add_space(4.0);
+    ui.add_space(2.0);
 
     ui.horizontal_wrapped(|ui| {
         if ui.button("+ Vignette").clicked() {
@@ -2344,7 +2368,7 @@ fn show_effects_panel(
     let mut remove = None;
 
     for (index, effect) in effects.iter_mut().enumerate() {
-        ui.add_space(4.0);
+        ui.add_space(2.0);
         ui.group(|ui| {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut effect.enabled, "");
@@ -2376,9 +2400,9 @@ fn show_effects_panel(
                     },
                 );
             });
-            ui.add_space(4.0);
+            ui.add_space(2.0);
             show_effect_kind_panel(ui, &mut effect.kind);
-            ui.add_space(4.0);
+            ui.add_space(2.0);
             show_mask_panel(ui, &mut effect.mask);
         });
     }
