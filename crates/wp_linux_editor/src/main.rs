@@ -933,6 +933,17 @@ struct EditorApp {
     /// remove/reorder/reset) so it never points past the end or at the
     /// wrong layer after a reorder.
     selected: Option<usize>,
+    /// Index into the *selected layer's* `effects` list of whichever
+    /// effect is currently active for mask editing -- `None` until the
+    /// user clicks one in `show_effects_panel`. Drives the mask gizmo
+    /// (Circle/Gradient's `Transform2D`) drawn on top of the preview in
+    /// `show_preview_content`, same rationale as `selected` driving
+    /// Text's own gizmo. Reset to `None` any time `selected` itself
+    /// changes to point at a genuinely different layer (a new layer's
+    /// effect stack has nothing to do with whatever index was active on
+    /// the old one) -- but *not* on a plain layer reorder, which leaves
+    /// the selected layer's own identity (and its effects list) alone.
+    selected_effect: Option<usize>,
     fps: u32,
     status: String,
     preview: Option<Preview>,
@@ -963,6 +974,7 @@ impl Default for EditorApp {
             delete_overlay: None,
             layers: Vec::new(),
             selected: None,
+            selected_effect: None,
             fps: 30,
             status: String::new(),
             preview: None,
@@ -1419,6 +1431,7 @@ impl EditorApp {
     fn new_project(&mut self) {
         self.layers = Vec::new();
         self.selected = None;
+        self.selected_effect = None;
         self.fps = 30;
         self.current_project_id = None;
         self.current_project_name = String::new();
@@ -1434,6 +1447,7 @@ impl EditorApp {
             Ok((layers, fps, description)) => {
                 self.layers = layers;
                 self.selected = None;
+                self.selected_effect = None;
                 self.fps = fps;
                 self.current_project_id = Some(entry.id.clone());
                 self.current_project_name = entry.name.clone();
@@ -1585,6 +1599,7 @@ impl EditorApp {
                     effects: Vec::new(),
                 });
                 self.selected = Some(self.layers.len() - 1);
+                self.selected_effect = None;
             }
             if ui.button("+ Xray").clicked() {
                 self.layers.push(EditorLayer::Xray {
@@ -1594,6 +1609,7 @@ impl EditorApp {
                     effects: Vec::new(),
                 });
                 self.selected = Some(self.layers.len() - 1);
+                self.selected_effect = None;
             }
             if ui.button("+ Gif").clicked() {
                 self.layers.push(EditorLayer::Gif {
@@ -1601,6 +1617,7 @@ impl EditorApp {
                     effects: Vec::new(),
                 });
                 self.selected = Some(self.layers.len() - 1);
+                self.selected_effect = None;
             }
             if ui.button("+ Parallax").clicked() {
                 self.layers.push(EditorLayer::Parallax {
@@ -1610,6 +1627,7 @@ impl EditorApp {
                     effects: Vec::new(),
                 });
                 self.selected = Some(self.layers.len() - 1);
+                self.selected_effect = None;
             }
             if ui.button("+ Text").clicked() {
                 self.layers.push(EditorLayer::Text {
@@ -1625,6 +1643,7 @@ impl EditorApp {
                 // separately discover that clicking a layer's row below
                 // selects it.
                 self.selected = Some(self.layers.len() - 1);
+                self.selected_effect = None;
             }
         });
 
@@ -1676,6 +1695,7 @@ impl EditorApp {
                             .clicked()
                         {
                             self.selected = Some(index);
+                            self.selected_effect = None;
                         }
                         if ui.small_button("up").clicked() {
                             move_up = Some(index);
@@ -1702,6 +1722,14 @@ impl EditorApp {
                 Some(selected) if selected > index => Some(selected - 1),
                 other => other,
             };
+            // Only reset if the removed layer *was* the selected one
+            // (`selected` just went to `None` above) -- a shift-down or
+            // an unrelated layer's removal leaves the still-selected
+            // layer's own effects list, and therefore this index into
+            // it, untouched.
+            if self.selected.is_none() {
+                self.selected_effect = None;
+            }
         }
         if let Some(index) = move_up
             && index > 0
@@ -1769,7 +1797,7 @@ impl EditorApp {
             .id_salt("layer_settings_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                show_layer_panel(ui, layer);
+                show_layer_panel(ui, layer, &mut self.selected_effect);
             });
     }
 
@@ -1947,6 +1975,38 @@ impl EditorApp {
                 ui.painter().circle_filled(handle_pos, 4.0, color);
             }
 
+            // The selected layer's selected effect (if any, and if its
+            // mask has a `Transform2D` at all -- `None`/`Texture` don't)
+            // gets its own gizmo on the preview, same on-canvas-instead-
+            // of-just-sliders rationale as Text's gizmo above, just
+            // editing a mask's transform instead of a layer's position.
+            if let Some(layer_index) = self.selected
+                && let Some(effect_index) = self.selected_effect
+                && let Some(layer) = self.layers.get_mut(layer_index)
+            {
+                let effects = match layer {
+                    EditorLayer::Image { effects, .. }
+                    | EditorLayer::Xray { effects, .. }
+                    | EditorLayer::Gif { effects, .. }
+                    | EditorLayer::Parallax { effects, .. } => Some(effects),
+                    EditorLayer::Text { .. } => None,
+                };
+                if let Some(mask) = effects
+                    .and_then(|effects| effects.get_mut(effect_index))
+                    .map(|effect| &mut effect.mask)
+                {
+                    match mask {
+                        EditorMask::Circle { transform, .. } => {
+                            show_circle_mask_gizmo(ui, &response, transform);
+                        }
+                        EditorMask::Gradient { transform, .. } => {
+                            show_gradient_mask_gizmo(ui, &response, transform);
+                        }
+                        EditorMask::None | EditorMask::Texture { .. } => {}
+                    }
+                }
+            }
+
             // Displayed size and actual texture size differ (the image is
             // stretched to fill the panel), so a hover position in screen
             // space needs rescaling back down to texture pixel space --
@@ -1972,25 +2032,185 @@ impl EditorApp {
     }
 }
 
+/// Drag-to-move + drag-to-resize gizmo for a Circle mask's
+/// `Transform2D`, drawn over `response` (the preview image). Doesn't
+/// touch `transform.rotation` -- a circle is rotationally symmetric,
+/// and `mask_blend.wgsl`'s Circle branch never reads it.
+///
+/// Mirrors the geometry `mask_blend.wgsl` itself computes: `radius =
+/// transform.scale * 0.5`, aspect-corrected against the canvas's own
+/// width/height so it reads as a true circle rather than an ellipse on
+/// a non-square canvas. Since `response.rect` already preserves the
+/// canvas's real aspect ratio (see `show_preview_content`'s
+/// `display_size`), that correction collapses into a single
+/// screen-space radius using `rect.height()` as the reference axis --
+/// the same derivation the aspect-corrected UV distance in the shader
+/// works out to once both axes are converted through a rect that's
+/// already proportioned to match.
+fn show_circle_mask_gizmo(
+    ui: &mut eframe::egui::Ui,
+    response: &eframe::egui::Response,
+    transform: &mut project_format::Transform2D,
+) {
+    let center = eframe::egui::pos2(
+        response.rect.min.x + transform.x * response.rect.width(),
+        response.rect.min.y + transform.y * response.rect.height(),
+    );
+    let screen_radius = (transform.scale * 0.5) * response.rect.height();
+    let edge_pos = center + eframe::egui::vec2(screen_radius, 0.0);
+
+    // Center handle moves the mask -- registered before the edge
+    // handle so the edge handle wins hit-testing on overlap (small
+    // `scale` puts them close together), same "last interact() wins"
+    // rationale as the Text gizmo above.
+    let center_response = ui.interact(
+        eframe::egui::Rect::from_center_size(center, eframe::egui::vec2(14.0, 14.0)),
+        ui.id().with("mask_gizmo_circle_center"),
+        eframe::egui::Sense::drag(),
+    );
+    if center_response.dragged() {
+        let delta = center_response.drag_delta();
+        transform.x = (transform.x + delta.x / response.rect.width().max(1.0)).clamp(0.0, 1.0);
+        transform.y = (transform.y + delta.y / response.rect.height().max(1.0)).clamp(0.0, 1.0);
+    }
+
+    let edge_response = ui
+        .interact(
+            eframe::egui::Rect::from_center_size(edge_pos, eframe::egui::vec2(12.0, 12.0)),
+            ui.id().with("mask_gizmo_circle_edge"),
+            eframe::egui::Sense::drag(),
+        )
+        .on_hover_and_drag_cursor(eframe::egui::CursorIcon::ResizeHorizontal)
+        .on_hover_text("Drag to resize");
+    if edge_response.dragged() {
+        let delta = edge_response.drag_delta();
+        let new_screen_radius = (screen_radius + delta.x).max(1.0);
+        transform.scale = ((new_screen_radius / response.rect.height().max(1.0)) * 2.0)
+            .clamp(0.05, 3.0);
+    }
+
+    let color = if center_response.dragged() || edge_response.dragged() {
+        eframe::egui::Color32::YELLOW
+    } else {
+        eframe::egui::Color32::WHITE
+    };
+    const CIRCLE_SEGMENTS: usize = 48;
+    let points: Vec<eframe::egui::Pos2> = (0..=CIRCLE_SEGMENTS)
+        .map(|i| {
+            let angle = (i as f32 / CIRCLE_SEGMENTS as f32) * std::f32::consts::TAU;
+            center + eframe::egui::vec2(angle.cos(), angle.sin()) * screen_radius
+        })
+        .collect();
+    ui.painter().extend(eframe::egui::Shape::dashed_line(
+        &points,
+        eframe::egui::Stroke::new(1.5, color),
+        6.0,
+        4.0,
+    ));
+    ui.painter().circle_filled(center, 4.0, color);
+    ui.painter().circle_filled(edge_pos, 4.0, color);
+}
+
+/// Drag-to-move + drag-to-rotate-and-scale gizmo for a Gradient mask's
+/// `Transform2D`. `mask_blend.wgsl`'s Gradient branch measures its
+/// `dot(centered, dir)` span in *raw* UV space, not aspect-corrected
+/// like Circle -- so this gizmo deliberately converts `x`/`y`/rotation/
+/// scale to screen space through the same non-uniform (`rect.width()`
+/// vs `rect.height()`) scaling the shader's own UV space implies,
+/// rather than correcting it into a visually "true" angle. On a
+/// non-square canvas the on-screen handle will look slightly skewed
+/// from its numeric rotation as a result -- that's the gizmo faithfully
+/// showing what actually renders, not a bug to square away.
+fn show_gradient_mask_gizmo(
+    ui: &mut eframe::egui::Ui,
+    response: &eframe::egui::Response,
+    transform: &mut project_format::Transform2D,
+) {
+    let to_screen = |uv: eframe::egui::Vec2| -> eframe::egui::Pos2 {
+        eframe::egui::pos2(
+            response.rect.min.x + uv.x * response.rect.width(),
+            response.rect.min.y + uv.y * response.rect.height(),
+        )
+    };
+    let position_uv = eframe::egui::vec2(transform.x, transform.y);
+    let angle_rad = transform.rotation.to_radians();
+    let end_uv = position_uv + eframe::egui::vec2(angle_rad.cos(), angle_rad.sin()) * transform.scale;
+
+    let center = to_screen(position_uv);
+    let end_pos = to_screen(end_uv);
+
+    // Center handle moves the mask -- registered before the end handle
+    // so the end handle wins hit-testing on overlap (small `scale`
+    // puts them close together), same convention as every other gizmo
+    // here.
+    let center_response = ui.interact(
+        eframe::egui::Rect::from_center_size(center, eframe::egui::vec2(14.0, 14.0)),
+        ui.id().with("mask_gizmo_gradient_center"),
+        eframe::egui::Sense::drag(),
+    );
+    if center_response.dragged() {
+        let delta = center_response.drag_delta();
+        transform.x = (transform.x + delta.x / response.rect.width().max(1.0)).clamp(0.0, 1.0);
+        transform.y = (transform.y + delta.y / response.rect.height().max(1.0)).clamp(0.0, 1.0);
+    }
+
+    let end_response = ui
+        .interact(
+            eframe::egui::Rect::from_center_size(end_pos, eframe::egui::vec2(12.0, 12.0)),
+            ui.id().with("mask_gizmo_gradient_end"),
+            eframe::egui::Sense::drag(),
+        )
+        .on_hover_text("Drag to rotate/resize the gradient");
+    if end_response.dragged() {
+        let delta = end_response.drag_delta();
+        let delta_uv = eframe::egui::vec2(
+            delta.x / response.rect.width().max(1.0),
+            delta.y / response.rect.height().max(1.0),
+        );
+        let to_end = (end_uv + delta_uv) - position_uv;
+        let new_rotation = to_end.y.atan2(to_end.x).to_degrees().rem_euclid(360.0);
+        transform.scale = to_end.length().max(0.0001).clamp(0.05, 3.0);
+        transform.rotation = new_rotation.clamp(0.0, 360.0);
+    }
+
+    let color = if center_response.dragged() || end_response.dragged() {
+        eframe::egui::Color32::YELLOW
+    } else {
+        eframe::egui::Color32::WHITE
+    };
+    ui.painter().line_segment(
+        [center, end_pos],
+        eframe::egui::Stroke::new(1.5, color),
+    );
+    ui.painter().circle_filled(center, 4.0, color);
+    ui.painter().circle_filled(end_pos, 4.0, color);
+}
+
 /// Property panel for one layer in the editor's layer list --
 /// dispatches to a per-variant panel below, mirroring `EditorLayer`'s
 /// own shape one level down.
-fn show_layer_panel(ui: &mut eframe::egui::Ui, layer: &mut EditorLayer) {
+fn show_layer_panel(
+    ui: &mut eframe::egui::Ui,
+    layer: &mut EditorLayer,
+    selected_effect: &mut Option<usize>,
+) {
     match layer {
-        EditorLayer::Image { path, effects } => show_image_panel(ui, path, effects),
+        EditorLayer::Image { path, effects } => {
+            show_image_panel(ui, path, effects, selected_effect)
+        }
         EditorLayer::Xray {
             base,
             overlay,
             radius,
             effects,
-        } => show_xray_panel(ui, base, overlay, radius, effects),
-        EditorLayer::Gif { path, effects } => show_gif_panel(ui, path, effects),
+        } => show_xray_panel(ui, base, overlay, radius, effects, selected_effect),
+        EditorLayer::Gif { path, effects } => show_gif_panel(ui, path, effects, selected_effect),
         EditorLayer::Parallax {
             path,
             strength,
             smoothing,
             effects,
-        } => show_parallax_panel(ui, path, strength, smoothing, effects),
+        } => show_parallax_panel(ui, path, strength, smoothing, effects, selected_effect),
         EditorLayer::Text {
             x,
             y,
@@ -2005,9 +2225,10 @@ fn show_image_panel(
     ui: &mut eframe::egui::Ui,
     path: &mut Option<PathBuf>,
     effects: &mut Vec<EditorEffect>,
+    selected_effect: &mut Option<usize>,
 ) {
     path_picker(ui, "Picture", path, &["png", "jpg", "jpeg", "webp"]);
-    show_effects_panel(ui, effects);
+    show_effects_panel(ui, effects, selected_effect);
 }
 
 fn show_xray_panel(
@@ -2016,6 +2237,7 @@ fn show_xray_panel(
     overlay: &mut Option<PathBuf>,
     radius: &mut f32,
     effects: &mut Vec<EditorEffect>,
+    selected_effect: &mut Option<usize>,
 ) {
     path_picker(ui, "Base picture", base, &["png", "jpg", "jpeg", "webp"]);
     path_picker(
@@ -2028,16 +2250,17 @@ fn show_xray_panel(
         ui.label("Radius (px):");
         scroll_slider(ui, radius, 20.0..=800.0);
     });
-    show_effects_panel(ui, effects);
+    show_effects_panel(ui, effects, selected_effect);
 }
 
 fn show_gif_panel(
     ui: &mut eframe::egui::Ui,
     path: &mut Option<PathBuf>,
     effects: &mut Vec<EditorEffect>,
+    selected_effect: &mut Option<usize>,
 ) {
     path_picker(ui, "Gif file", path, &["gif"]);
-    show_effects_panel(ui, effects);
+    show_effects_panel(ui, effects, selected_effect);
 }
 
 fn show_parallax_panel(
@@ -2046,6 +2269,7 @@ fn show_parallax_panel(
     strength: &mut f32,
     smoothing: &mut f32,
     effects: &mut Vec<EditorEffect>,
+    selected_effect: &mut Option<usize>,
 ) {
     path_picker(
         ui,
@@ -2064,7 +2288,7 @@ fn show_parallax_panel(
         );
         scroll_slider(ui, smoothing, 0.0..=1.0);
     });
-    show_effects_panel(ui, effects);
+    show_effects_panel(ui, effects, selected_effect);
 }
 
 /// Add/remove/reorder/configure a layer's post-processing stack --
@@ -2073,7 +2297,11 @@ fn show_parallax_panel(
 /// Mirrors `show_layers_panel`'s own list -- a compact row per effect
 /// (enabled checkbox, kind label, reorder/remove) with the effect's own
 /// param sliders and mask config nested inside via `ui.group`.
-fn show_effects_panel(ui: &mut eframe::egui::Ui, effects: &mut Vec<EditorEffect>) {
+fn show_effects_panel(
+    ui: &mut eframe::egui::Ui,
+    effects: &mut Vec<EditorEffect>,
+    selected_effect: &mut Option<usize>,
+) {
     ui.add_space(8.0);
     ui.separator();
     ui.add_space(8.0);
@@ -2120,7 +2348,19 @@ fn show_effects_panel(ui: &mut eframe::egui::Ui, effects: &mut Vec<EditorEffect>
         ui.group(|ui| {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut effect.enabled, "");
-                ui.strong(format!("#{} {}", index + 1, effect_kind_label(&effect.kind)));
+                let label = format!("#{} {}", index + 1, effect_kind_label(&effect.kind));
+                // Selectable, not just a label -- clicking it is how
+                // `selected_effect` gets set, which drives the mask
+                // gizmo on the preview (Circle/Gradient only -- see
+                // `show_preview_content`), same pattern as the layer
+                // list's own selectable rows driving `selected`.
+                if ui
+                    .selectable_label(*selected_effect == Some(index), label)
+                    .on_hover_text("Select to edit this effect's mask on the preview")
+                    .clicked()
+                {
+                    *selected_effect = Some(index);
+                }
                 ui.with_layout(
                     eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
                     |ui| {
@@ -2145,16 +2385,33 @@ fn show_effects_panel(ui: &mut eframe::egui::Ui, effects: &mut Vec<EditorEffect>
 
     if let Some(index) = remove {
         effects.remove(index);
+        // Same bookkeeping as `show_layers_panel`'s own remove/reorder
+        // handling for `selected`, one level down.
+        *selected_effect = match *selected_effect {
+            Some(selected) if selected == index => None,
+            Some(selected) if selected > index => Some(selected - 1),
+            other => other,
+        };
     }
     if let Some(index) = move_up
         && index > 0
     {
         effects.swap(index, index - 1);
+        *selected_effect = match *selected_effect {
+            Some(selected) if selected == index => Some(index - 1),
+            Some(selected) if selected == index - 1 => Some(index),
+            other => other,
+        };
     }
     if let Some(index) = move_down
         && index + 1 < effects.len()
     {
         effects.swap(index, index + 1);
+        *selected_effect = match *selected_effect {
+            Some(selected) if selected == index => Some(index + 1),
+            Some(selected) if selected == index + 1 => Some(index),
+            other => other,
+        };
     }
 }
 
