@@ -41,16 +41,29 @@ fn default_fps() -> u32 {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Layer {
     /// A single static picture, relative path within the project dir.
-    Image { path: String },
+    Image {
+        path: String,
+        /// Post-processing stack applied to this layer's own rendered
+        /// output, bottom to top -- see [`Effect`]. Empty for any
+        /// project.json that predates this field.
+        #[serde(default)]
+        effects: Vec<Effect>,
+    },
     /// A base picture with a second picture ("overlay") only visible in
     /// a circle around the cursor -- e.g. a night-vision/x-ray effect.
     Xray {
         base: String,
         overlay: String,
         radius: f32,
+        #[serde(default)]
+        effects: Vec<Effect>,
     },
     /// A looping GIF animation, relative path within the project dir.
-    Gif { path: String },
+    Gif {
+        path: String,
+        #[serde(default)]
+        effects: Vec<Effect>,
+    },
     /// A single picture that pans opposite* the cursor to fake depth --
     /// stack several of these (background to foreground) with increasing
     /// `strength` for a full parallax effect. The renderer zooms the
@@ -68,6 +81,8 @@ pub enum Layer {
         /// Seconds for the pan to ease towards the cursor-driven target
         /// (exponential decay) -- 0.0 tracks the cursor instantly.
         smoothing: f32,
+        #[serde(default)]
+        effects: Vec<Effect>,
     },
     /// A string of text drawn at an arbitrary position on the canvas --
     /// unlike every other layer, not a full-canvas effect. Always drawn
@@ -131,6 +146,90 @@ impl Layer {
             Layer::Image { .. } => false,
         }
     }
+}
+
+/// Position/scale/rotation for something drawn on top of a layer's own
+/// content -- currently only a [`Mask`]'s shape. `x`/`y` are the same
+/// normalized (0.0..=1.0) fraction-of-canvas convention `Layer::Text`
+/// already uses, `rotation` is in degrees (matches what an editor slider
+/// shows a human, converted to radians only at the point a shader
+/// actually needs it).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Transform2D {
+    pub x: f32,
+    pub y: f32,
+    pub scale: f32,
+    pub rotation: f32,
+}
+
+impl Default for Transform2D {
+    /// Centered, unscaled, unrotated -- the sane starting point for a
+    /// freshly added mask, before a user has dragged its gizmo at all.
+    fn default() -> Self {
+        Transform2D {
+            x: 0.5,
+            y: 0.5,
+            scale: 1.0,
+            rotation: 0.0,
+        }
+    }
+}
+
+/// Where an [`Effect`] applies, independently of what the effect itself
+/// does -- a generic mechanism shared by every effect kind, not something
+/// each effect's own shader implements (see `Ideas.md`, "Развилка 2").
+/// The engine blends the effect's output back against its input by this
+/// mask's value (0.0 = original, 1.0 = fully effect) in one fixed pass,
+/// regardless of `kind`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Mask {
+    /// Effect applies to the whole layer, unmasked.
+    #[default]
+    None,
+    Circle {
+        transform: Transform2D,
+        /// Fraction of the circle's radius over which the mask eases
+        /// from 1.0 to 0.0 at its edge, rather than cutting off sharply.
+        feather: f32,
+        invert: bool,
+    },
+    Gradient {
+        transform: Transform2D,
+        feather: f32,
+        invert: bool,
+    },
+    /// A hand-authored or hand-picked grayscale image, relative path
+    /// within the project dir -- brightness is the mask value. Produced
+    /// either by `path_picker` or by painting it directly in the editor;
+    /// the two are indistinguishable once saved (see `Ideas.md`, "Кисть
+    /// для маски").
+    Texture { path: String, invert: bool },
+}
+
+/// Which built-in effect this is and its own parameters -- deliberately
+/// a small closed set for now (Фаза 1 of the library in `Ideas.md`), not
+/// yet the generic user-authored `Shader` variant planned for Фаза 3.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EffectKind {
+    Vignette { strength: f32, softness: f32 },
+    ColorAdjust {
+        brightness: f32,
+        contrast: f32,
+        saturation: f32,
+    },
+    Blur { radius: f32 },
+}
+
+/// One entry in a layer's post-processing stack -- see `Ideas.md`,
+/// "Эффекты как стек пост-обработки на слое".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Effect {
+    pub kind: EffectKind,
+    #[serde(default)]
+    pub mask: Mask,
+    pub enabled: bool,
 }
 
 #[derive(Debug)]
@@ -275,6 +374,52 @@ mod tests {
                 assert_eq!((command.as_str(), interval_secs), ("date", 60));
             }
             _ => panic!("expected Layer::Text with TextSource::Command"),
+        }
+    }
+
+    #[test]
+    fn image_layer_with_effects_round_trips() {
+        let layer = Layer::Image {
+            path: "bg.png".to_string(),
+            effects: vec![Effect {
+                kind: EffectKind::Vignette {
+                    strength: 0.6,
+                    softness: 0.3,
+                },
+                mask: Mask::Circle {
+                    transform: Transform2D {
+                        x: 0.5,
+                        y: 0.5,
+                        scale: 1.2,
+                        rotation: 0.0,
+                    },
+                    feather: 0.2,
+                    invert: false,
+                },
+                enabled: true,
+            }],
+        };
+        let json = serde_json::to_string(&layer).unwrap();
+        let round_tripped: Layer = serde_json::from_str(&json).unwrap();
+        match round_tripped {
+            Layer::Image { path, effects } => {
+                assert_eq!(path, "bg.png");
+                assert_eq!(effects.len(), 1);
+                assert!(effects[0].enabled);
+                assert!(matches!(effects[0].kind, EffectKind::Vignette { .. }));
+                assert!(matches!(effects[0].mask, Mask::Circle { .. }));
+            }
+            _ => panic!("expected Layer::Image"),
+        }
+    }
+
+    #[test]
+    fn layer_without_effects_field_defaults_to_empty_for_pre_existing_project_json() {
+        let layer: Layer =
+            serde_json::from_str(r#"{"type":"image","path":"bg.png"}"#).expect("should still parse");
+        match layer {
+            Layer::Image { effects, .. } => assert!(effects.is_empty()),
+            _ => panic!("expected Layer::Image"),
         }
     }
 }

@@ -456,6 +456,23 @@ pub struct TextLayer {
     color: [f32; 4],
 }
 
+impl TextLayer {
+    /// Pixel width/height of the shaped `buffer`'s bounding box --
+    /// `(0.0, 0.0)` for an empty string, which lays out to zero runs.
+    /// Width is the widest line; height is the bottom of the last line
+    /// (`line_top + line_height` rather than a running sum, so it's
+    /// correct regardless of how many lines came before).
+    fn measure(&self) -> (f32, f32) {
+        let mut width: f32 = 0.0;
+        let mut height: f32 = 0.0;
+        for run in self.buffer.layout_runs() {
+            width = width.max(run.line_w);
+            height = height.max(run.line_top + run.line_height);
+        }
+        (width, height)
+    }
+}
+
 /// Bundles every piece of glyphon/cosmic-text state needed to shape and
 /// draw text layers. One instance per [`SceneRenderer`] (not per scene,
 /// not per layer) -- glyphon's `TextAtlas`/`TextRenderer` are meant to be
@@ -576,6 +593,21 @@ impl LoadedLayer {
             text.y = y;
             text.font_size = font_size;
             text.color = color;
+        }
+    }
+
+    /// Pixel width/height of a Text layer's shaped text, in the same
+    /// canvas-pixel space `x`/`y` (multiplied by canvas width/height)
+    /// already use -- i.e. before any further scaling a caller (editor's
+    /// preview, which usually renders smaller than the project's actual
+    /// resolution) applies on top. `None` for any other layer kind.
+    /// Meant for a caller that wants to draw a bounding box around a Text
+    /// layer (editor's on-preview move/resize handles) instead of just a
+    /// point at its `x`/`y` origin.
+    pub fn text_size(&self) -> Option<(f32, f32)> {
+        match self {
+            LoadedLayer::Text(text) => Some(text.measure()),
+            _ => None,
         }
     }
 }
@@ -1164,13 +1196,16 @@ impl SceneRenderer {
         let mut layers = Vec::with_capacity(project.layers.len());
         for layer in &project.layers {
             match layer {
-                Layer::Image { path } => {
+                // `effects` ignored for now -- applying a layer's
+                // post-processing stack is M2's job (offscreen render
+                // target + generic mask-blend pass), not loading.
+                Layer::Image { path, .. } => {
                     let (rgba, width, height) = open_rgba(&project_dir.join(path))?;
                     layers.push(LoadedLayer::Image(
                         self.create_image_layer(&rgba, width, height),
                     ));
                 }
-                Layer::Gif { path } => {
+                Layer::Gif { path, .. } => {
                     let (frames, width, height) = decode_gif(&project_dir.join(path))?;
                     let cumulative_ms = cumulative_delays(&frames);
                     let total_ms = *cumulative_ms.last().expect("gif has at least one frame");
@@ -1189,6 +1224,7 @@ impl SceneRenderer {
                     base,
                     overlay,
                     radius,
+                    ..
                 } => {
                     let (base_rgba, base_width, base_height) = open_rgba(&project_dir.join(base))?;
                     let (overlay_rgba, overlay_width, overlay_height) =
@@ -1207,6 +1243,7 @@ impl SceneRenderer {
                     path,
                     strength,
                     smoothing,
+                    ..
                 } => {
                     let (rgba, width, height) = open_rgba(&project_dir.join(path))?;
                     layers.push(LoadedLayer::Parallax(

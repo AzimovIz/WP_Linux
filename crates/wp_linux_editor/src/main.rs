@@ -548,12 +548,16 @@ fn build_preview_project(layers: &[EditorLayer]) -> Option<project_format::Proje
             // directory, and `Path::join` with an absolute right-hand
             // side just returns that absolute path unchanged, so passing
             // `Path::new("")` as the base works out.
+            // `effects: Vec::new()` throughout -- `EditorLayer` has
+            // nowhere to keep a per-layer effect stack yet (that's M4),
+            // so the preview never shows one either.
             EditorLayer::Image { path } => project_format::Layer::Image {
                 path: path
                     .as_ref()
                     .expect("checked complete above")
                     .display()
                     .to_string(),
+                effects: Vec::new(),
             },
             EditorLayer::Xray {
                 base,
@@ -571,6 +575,7 @@ fn build_preview_project(layers: &[EditorLayer]) -> Option<project_format::Proje
                     .display()
                     .to_string(),
                 radius: *radius,
+                effects: Vec::new(),
             },
             EditorLayer::Gif { path } => project_format::Layer::Gif {
                 path: path
@@ -578,6 +583,7 @@ fn build_preview_project(layers: &[EditorLayer]) -> Option<project_format::Proje
                     .expect("checked complete above")
                     .display()
                     .to_string(),
+                effects: Vec::new(),
             },
             EditorLayer::Parallax {
                 path,
@@ -591,6 +597,7 @@ fn build_preview_project(layers: &[EditorLayer]) -> Option<project_format::Proje
                     .to_string(),
                 strength: *strength,
                 smoothing: *smoothing,
+                effects: Vec::new(),
             },
             EditorLayer::Text {
                 x,
@@ -685,6 +692,13 @@ struct EditorApp {
 
     // -- "Editor" tab state --
     layers: Vec<EditorLayer>,
+    /// Index into `layers` of whichever one is currently selected in the
+    /// list -- `None` until the user clicks one. Drives which layer (if
+    /// any) shows a drag handle on top of the preview in `show_preview`;
+    /// kept in sync with `layers` itself by every mutation site (add/
+    /// remove/reorder/reset) so it never points past the end or at the
+    /// wrong layer after a reorder.
+    selected: Option<usize>,
     fps: u32,
     status: String,
     preview: Option<Preview>,
@@ -714,6 +728,7 @@ impl Default for EditorApp {
             apply_overlay: None,
             delete_overlay: None,
             layers: Vec::new(),
+            selected: None,
             fps: 30,
             status: String::new(),
             preview: None,
@@ -805,16 +820,16 @@ impl eframe::App for EditorApp {
                 });
             }
             Tab::Editor => {
-                eframe::egui::Panel::left("preview_panel")
+                eframe::egui::Panel::right("editor_sidebar")
                     .resizable(true)
-                    .default_size(760.0)
-                    .size_range(320.0..=980.0)
+                    .default_size(300.0)
+                    .size_range(220.0..=900.0)
                     .show(ui, |ui| {
-                        self.show_preview(ui, render_state.as_ref());
+                        self.show_layers_panel(ui);
                     });
 
                 eframe::egui::CentralPanel::default().show(ui, |ui| {
-                    self.show_editor_tab(ui);
+                    self.show_preview(ui, render_state.as_ref());
                 });
             }
         }
@@ -1169,6 +1184,7 @@ impl EditorApp {
     /// was open before.
     fn new_project(&mut self) {
         self.layers = Vec::new();
+        self.selected = None;
         self.fps = 30;
         self.current_project_id = None;
         self.current_project_name = String::new();
@@ -1183,6 +1199,7 @@ impl EditorApp {
         match open_project(&entry.dir) {
             Ok((layers, fps, description)) => {
                 self.layers = layers;
+                self.selected = None;
                 self.fps = fps;
                 self.current_project_id = Some(entry.id.clone());
                 self.current_project_name = entry.name.clone();
@@ -1196,7 +1213,15 @@ impl EditorApp {
         }
     }
 
-    fn show_editor_tab(&mut self, ui: &mut eframe::egui::Ui) {
+    /// Left sidebar for the Editor tab: project-level actions (New/Open/
+    /// Save, name/description/FPS), the "+ layer" buttons, and a compact
+    /// list of the project's layers -- name plus reorder/remove/select
+    /// only, no per-layer settings. Settings for whichever layer is
+    /// `selected` live in the separate `show_layer_settings_panel`
+    /// instead, master-detail style, so the list stays scannable
+    /// regardless of how many sliders (and, once M4 lands, how deep an
+    /// effect stack) any single layer's own settings need.
+    fn show_layers_panel(&mut self, ui: &mut eframe::egui::Ui) {
         // New/Open/Save first -- the actions that reset, load, or persist
         // everything below them, so they lead rather than trail the form.
         ui.horizontal(|ui| {
@@ -1315,9 +1340,14 @@ impl EditorApp {
         ui.label("Layers are drawn bottom to top -- the first one in the list is furthest back.");
         ui.add_space(4.0);
 
-        ui.horizontal(|ui| {
+        // Wrapped, not a plain `horizontal` -- five un-wrapped buttons
+        // would need more width than this panel's own configured
+        // minimum (220px), which would silently override that minimum
+        // and stop the panel from ever shrinking down to it.
+        ui.horizontal_wrapped(|ui| {
             if ui.button("+ Image").clicked() {
                 self.layers.push(EditorLayer::Image { path: None });
+                self.selected = Some(self.layers.len() - 1);
             }
             if ui.button("+ Xray").clicked() {
                 self.layers.push(EditorLayer::Xray {
@@ -1325,9 +1355,11 @@ impl EditorApp {
                     overlay: None,
                     radius: 200.0,
                 });
+                self.selected = Some(self.layers.len() - 1);
             }
             if ui.button("+ Gif").clicked() {
                 self.layers.push(EditorLayer::Gif { path: None });
+                self.selected = Some(self.layers.len() - 1);
             }
             if ui.button("+ Parallax").clicked() {
                 self.layers.push(EditorLayer::Parallax {
@@ -1335,6 +1367,7 @@ impl EditorApp {
                     strength: 0.05,
                     smoothing: 0.15,
                 });
+                self.selected = Some(self.layers.len() - 1);
             }
             if ui.button("+ Text").clicked() {
                 self.layers.push(EditorLayer::Text {
@@ -1344,80 +1377,158 @@ impl EditorApp {
                     color: [1.0, 1.0, 1.0, 1.0],
                     source: EditorTextSource::Literal(String::new()),
                 });
+                // Selected immediately, not just appended -- a freshly
+                // added Text layer's drag handle should be visible on
+                // the preview right away, without the user needing to
+                // separately discover that clicking a layer's row below
+                // selects it.
+                self.selected = Some(self.layers.len() - 1);
             }
         });
 
         ui.add_space(8.0);
 
-        // A `Panel`, not a fixed pixel guess -- it measures its own
-        // content's actual height each frame and reserves exactly that
-        // much, so the status line it holds always stays fully visible
-        // and pinned to the bottom regardless of the window's size (a
-        // hand-picked constant here previously drifted out of sync the
-        // moment spacing/padding changed, e.g. from `apply_style`,
-        // silently clipping it below the window). Declared *before* the
-        // layer list below on purpose: like every other `Panel`, it
-        // claims its slice of `ui`'s remaining space first, leaving
-        // whatever's left to the list's `ScrollArea`.
-        eframe::egui::Panel::bottom("editor_footer")
-            .show_separator_line(false)
-            .show(ui, |ui| {
-                if !self.status.is_empty() {
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(8.0);
-                    ui.label(&self.status);
-                    ui.add_space(4.0);
-                }
-            });
-
         let mut move_up = None;
         let mut move_down = None;
         let mut remove = None;
 
-        eframe::egui::ScrollArea::vertical()
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                for (index, layer) in self.layers.iter_mut().enumerate() {
-                    ui.group(|ui| {
-                        // Match the group to whatever width the
-                        // (resizable) panel actually has instead of
-                        // sizing to content -- otherwise a group can
-                        // only ever grow to fit its widest child and
-                        // never shrinks back down when the window is
-                        // narrowed.
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            ui.strong(format!("#{} {}", index + 1, layer.label()));
-                            if ui.small_button("up").clicked() {
-                                move_up = Some(index);
-                            }
-                            if ui.small_button("down").clicked() {
-                                move_down = Some(index);
-                            }
-                            if ui.small_button("remove").clicked() {
-                                remove = Some(index);
-                            }
-                        });
+        // Capped to ~4 rows regardless of how many layers there are --
+        // same reasoning and the same kind of approximation as the
+        // description box above (a hand-measured row height, not
+        // pixel-exact), but here *not* shrinking below that when there
+        // are fewer than 4 layers either (`auto_shrink`'s height axis is
+        // `false`, not `true`): a list that resized itself shorter every
+        // time a layer was removed would shove the settings panel below
+        // it up and down on every edit, which is worse than a little
+        // fixed blank space at the bottom sometimes.
+        let row_height = ui
+            .spacing()
+            .interact_size
+            .y
+            .max(ui.text_style_height(&eframe::egui::TextStyle::Body));
+        let list_height = (row_height + ui.spacing().item_spacing.y) * 4.0;
 
-                        show_layer_panel(ui, layer);
+        eframe::egui::ScrollArea::vertical()
+            .id_salt("layer_list_scroll")
+            .max_height(list_height)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                // `iter()`, not `iter_mut()` -- this row no longer draws
+                // the layer's own settings (that moved to
+                // `show_layer_settings_panel`), so nothing here needs to
+                // mutate an individual layer, only `self.layers` as a
+                // whole via `remove`/`move_up`/`move_down` below.
+                for (index, layer) in self.layers.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        // Selectable, not just a label -- clicking it is
+                        // how `selected` gets set, which drives both the
+                        // settings panel on the right and the drag
+                        // handle on the preview (currently only wired up
+                        // for Text -- see `show_preview`).
+                        if ui
+                            .selectable_label(
+                                self.selected == Some(index),
+                                format!("#{} {}", index + 1, layer.label()),
+                            )
+                            .on_hover_text("Select this layer to edit its settings")
+                            .clicked()
+                        {
+                            self.selected = Some(index);
+                        }
+                        if ui.small_button("up").clicked() {
+                            move_up = Some(index);
+                        }
+                        if ui.small_button("down").clicked() {
+                            move_down = Some(index);
+                        }
+                        if ui.small_button("remove").clicked() {
+                            remove = Some(index);
+                        }
                     });
                 }
             });
 
         if let Some(index) = remove {
             self.layers.remove(index);
+            // Keep `selected` pointing at the same layer it did before
+            // the removal (shifted down by one once its own index is
+            // gone), rather than left dangling past the end of the
+            // shrunk `layers` or silently pointing at whatever layer
+            // slid into the removed slot.
+            self.selected = match self.selected {
+                Some(selected) if selected == index => None,
+                Some(selected) if selected > index => Some(selected - 1),
+                other => other,
+            };
         }
         if let Some(index) = move_up
             && index > 0
         {
             self.layers.swap(index, index - 1);
+            self.selected = match self.selected {
+                Some(selected) if selected == index => Some(index - 1),
+                Some(selected) if selected == index - 1 => Some(index),
+                other => other,
+            };
         }
         if let Some(index) = move_down
             && index + 1 < self.layers.len()
         {
             self.layers.swap(index, index + 1);
+            self.selected = match self.selected {
+                Some(selected) if selected == index => Some(index + 1),
+                Some(selected) if selected == index + 1 => Some(index),
+                other => other,
+            };
         }
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        // Settings for whichever layer is selected above -- stacked
+        // below the list in this same sidebar column (master-detail),
+        // filling whatever vertical space the list's fixed ~4 rows left
+        // behind instead of a separate side-by-side panel.
+        self.show_layer_settings_panel(ui);
+    }
+
+    /// The master-detail counterpart to the layer list above it in
+    /// `show_layers_panel`: settings for whichever layer is currently
+    /// `selected`, and nothing else. Empty state (`selected` is `None`,
+    /// or stale past the end of `layers`, which list mutations should
+    /// never actually leave it -- see the bookkeeping in
+    /// `show_layers_panel`) shows a prompt instead of a panicking
+    /// `layers[index]`.
+    fn show_layer_settings_panel(&mut self, ui: &mut eframe::egui::Ui) {
+        ui.heading("Layer settings");
+        ui.add_space(4.0);
+
+        let Some(index) = self.selected else {
+            ui.label("Select a layer on the left to edit its settings.");
+            return;
+        };
+        let Some(layer) = self.layers.get_mut(index) else {
+            self.selected = None;
+            ui.label("Select a layer on the left to edit its settings.");
+            return;
+        };
+
+        ui.strong(format!("#{} {}", index + 1, layer.label()));
+        ui.add_space(4.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        // Fills whatever's left in the sidebar column (`auto_shrink`'s
+        // height axis is `false`, not `true`) rather than shrinking to
+        // its content -- this is the last thing in the column, so
+        // nothing else needs the space back.
+        eframe::egui::ScrollArea::vertical()
+            .id_salt("layer_settings_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                show_layer_panel(ui, layer);
+            });
     }
 
     fn show_preview(
@@ -1463,6 +1574,108 @@ impl EditorApp {
                 display_size,
             )));
 
+            // The selected layer (if it's a Text layer -- the only kind
+            // with a position today) gets a dashed bounding box overlaid
+            // on the preview, as an on-canvas alternative to its x/y and
+            // font_size sliders: drag anywhere inside it to move, drag
+            // the small handle at its top-right corner to resize.
+            if let Some(index) = self.selected
+                && let Some(EditorLayer::Text { x, y, font_size, .. }) =
+                    self.layers.get_mut(index)
+            {
+                // Screen-space top-left corner -- `response.rect` rescaled
+                // by (x, y), both already the same normalized 0.0..=1.0
+                // fractions the shader/glyphon layout itself uses (see
+                // `Layer::Text`'s doc comment); the exact inverse of
+                // `cursor_local`'s conversion below.
+                let origin = eframe::egui::pos2(
+                    response.rect.min.x + *x * response.rect.width(),
+                    response.rect.min.y + *y * response.rect.height(),
+                );
+
+                // The shaped text's own size lives in canvas-pixel space
+                // (the same units `x`/`y` are multiplied into for the
+                // glyphon layout itself) -- rescale into screen-pixel
+                // space the same way `origin` above already is. A
+                // minimum keeps the box (and its resize handle) grabbable
+                // even for an empty/just-added string, which shapes to
+                // zero size.
+                let (text_w, text_h) = preview
+                    .layers
+                    .get(index)
+                    .and_then(LoadedLayer::text_size)
+                    .unwrap_or((0.0, 0.0));
+                let to_screen_x = response.rect.width() / preview.width.max(1) as f32;
+                let to_screen_y = response.rect.height() / preview.height.max(1) as f32;
+                let size = eframe::egui::vec2(
+                    (text_w * to_screen_x).max(20.0),
+                    (text_h * to_screen_y).max(20.0),
+                );
+                let body_rect = eframe::egui::Rect::from_min_size(origin, size);
+
+                // Whole box moves the layer -- registered *before* the
+                // resize handle below so the handle wins hit-testing
+                // where the two overlap (egui breaks position ties in
+                // favor of whichever `interact` was called last, i.e.
+                // "topmost"; see `hit_test::hit_test`'s doc comment).
+                let body_response = ui.interact(
+                    body_rect,
+                    ui.id().with("layer_gizmo_body"),
+                    eframe::egui::Sense::drag(),
+                );
+                if body_response.dragged() {
+                    let delta = body_response.drag_delta();
+                    *x = (*x + delta.x / response.rect.width().max(1.0)).clamp(0.0, 1.0);
+                    *y = (*y + delta.y / response.rect.height().max(1.0)).clamp(0.0, 1.0);
+                }
+
+                // Small handle at the bottom-right corner resizes -- the
+                // box is anchored at its top-left (x, y) origin and grows
+                // down/right as `font_size` grows, so the bottom-right
+                // corner is the one that actually moves with it. Drag
+                // down to grow, up to shrink, matching `font_size`'s own
+                // definition as a fraction of canvas *height* (see
+                // `Layer::Text`'s doc comment).
+                let handle_pos = eframe::egui::pos2(body_rect.right(), body_rect.bottom());
+                let handle_rect = eframe::egui::Rect::from_center_size(
+                    handle_pos,
+                    eframe::egui::vec2(12.0, 12.0),
+                );
+                let handle_response = ui
+                    .interact(
+                        handle_rect,
+                        ui.id().with("layer_gizmo_resize"),
+                        eframe::egui::Sense::drag(),
+                    )
+                    .on_hover_and_drag_cursor(eframe::egui::CursorIcon::ResizeSouthEast)
+                    .on_hover_text("Drag to change font size");
+                if handle_response.dragged() {
+                    let delta = handle_response.drag_delta();
+                    *font_size = (*font_size + delta.y / response.rect.height().max(1.0))
+                        .clamp(0.01, 0.5);
+                }
+
+                let color = if body_response.dragged() || handle_response.dragged() {
+                    eframe::egui::Color32::YELLOW
+                } else {
+                    eframe::egui::Color32::WHITE
+                };
+                let corners = [
+                    body_rect.left_top(),
+                    body_rect.right_top(),
+                    body_rect.right_bottom(),
+                    body_rect.left_bottom(),
+                    body_rect.left_top(),
+                ];
+                ui.painter().extend(eframe::egui::Shape::dashed_line(
+                    &corners,
+                    eframe::egui::Stroke::new(1.5, color),
+                    6.0,
+                    4.0,
+                ));
+                ui.painter().circle_filled(handle_pos, 4.0, color);
+            }
+
             // Displayed size and actual texture size differ (the image is
             // stretched to fill the panel), so a hover position in screen
             // space needs rescaling back down to texture pixel space --
@@ -1484,6 +1697,16 @@ impl EditorApp {
         if let Some(err) = &self.preview_error {
             ui.add_space(4.0);
             ui.colored_label(eframe::egui::Color32::RED, err);
+        }
+
+        // Last New/Open/Save result -- shown under the preview rather
+        // than under the sidebar's layer list/settings, so it stays
+        // visible regardless of how tall those get.
+        if !self.status.is_empty() {
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(8.0);
+            ui.label(&self.status);
         }
     }
 }
@@ -1827,9 +2050,10 @@ fn load_thumbnail_texture(ctx: &eframe::egui::Context, path: &Path) -> eframe::e
 ///
 /// Consumes the scroll delta it acts on (see the `smooth_scroll_delta`
 /// reset below) so it doesn't *also* get read by an enclosing
-/// `ScrollArea` -- see `show_editor_tab`'s layer list, which relies on
-/// this to let wheel-over-a-slider and wheel-over-the-list-background
-/// do two different things instead of both firing at once.
+/// `ScrollArea` -- see `show_layer_settings_panel`'s `ScrollArea`, which
+/// relies on this to let wheel-over-a-slider and wheel-over-the-
+/// settings-background do two different things instead of both firing
+/// at once.
 fn scroll_slider<Num: eframe::egui::emath::Numeric>(
     ui: &mut eframe::egui::Ui,
     value: &mut Num,
@@ -1897,25 +2121,33 @@ fn open_project(project_dir: &Path) -> Result<(Vec<EditorLayer>, u32, String), S
         .layers
         .into_iter()
         .map(|layer| match layer {
-            project_format::Layer::Image { path } => EditorLayer::Image {
+            // `effects` dropped on the floor here -- `EditorLayer` has
+            // nowhere to keep it yet (that's M4). Until then, opening
+            // and re-saving a project with hand-authored effects in its
+            // project.json silently wipes them; nothing can create a
+            // non-empty `effects` list any other way yet, so this is a
+            // narrow, temporary gap rather than a real loss today.
+            project_format::Layer::Image { path, .. } => EditorLayer::Image {
                 path: Some(project_dir.join(path)),
             },
             project_format::Layer::Xray {
                 base,
                 overlay,
                 radius,
+                ..
             } => EditorLayer::Xray {
                 base: Some(project_dir.join(base)),
                 overlay: Some(project_dir.join(overlay)),
                 radius,
             },
-            project_format::Layer::Gif { path } => EditorLayer::Gif {
+            project_format::Layer::Gif { path, .. } => EditorLayer::Gif {
                 path: Some(project_dir.join(path)),
             },
             project_format::Layer::Parallax {
                 path,
                 strength,
                 smoothing,
+                ..
             } => EditorLayer::Parallax {
                 path: Some(project_dir.join(path)),
                 strength,
@@ -1977,10 +2209,17 @@ fn save_project(
             };
 
             let saved = match layer {
+                // `effects: Vec::new()` throughout -- see the matching
+                // note on `open_project`'s conversion the other
+                // direction; `EditorLayer` can't carry a non-empty one
+                // yet, so there's nothing to save until M4.
                 EditorLayer::Image { path } => {
                     let path = path.as_ref().expect("save is disabled until complete");
                     let file_name = stage(path, &format!("layer_{index}_image"))?;
-                    project_format::Layer::Image { path: file_name }
+                    project_format::Layer::Image {
+                        path: file_name,
+                        effects: Vec::new(),
+                    }
                 }
                 EditorLayer::Xray {
                     base,
@@ -1995,12 +2234,16 @@ fn save_project(
                         base: base_name,
                         overlay: overlay_name,
                         radius: *radius,
+                        effects: Vec::new(),
                     }
                 }
                 EditorLayer::Gif { path } => {
                     let path = path.as_ref().expect("save is disabled until complete");
                     let file_name = stage(path, &format!("layer_{index}_anim"))?;
-                    project_format::Layer::Gif { path: file_name }
+                    project_format::Layer::Gif {
+                        path: file_name,
+                        effects: Vec::new(),
+                    }
                 }
                 EditorLayer::Parallax {
                     path,
@@ -2013,6 +2256,7 @@ fn save_project(
                         path: file_name,
                         strength: *strength,
                         smoothing: *smoothing,
+                        effects: Vec::new(),
                     }
                 }
                 // No asset to stage.
