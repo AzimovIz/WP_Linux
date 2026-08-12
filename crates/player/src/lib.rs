@@ -46,6 +46,7 @@ const PARALLAX_SHADER: &str = include_str!("parallax.wgsl");
 const VIGNETTE_SHADER: &str = include_str!("vignette.wgsl");
 const COLORADJUST_SHADER: &str = include_str!("coloradjust.wgsl");
 const BLUR_SHADER: &str = include_str!("blur.wgsl");
+const SMOKE_SHADER: &str = include_str!("smoke.wgsl");
 const MASK_BLEND_SHADER: &str = include_str!("mask_blend.wgsl");
 
 pub struct GifFrame {
@@ -177,6 +178,62 @@ enum LoadedEffectKind {
         vertical_uniform_buffer: wgpu::Buffer,
         vertical_bind_group: wgpu::BindGroup,
     },
+    /// The first stateful/feedback effect -- see `Ideas.md`, "Техника
+    /// отрисовки для стейтфул-эффектов". Everything else in this enum
+    /// is a pure function of the layer's current content each frame;
+    /// Smoke instead carries `state_texture` forward frame to frame,
+    /// completely independent of the layer's own picture (only
+    /// combined with it later, generically, by the mask-blend pass --
+    /// same as every other effect kind). Boxed (see `SmokeEffect`'s own
+    /// doc comment) so this variant's extra state doesn't inflate every
+    /// other, much smaller variant's footprint too.
+    Smoke(Box<SmokeEffect>),
+}
+
+/// Payload of `LoadedEffectKind::Smoke`, boxed out of the enum itself --
+/// substantially bigger than every sibling variant (two textures/views,
+/// its own uniform buffer and bind group), and Rust sizes an enum by
+/// its largest variant, so without this every `LoadedEffect` would pay
+/// for Smoke's footprint even when it's actually a Vignette (Clippy's
+/// `large_enum_variant`).
+struct SmokeEffect {
+    // CPU-cached copies of this effect's own params. Unlike every other
+    // effect kind's `set_effect_params` handling, these writes never
+    // touch the GPU directly -- `update_smoke_cursors` (called every
+    // redraw tick, not just when a slider moves) is what actually
+    // rewrites the uniform buffer, combining these with the live cursor
+    // position in one write. Exactly the pattern `XrayLayer::radius` +
+    // `update_xray_cursors` already established; `set_effect_params`
+    // alone changing it would mean waiting for the next cursor tick to
+    // see the color/decay/radius take effect, and them not being here
+    // at all would mean `update_smoke_cursors` has nothing to write
+    // back each frame.
+    color: [f32; 4],
+    decay: f32,
+    radius: f32,
+    // This effect's own chain's resolution -- needed to convert a
+    // shared canvas-pixel cursor position into this effect's own UV
+    // space in `update_smoke_cursors`.
+    width: u32,
+    height: u32,
+    // Persistent GPU state -- unlike `scratch`/`blur_temp` (which every
+    // other effect kind treats as this-frame-only, always
+    // `LoadOp::Clear`ed), never cleared after its one-time zero-init at
+    // creation (see `SceneRenderer::clear_texture`). Holds last frame's
+    // decayed+splatted result, and `record_draw` feeds it straight into
+    // the generic mask-blend pass as this effect's raw output -- there's
+    // no separate scratch write for Smoke, `state_view` fills that role
+    // directly.
+    state_texture: wgpu::Texture,
+    state_view: wgpu::TextureView,
+    // A fresh copy of `state_texture`, taken every frame right before
+    // the decay+splat pass -- exists purely so that pass can sample
+    // "last frame's state" while writing into `state_texture` itself; a
+    // texture can't be both a pass's input and its render target at
+    // once. See `record_draw`.
+    temp_texture: wgpu::Texture,
+    uniform_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
 }
 
 /// GPU-side counterpart of [`project_format::Mask`] -- always has a
@@ -734,7 +791,7 @@ impl LoadedLayer {
         for (loaded, effect) in chain.effects.iter_mut().zip(effects) {
             loaded.enabled = effect.enabled;
 
-            match (&loaded.kind, &effect.kind) {
+            match (&mut loaded.kind, &effect.kind) {
                 (
                     LoadedEffectKind::Vignette { uniform_buffer, .. },
                     EffectKind::Vignette { strength, softness },
@@ -777,6 +834,24 @@ impl LoadedLayer {
                         0,
                         &blur_uniform_bytes(*radius, (0.0, 1.0)),
                     );
+                }
+                (
+                    LoadedEffectKind::Smoke(loaded_smoke),
+                    EffectKind::Smoke {
+                        color,
+                        decay,
+                        radius,
+                    },
+                ) => {
+                    // No GPU write here, deliberately -- see
+                    // `LoadedEffectKind::Smoke`'s doc comment.
+                    // `update_smoke_cursors` is what actually rewrites
+                    // this effect's uniform buffer, every redraw tick,
+                    // combining these CPU-cached fields with the live
+                    // cursor position it alone has on hand.
+                    loaded_smoke.color = *color;
+                    loaded_smoke.decay = *decay;
+                    loaded_smoke.radius = *radius;
                 }
                 // Mismatched shape (mid-reload) -- this effect's kind
                 // params are skipped for this frame, but its mask
@@ -881,6 +956,27 @@ fn blur_uniform_bytes(radius: f32, direction: (f32, f32)) -> [u8; 16] {
     bytes
 }
 
+/// Packs `SmokeParams`' bytes (`smoke.wgsl`) -- shared by
+/// `create_effect_chain`'s initial load and
+/// `SceneRenderer::update_smoke_cursors`'s per-frame write. Unlike
+/// every other `*_uniform_bytes` helper here, this is never called
+/// from `LoadedLayer::set_effect_params` -- see `LoadedEffectKind::
+/// Smoke`'s doc comment for why that setter only updates the CPU-side
+/// fields this reads, and leaves the actual GPU write to whichever
+/// caller also has the live cursor position on hand.
+fn smoke_uniform_bytes(color: [f32; 4], cursor_uv: (f32, f32), decay: f32, radius: f32) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    bytes[0..4].copy_from_slice(&color[0].to_le_bytes());
+    bytes[4..8].copy_from_slice(&color[1].to_le_bytes());
+    bytes[8..12].copy_from_slice(&color[2].to_le_bytes());
+    bytes[12..16].copy_from_slice(&color[3].to_le_bytes());
+    bytes[16..20].copy_from_slice(&cursor_uv.0.to_le_bytes());
+    bytes[20..24].copy_from_slice(&cursor_uv.1.to_le_bytes());
+    bytes[24..28].copy_from_slice(&decay.to_le_bytes());
+    bytes[28..32].copy_from_slice(&radius.to_le_bytes());
+    bytes
+}
+
 /// Packs `MaskParams`' bytes (`mask_blend.wgsl`) -- shared by
 /// `create_loaded_mask`'s initial load and
 /// `LoadedLayer::set_effect_params`'s live update. `canvas_aspect`
@@ -978,6 +1074,8 @@ pub struct SceneRenderer {
     coloradjust_bind_group_layout: wgpu::BindGroupLayout,
     blur_pipeline: wgpu::RenderPipeline,
     blur_bind_group_layout: wgpu::BindGroupLayout,
+    smoke_pipeline: wgpu::RenderPipeline,
+    smoke_bind_group_layout: wgpu::BindGroupLayout,
     mask_pipeline: wgpu::RenderPipeline,
     mask_bind_group_layout: wgpu::BindGroupLayout,
     dummy_mask_view: wgpu::TextureView,
@@ -1331,6 +1429,36 @@ impl SceneRenderer {
             None,
         );
 
+        // Same bind group layout shape as vignette/coloradjust/blur --
+        // one input texture (`temp`, see `LoadedEffectKind::Smoke`), a
+        // sampler, and this effect's own uniform params.
+        let smoke_bind_group_layout =
+            build_effect_bind_group_layout(&device, "smoke-bind-group-layout");
+
+        let smoke_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("smoke-shader"),
+            source: wgpu::ShaderSource::Wgsl(SMOKE_SHADER.into()),
+        });
+
+        let smoke_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("smoke-pipeline-layout"),
+            bind_group_layouts: &[Some(&smoke_bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        // No blend -- the shader unconditionally writes a full replacement
+        // color for every pixel (`previous * decay + splat`, clamped),
+        // never leaving any of the target's existing content showing
+        // through, so there's nothing for hardware blending to mix in.
+        let smoke_pipeline = build_fullscreen_pipeline(
+            &device,
+            "smoke-pipeline",
+            &smoke_pipeline_layout,
+            &smoke_shader,
+            OFFSCREEN_FORMAT,
+            None,
+        );
+
         let mask_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("mask-bind-group-layout"),
@@ -1480,6 +1608,8 @@ impl SceneRenderer {
             coloradjust_bind_group_layout,
             blur_pipeline,
             blur_bind_group_layout,
+            smoke_pipeline,
+            smoke_bind_group_layout,
             mask_pipeline,
             mask_bind_group_layout,
             dummy_mask_view,
@@ -1554,6 +1684,39 @@ impl SceneRenderer {
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         (texture, view)
+    }
+
+    /// Fills `view` with fully-transparent black via a one-off render
+    /// pass, then submits it immediately -- used to zero-initialize a
+    /// persistent effect's own state texture at creation time (see
+    /// `LoadedEffectKind::Smoke::state_texture`), which -- unlike
+    /// `create_texture`/`write_texture` -- is never written from decoded
+    /// image bytes, so without this its first frame would sample
+    /// whatever undefined content the GPU happened to allocate. A rare,
+    /// one-time-per-effect-load cost, not a per-frame one.
+    fn clear_texture(&self, view: &wgpu::TextureView) {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("clear-texture-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+        self.queue.submit(Some(encoder.finish()));
     }
 
     /// Builds a layer's post-processing stack from its `effects` list --
@@ -1757,10 +1920,129 @@ impl SceneRenderer {
                         vertical_bind_group,
                     }
                 }
+                EffectKind::Smoke {
+                    color,
+                    decay,
+                    radius,
+                } => {
+                    let state_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("smoke-state-texture"),
+                        size: wgpu::Extent3d {
+                            width,
+                            height,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: OFFSCREEN_FORMAT,
+                        // RENDER_ATTACHMENT: the decay+splat pass's own
+                        // target. TEXTURE_BINDING: sampled by the
+                        // mask-blend pass. COPY_SRC: copied from every
+                        // frame in `record_draw` (see `temp_texture`
+                        // below).
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                            | wgpu::TextureUsages::TEXTURE_BINDING
+                            | wgpu::TextureUsages::COPY_SRC,
+                        view_formats: &[],
+                    });
+                    let state_view =
+                        state_texture.create_view(&wgpu::TextureViewDescriptor::default());
+                    // Unlike every other offscreen target in this
+                    // module, `state_texture` must start fully
+                    // transparent rather than whatever the GPU happened
+                    // to allocate -- it's never written from decoded
+                    // image bytes, and its very first read (this
+                    // effect's first frame) happens before any pass of
+                    // its own has written to it yet.
+                    self.clear_texture(&state_view);
+
+                    let temp_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("smoke-temp-texture"),
+                        size: wgpu::Extent3d {
+                            width,
+                            height,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: OFFSCREEN_FORMAT,
+                        // Only ever a copy destination and a sampled
+                        // input -- never a render target itself.
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING
+                            | wgpu::TextureUsages::COPY_DST,
+                        view_formats: &[],
+                    });
+                    let temp_view =
+                        temp_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+                    let uniform_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("smoke-params"),
+                        size: 32,
+                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    // Off-canvas sentinel until the first real cursor
+                    // arrives via `update_smoke_cursors` (called every
+                    // redraw tick by every consumer -- editor/player/
+                    // render-server all already do the same for
+                    // `update_xray_cursors`) -- matches the convention
+                    // `cursor_px_from_uv`/`App::pointer_frame`'s `Leave`
+                    // handling already use elsewhere for "no cursor
+                    // here".
+                    self.queue.write_buffer(
+                        &uniform_buffer,
+                        0,
+                        &smoke_uniform_bytes(*color, (-1.0e6, -1.0e6), *decay, *radius),
+                    );
+
+                    let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("smoke-bind-group"),
+                        layout: &self.smoke_bind_group_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(&temp_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(&self.sampler),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: uniform_buffer.as_entire_binding(),
+                            },
+                        ],
+                    });
+
+                    LoadedEffectKind::Smoke(Box::new(SmokeEffect {
+                        color: *color,
+                        decay: *decay,
+                        radius: *radius,
+                        width,
+                        height,
+                        state_texture,
+                        state_view,
+                        temp_texture,
+                        uniform_buffer,
+                        bind_group,
+                    }))
+                }
             };
 
+            // Every other effect kind writes its raw output into the
+            // chain's shared, every-frame-cleared `scratch` -- Smoke's
+            // is its own persistent `state_view` instead (see
+            // `LoadedEffectKind::Smoke`'s doc comment), so the mask
+            // built below has to read from whichever one actually holds
+            // this effect's output.
+            let mask_source_view = match &kind {
+                LoadedEffectKind::Smoke(smoke) => &smoke.state_view,
+                _ => &scratch_view,
+            };
             let mask =
-                self.create_loaded_mask(project_dir, &effect.mask, &scratch_view, canvas_aspect)?;
+                self.create_loaded_mask(project_dir, &effect.mask, mask_source_view, canvas_aspect)?;
 
             loaded_effects.push(LoadedEffect {
                 kind,
@@ -2200,6 +2482,64 @@ impl SceneRenderer {
         }
     }
 
+    /// Updates every Smoke effect's cursor position -- like
+    /// `update_xray_cursors`, one shared cursor position (the same
+    /// canvas/target pixel coordinates) across every layer's effect
+    /// chain in a scene. Converted into each effect's own UV space
+    /// using the *canvas's* resolution (`set_text_viewport`'s
+    /// `canvas_width`/`canvas_height`, the same space `cursor_px`
+    /// itself is expressed in) -- deliberately *not*
+    /// `LoadedEffectKind::Smoke`'s own `width`/`height`, which is the
+    /// layer's native asset resolution and can be a wildly different
+    /// scale from the canvas (see the comment inline below).
+    ///
+    /// Combines the live cursor with each Smoke effect's CPU-cached
+    /// `color`/`decay`/`radius` (see `LoadedLayer::set_effect_params`,
+    /// which never touches the GPU buffer itself) into one full
+    /// uniform-buffer write, every call -- cheap, and matches
+    /// `update_xray_cursors`'s own "just rewrite the whole thing every
+    /// tick" rationale.
+    pub fn update_smoke_cursors(&self, layers: &[LoadedLayer], cursor_px: (f32, f32)) {
+        // `cursor_px` arrives in *canvas* pixel space (the same space
+        // `set_text_viewport`'s `width`/`height` establishes, and that
+        // `text.x * canvas_width` already relies on) -- not each Smoke
+        // effect's own offscreen chain resolution, which is a given
+        // layer's *native asset* pixel size and can be a completely
+        // different scale (e.g. a 3840x2160 source image against a
+        // 480px-wide editor preview canvas). Normalizing by
+        // `smoke.width`/`smoke.height` instead of this would leave the
+        // splat clamped into whatever fraction of the canvas
+        // `smoke.width`/`canvas_width` works out to, stuck near the
+        // top-left corner -- exactly the bug this comment is here to
+        // prevent regressing.
+        let (canvas_width, canvas_height) = {
+            let glyphon = self.glyphon.lock().unwrap();
+            (glyphon.canvas_width, glyphon.canvas_height)
+        };
+        for layer in layers {
+            let chain = match layer {
+                LoadedLayer::Image(image) | LoadedLayer::Gif { image, .. } => &image.effects,
+                LoadedLayer::Xray(xray) => &xray.effects,
+                LoadedLayer::Parallax(parallax) => &parallax.effects,
+                LoadedLayer::Text(_) => continue,
+            };
+            let Some(chain) = chain else { continue };
+            for effect in &chain.effects {
+                if let LoadedEffectKind::Smoke(smoke) = &effect.kind {
+                    let cursor_uv = (
+                        cursor_px.0 / canvas_width.max(1) as f32,
+                        cursor_px.1 / canvas_height.max(1) as f32,
+                    );
+                    self.queue.write_buffer(
+                        &smoke.uniform_buffer,
+                        0,
+                        &smoke_uniform_bytes(smoke.color, cursor_uv, smoke.decay, smoke.radius),
+                    );
+                }
+            }
+        }
+    }
+
     /// Eases every parallax layer's pan towards a cursor-driven target
     /// and writes the result into its uniform buffer. `cursor_px` mirrors
     /// `update_xray_cursors` -- one shared cursor position, in the
@@ -2582,6 +2922,62 @@ impl SceneRenderer {
                             pass.set_bind_group(0, vertical_bind_group, &[]);
                             pass.draw(0..3, 0..1);
                         }
+                    }
+                    LoadedEffectKind::Smoke(smoke) => {
+                        // Snapshot last frame's persistent state into
+                        // `temp` -- a plain GPU-to-GPU copy, not a
+                        // render pass, so it doesn't hit the
+                        // can't-read-and-write-the-same-texture
+                        // restriction the decay+splat pass below would
+                        // otherwise run into by sampling and targeting
+                        // `state_texture` at once.
+                        encoder.copy_texture_to_texture(
+                            wgpu::TexelCopyTextureInfo {
+                                texture: &smoke.state_texture,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            wgpu::TexelCopyTextureInfo {
+                                texture: &smoke.temp_texture,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            wgpu::Extent3d {
+                                width: smoke.width,
+                                height: smoke.height,
+                                depth_or_array_layers: 1,
+                            },
+                        );
+
+                        // Reads `temp` (the snapshot just taken above),
+                        // writes the decayed-plus-splatted result back
+                        // into `state_view` directly -- there's no
+                        // separate `scratch` write for Smoke, this *is*
+                        // both its next frame's persistent state and
+                        // this frame's raw output for the mask-blend
+                        // pass below (see `create_effect_chain`'s
+                        // `mask_source_view` selection).
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("smoke-pass"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &smoke.state_view,
+                                depth_slice: None,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                            multiview_mask: None,
+                        });
+                        pass.set_pipeline(&self.smoke_pipeline);
+                        pass.set_bind_group(0, &smoke.bind_group, &[]);
+                        pass.draw(0..3, 0..1);
                     }
                 }
 

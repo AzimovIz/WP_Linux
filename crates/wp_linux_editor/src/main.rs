@@ -482,6 +482,7 @@ enum EffectKindSignature {
     Vignette,
     ColorAdjust,
     Blur,
+    Smoke,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -498,6 +499,7 @@ fn effect_signature(effect: &EditorEffect) -> EffectSignature {
             project_format::EffectKind::Vignette { .. } => EffectKindSignature::Vignette,
             project_format::EffectKind::ColorAdjust { .. } => EffectKindSignature::ColorAdjust,
             project_format::EffectKind::Blur { .. } => EffectKindSignature::Blur,
+            project_format::EffectKind::Smoke { .. } => EffectKindSignature::Smoke,
         },
         mask: match &effect.mask {
             EditorMask::None => MaskSignature::None,
@@ -692,6 +694,7 @@ impl Preview {
         self.renderer.advance_gifs(&mut self.layers, elapsed_ms);
         let cursor_px = cursor_local.unwrap_or((-1.0e6, -1.0e6));
         self.renderer.update_xray_cursors(&self.layers, cursor_px);
+        self.renderer.update_smoke_cursors(&self.layers, cursor_px);
         let parallax_dt_ms = elapsed_ms.saturating_sub(self.last_parallax_update_ms);
         self.last_parallax_update_ms = elapsed_ms;
         self.renderer
@@ -2361,6 +2364,17 @@ fn show_effects_panel(
                 enabled: true,
             });
         }
+        if ui.button("+ Smoke").clicked() {
+            effects.push(EditorEffect {
+                kind: project_format::EffectKind::Smoke {
+                    color: [0.6, 0.3, 0.9, 1.0],
+                    decay: 0.97,
+                    radius: 0.05,
+                },
+                mask: EditorMask::None,
+                enabled: true,
+            });
+        }
     });
 
     let mut move_up = None;
@@ -2444,6 +2458,7 @@ fn effect_kind_label(kind: &project_format::EffectKind) -> &'static str {
         project_format::EffectKind::Vignette { .. } => "Vignette",
         project_format::EffectKind::ColorAdjust { .. } => "Color adjust",
         project_format::EffectKind::Blur { .. } => "Blur",
+        project_format::EffectKind::Smoke { .. } => "Smoke",
     }
 }
 
@@ -2481,6 +2496,26 @@ fn show_effect_kind_panel(ui: &mut eframe::egui::Ui, kind: &mut project_format::
             ui.horizontal(|ui| {
                 ui.label("Radius:");
                 scroll_slider(ui, radius, 0.0..=0.1);
+            });
+        }
+        project_format::EffectKind::Smoke {
+            color,
+            decay,
+            radius,
+        } => {
+            ui.horizontal(|ui| {
+                ui.label("Color:");
+                ui.color_edit_button_rgba_unmultiplied(color);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Decay:").on_hover_text(
+                    "Fraction of the trail kept each frame -- closer to 1.0 fades slower.",
+                );
+                scroll_slider(ui, decay, 0.8..=0.999);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Splat radius:");
+                scroll_slider(ui, radius, 0.0..=0.3);
             });
         }
     }

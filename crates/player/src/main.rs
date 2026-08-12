@@ -258,6 +258,7 @@ impl App {
         let elapsed_ms = self.start.elapsed().as_millis() as u64;
         renderer.advance_gifs(&mut self.layers, elapsed_ms);
         renderer.update_xray_cursors(&self.layers, self.cursor);
+        renderer.update_smoke_cursors(&self.layers, self.cursor);
         let parallax_dt_ms = elapsed_ms.saturating_sub(self.last_parallax_update_ms);
         self.last_parallax_update_ms = elapsed_ms;
         renderer.update_parallax(&mut self.layers, self.cursor, parallax_dt_ms);

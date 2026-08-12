@@ -54,7 +54,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use player::{LoadedLayer, SceneRenderer};
-use project_format::{Layer, Project};
+use project_format::{EffectKind, Layer, Project};
 use renderer::{CANVAS_FORMAT, Canvas};
 use tiny_http::{Method, Request, Response, Server};
 use zbus::blocking::connection;
@@ -706,6 +706,7 @@ fn compose_and_encode(
     );
 
     renderer.update_xray_cursors(&project.layers, cursor_px);
+    renderer.update_smoke_cursors(&project.layers, cursor_px);
     let rgba = renderer::render_frame(renderer, &project.canvas, &project.layers);
 
     if project.dynamic {
@@ -746,10 +747,15 @@ fn load_project(renderer: &SceneRenderer, project_dir: &Path) -> Result<LoadedPr
     renderer.set_text_viewport(&mut loaded_layers, canvas_width, canvas_height);
 
     let dynamic = project.layers.iter().any(Layer::is_dynamic);
-    let needs_cursor = project
-        .layers
-        .iter()
-        .any(|l| matches!(l, Layer::Xray { .. } | Layer::Parallax { .. }));
+    // Smoke needs the cursor same as Xray/Parallax do -- unlike them,
+    // it's not its own layer variant, so this also has to look inside
+    // every layer's own effects list (see `Layer::effects`).
+    let needs_cursor = project.layers.iter().any(|l| {
+        matches!(l, Layer::Xray { .. } | Layer::Parallax { .. })
+            || l.effects()
+                .iter()
+                .any(|effect| effect.enabled && matches!(effect.kind, EffectKind::Smoke { .. }))
+    });
     let canvas = renderer::create_canvas(renderer, canvas_width, canvas_height);
     let fps = project.fps.clamp(1, 60);
     let tick_interval = Duration::from_millis(1000 / u64::from(fps));
@@ -1082,6 +1088,72 @@ mod tests {
         assert!(
             far_left[0] < 10,
             "a pixel well outside the blur radius should stay close to its original black, got {far_left:?}"
+        );
+    }
+
+    /// M6's Smoke -- the first *stateful* effect (see
+    /// `LoadedEffectKind::Smoke`'s doc comment in `player`), so unlike
+    /// every other effect test above, this one has to push a cursor
+    /// position (`SceneRenderer::update_smoke_cursors`) before
+    /// rendering -- without it the effect's uniform buffer still holds
+    /// `create_effect_chain`'s off-canvas sentinel, and there'd be
+    /// nothing to splat. A single render call is still enough to prove
+    /// the whole pipeline works: a fresh persistent state texture
+    /// starts fully transparent (`SceneRenderer::clear_texture`), so
+    /// the very first frame's splat is already visible right at the
+    /// cursor, on top of the plain black background underneath.
+    #[test]
+    fn smoke_effect_splats_color_at_the_cursor_but_leaves_the_far_corner_alone() {
+        let project_dir = unique_temp_dir();
+        let width = 64u32;
+        let height = 64u32;
+        image::RgbaImage::from_pixel(width, height, image::Rgba([0, 0, 0, 255]))
+            .save(project_dir.join("bg.png"))
+            .expect("failed to write test fixture PNG");
+
+        let project = project_format::Project {
+            name: String::new(),
+            description: String::new(),
+            fps: 30,
+            layers: vec![project_format::Layer::Image {
+                path: "bg.png".to_string(),
+                effects: vec![project_format::Effect {
+                    kind: project_format::EffectKind::Smoke {
+                        color: [1.0, 0.0, 0.0, 1.0],
+                        decay: 0.97,
+                        radius: 0.1,
+                    },
+                    mask: project_format::Mask::None,
+                    enabled: true,
+                }],
+            }],
+        };
+
+        let scene_renderer =
+            pollster::block_on(super::SceneRenderer::new_headless(renderer::CANVAS_FORMAT));
+        let layers = scene_renderer
+            .load_scene(&project_dir, &project, true)
+            .expect("load_scene failed");
+
+        scene_renderer.update_smoke_cursors(&layers, (width as f32 / 2.0, height as f32 / 2.0));
+
+        let canvas = renderer::create_canvas(&scene_renderer, width, height);
+        let pixels = renderer::render_frame(&scene_renderer, &canvas, &layers);
+
+        let pixel_at = |x: u32, y: u32| -> [u8; 4] {
+            let i = ((y * width + x) * 4) as usize;
+            [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+        };
+        let at_cursor = pixel_at(width / 2, height / 2);
+        let far_corner = pixel_at(0, 0);
+
+        assert!(
+            at_cursor[0] > 100,
+            "the splat's red should show up right at the cursor, got {at_cursor:?}"
+        );
+        assert!(
+            far_corner[0] < 10,
+            "a far corner outside the splat radius should stay close to the original black, got {far_corner:?}"
         );
     }
 

@@ -136,15 +136,40 @@ impl TextSource {
 }
 
 impl Layer {
+    /// This layer's post-processing stack, or an empty slice for `Text`
+    /// (the one variant that doesn't have one -- see `Text`'s own doc
+    /// comment). Lets callers that need to look at effects regardless
+    /// of which layer variant they're attached to (e.g. checking for an
+    /// enabled `EffectKind::Smoke`, see `is_dynamic` below) do so
+    /// without repeating this match themselves.
+    pub fn effects(&self) -> &[Effect] {
+        match self {
+            Layer::Image { effects, .. }
+            | Layer::Xray { effects, .. }
+            | Layer::Gif { effects, .. }
+            | Layer::Parallax { effects, .. } => effects,
+            Layer::Text { .. } => &[],
+        }
+    }
+
     /// Whether this layer needs continuous re-rendering (as opposed to
     /// being renderable once and left alone): anything that reacts to
-    /// the cursor or animates on its own.
+    /// the cursor or animates on its own. An otherwise-static `Image`
+    /// becomes dynamic too once it carries an enabled `Smoke` effect --
+    /// unlike every other effect kind (which only reshapes whatever the
+    /// layer already draws), Smoke has its own persistent GPU state that
+    /// evolves every frame regardless of what's underneath it.
     pub fn is_dynamic(&self) -> bool {
-        match self {
+        let dynamic_regardless_of_effects = match self {
             Layer::Xray { .. } | Layer::Gif { .. } | Layer::Parallax { .. } => true,
             Layer::Text { source, .. } => source.is_dynamic(),
             Layer::Image { .. } => false,
-        }
+        };
+        dynamic_regardless_of_effects
+            || self
+                .effects()
+                .iter()
+                .any(|effect| effect.enabled && matches!(effect.kind, EffectKind::Smoke { .. }))
     }
 }
 
@@ -208,8 +233,9 @@ pub enum Mask {
 }
 
 /// Which built-in effect this is and its own parameters -- deliberately
-/// a small closed set for now (Фаза 1 of the library in `Ideas.md`), not
-/// yet the generic user-authored `Shader` variant planned for Фаза 3.
+/// a small closed set for now (Фаза 1/2 of the library in `Ideas.md`),
+/// not yet the generic user-authored `Shader` variant planned for Фаза
+/// 3.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EffectKind {
@@ -220,6 +246,26 @@ pub enum EffectKind {
         saturation: f32,
     },
     Blur { radius: f32 },
+    /// A colored trail that persistently follows the cursor, fading
+    /// over time (Фаза 2 of the library -- the first *stateful* effect:
+    /// unlike every kind above, its GPU-side output isn't a pure
+    /// function of the layer's current content each frame, it carries
+    /// its own accumulated state forward frame to frame. See `Ideas.md`,
+    /// "Техника отрисовки для стейтфул-эффектов".
+    Smoke {
+        /// RGBA, same 0.0..=1.0-per-channel convention as `Layer::Text`'s
+        /// `color`. Splatted at the cursor position and faded by `decay`
+        /// every frame -- not a flat tint.
+        color: [f32; 4],
+        /// Fraction of the trail's own color kept each frame -- close to
+        /// 1.0 (e.g. 0.97) for a long, slow-fading trail; lower fades
+        /// faster. Values at or above 1.0 never fade at all.
+        decay: f32,
+        /// Splat radius, as a fraction of canvas size (not
+        /// aspect-corrected -- see `smoke.wgsl`'s doc comment for why
+        /// that's an acceptable simplification for a first version).
+        radius: f32,
+    },
 }
 
 /// One entry in a layer's post-processing stack -- see `Ideas.md`,
@@ -411,6 +457,52 @@ mod tests {
             }
             _ => panic!("expected Layer::Image"),
         }
+    }
+
+    #[test]
+    fn smoke_effect_round_trips_and_makes_its_layer_dynamic() {
+        let layer = Layer::Image {
+            path: "bg.png".to_string(),
+            effects: vec![Effect {
+                kind: EffectKind::Smoke {
+                    color: [0.6, 0.3, 0.9, 1.0],
+                    decay: 0.97,
+                    radius: 0.05,
+                },
+                mask: Mask::None,
+                enabled: true,
+            }],
+        };
+        assert!(layer.is_dynamic());
+
+        let json = serde_json::to_string(&layer).unwrap();
+        let round_tripped: Layer = serde_json::from_str(&json).unwrap();
+        match round_tripped {
+            Layer::Image { effects, .. } => {
+                assert!(matches!(
+                    effects[0].kind,
+                    EffectKind::Smoke { decay, .. } if decay == 0.97
+                ));
+            }
+            _ => panic!("expected Layer::Image"),
+        }
+    }
+
+    #[test]
+    fn a_disabled_smoke_effect_does_not_make_its_layer_dynamic() {
+        let layer = Layer::Image {
+            path: "bg.png".to_string(),
+            effects: vec![Effect {
+                kind: EffectKind::Smoke {
+                    color: [0.6, 0.3, 0.9, 1.0],
+                    decay: 0.97,
+                    radius: 0.05,
+                },
+                mask: Mask::None,
+                enabled: false,
+            }],
+        };
+        assert!(!layer.is_dynamic());
     }
 
     #[test]
