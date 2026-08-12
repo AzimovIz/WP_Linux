@@ -974,6 +974,117 @@ mod tests {
         assert_eq!(&pixels[0..4], &[10, 20, 30, 255]);
     }
 
+    /// M3's ColorAdjust, same real-pipeline round-trip as the Vignette
+    /// test above: a mid-gray picture pushed hard negative on brightness
+    /// should come out noticeably darker than it started.
+    #[test]
+    fn coloradjust_effect_darkens_with_negative_brightness() {
+        let project_dir = unique_temp_dir();
+        let width = 32u32;
+        let height = 32u32;
+        image::RgbaImage::from_pixel(width, height, image::Rgba([128, 128, 128, 255]))
+            .save(project_dir.join("bg.png"))
+            .expect("failed to write test fixture PNG");
+
+        let project = project_format::Project {
+            name: String::new(),
+            description: String::new(),
+            fps: 30,
+            layers: vec![project_format::Layer::Image {
+                path: "bg.png".to_string(),
+                effects: vec![project_format::Effect {
+                    kind: project_format::EffectKind::ColorAdjust {
+                        brightness: -0.5,
+                        contrast: 0.0,
+                        saturation: 0.0,
+                    },
+                    mask: project_format::Mask::None,
+                    enabled: true,
+                }],
+            }],
+        };
+
+        let scene_renderer =
+            pollster::block_on(super::SceneRenderer::new_headless(renderer::CANVAS_FORMAT));
+        let layers = scene_renderer
+            .load_scene(&project_dir, &project, true)
+            .expect("load_scene failed");
+
+        let canvas = renderer::create_canvas(&scene_renderer, width, height);
+        let pixels = renderer::render_frame(&scene_renderer, &canvas, &layers);
+
+        assert!(
+            pixels[0] < 50,
+            "128 - 0.5*255 should land near-black, got {}",
+            pixels[0]
+        );
+    }
+
+    /// M3's Blur, same real-pipeline round-trip: a hard black/white edge
+    /// down the middle of the picture should come out softened right at
+    /// the edge (an intermediate gray, not pure black or white) while a
+    /// pixel well away from the edge -- further than the blur's own
+    /// radius -- stays at its original extreme. Also exercises the
+    /// two-internal-pass (horizontal into `blur_temp`, vertical into
+    /// `scratch`) path that's unique to this effect kind among the
+    /// three implemented so far.
+    #[test]
+    fn blur_effect_softens_a_hard_edge_but_leaves_pixels_far_from_it_alone() {
+        let project_dir = unique_temp_dir();
+        let width = 64u32;
+        let height = 64u32;
+        let mut image = image::RgbaImage::new(width, height);
+        for (x, _y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = if x < width / 2 {
+                image::Rgba([0, 0, 0, 255])
+            } else {
+                image::Rgba([255, 255, 255, 255])
+            };
+        }
+        image
+            .save(project_dir.join("bg.png"))
+            .expect("failed to write test fixture PNG");
+
+        let project = project_format::Project {
+            name: String::new(),
+            description: String::new(),
+            fps: 30,
+            layers: vec![project_format::Layer::Image {
+                path: "bg.png".to_string(),
+                effects: vec![project_format::Effect {
+                    kind: project_format::EffectKind::Blur { radius: 0.08 },
+                    mask: project_format::Mask::None,
+                    enabled: true,
+                }],
+            }],
+        };
+
+        let scene_renderer =
+            pollster::block_on(super::SceneRenderer::new_headless(renderer::CANVAS_FORMAT));
+        let layers = scene_renderer
+            .load_scene(&project_dir, &project, true)
+            .expect("load_scene failed");
+
+        let canvas = renderer::create_canvas(&scene_renderer, width, height);
+        let pixels = renderer::render_frame(&scene_renderer, &canvas, &layers);
+
+        let pixel_at = |x: u32, y: u32| -> [u8; 4] {
+            let i = ((y * width + x) * 4) as usize;
+            [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+        };
+        let at_edge = pixel_at(width / 2, height / 2);
+        let far_left = pixel_at(2, height / 2);
+
+        assert!(
+            at_edge[0] > 20 && at_edge[0] < 235,
+            "the hard edge should be softened into an intermediate gray, got {at_edge:?}"
+        );
+        assert!(
+            far_left[0] < 10,
+            "a pixel well outside the blur radius should stay close to its original black, got {far_left:?}"
+        );
+    }
+
     /// Round-trips a small, non-uniform RGBA buffer through our BMP
     /// encoder and `image`'s own BMP decoder (a completely independent
     /// implementation) to catch any mistake in the header/mask/row-order

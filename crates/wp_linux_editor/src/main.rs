@@ -208,19 +208,23 @@ const WALLPAPER_ICON_GAP: f32 = 4.0;
 enum EditorLayer {
     Image {
         path: Option<PathBuf>,
+        effects: Vec<EditorEffect>,
     },
     Xray {
         base: Option<PathBuf>,
         overlay: Option<PathBuf>,
         radius: f32,
+        effects: Vec<EditorEffect>,
     },
     Gif {
         path: Option<PathBuf>,
+        effects: Vec<EditorEffect>,
     },
     Parallax {
         path: Option<PathBuf>,
         strength: f32,
         smoothing: f32,
+        effects: Vec<EditorEffect>,
     },
     Text {
         // Normalized (0.0..=1.0) canvas fractions -- see
@@ -286,6 +290,143 @@ impl EditorTextSource {
     }
 }
 
+/// One entry in a layer's effect stack, editor-side -- mirrors
+/// `project_format::Effect`. `kind` reuses `project_format::EffectKind`
+/// directly (plain numeric params, nothing an editing session needs to
+/// buffer, same as `EditorLayer::Text`'s `x`/`y`/`font_size`/`color`
+/// already reusing `project_format` types as-is); only the mask's
+/// `Texture` path deviates from `project_format::Mask`, via
+/// `EditorMask` below.
+struct EditorEffect {
+    kind: project_format::EffectKind,
+    mask: EditorMask,
+    enabled: bool,
+}
+
+impl EditorEffect {
+    /// Mirrors `EditorLayer::is_complete` -- an effect with a
+    /// `Texture` mask isn't saveable/previewable until a file's been
+    /// picked for it, same as any other asset path in this file.
+    fn is_complete(&self) -> bool {
+        match &self.mask {
+            EditorMask::Texture { path, .. } => path.is_some(),
+            EditorMask::None | EditorMask::Circle { .. } | EditorMask::Gradient { .. } => true,
+        }
+    }
+
+    fn to_project(&self) -> project_format::Effect {
+        project_format::Effect {
+            kind: self.kind.clone(),
+            mask: self.mask.to_project(),
+            enabled: self.enabled,
+        }
+    }
+}
+
+/// Mirrors `project_format::Mask`'s variants -- kept separate purely so
+/// `Texture`'s path can be an `Option<PathBuf>` fed to `path_picker`,
+/// like every other asset path in this file (`EditorLayer`'s own
+/// `path`/`base`/`overlay`), rather than `project_format::Mask`'s
+/// `String` (a relative, staged-on-save path that doesn't exist until
+/// the project itself is saved). Converted to/from
+/// `project_format::Mask` at the `open_project`/`save_project`/
+/// `build_preview_project` boundaries, same as `EditorTextSource`.
+enum EditorMask {
+    None,
+    Circle {
+        transform: project_format::Transform2D,
+        feather: f32,
+        invert: bool,
+    },
+    Gradient {
+        transform: project_format::Transform2D,
+        feather: f32,
+        invert: bool,
+    },
+    Texture {
+        path: Option<PathBuf>,
+        invert: bool,
+    },
+}
+
+impl EditorMask {
+    /// See `build_preview_project`'s doc comment on why an absolute
+    /// path here (as opposed to `save_project`'s staged relative one)
+    /// is exactly what a preview-only `Project` needs.
+    fn to_project(&self) -> project_format::Mask {
+        match self {
+            EditorMask::None => project_format::Mask::None,
+            EditorMask::Circle {
+                transform,
+                feather,
+                invert,
+            } => project_format::Mask::Circle {
+                transform: *transform,
+                feather: *feather,
+                invert: *invert,
+            },
+            EditorMask::Gradient {
+                transform,
+                feather,
+                invert,
+            } => project_format::Mask::Gradient {
+                transform: *transform,
+                feather: *feather,
+                invert: *invert,
+            },
+            EditorMask::Texture { path, invert } => project_format::Mask::Texture {
+                path: path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                invert: *invert,
+            },
+        }
+    }
+}
+
+/// Resolves a saved project's `Effect` list back into editor state,
+/// same rationale as `open_project`'s per-layer conversion -- a
+/// `Mask::Texture` path is relative to `project_dir`, same as any
+/// other asset path there.
+fn editor_effects_from_project(
+    effects: Vec<project_format::Effect>,
+    project_dir: &Path,
+) -> Vec<EditorEffect> {
+    effects
+        .into_iter()
+        .map(|effect| EditorEffect {
+            kind: effect.kind,
+            mask: match effect.mask {
+                project_format::Mask::None => EditorMask::None,
+                project_format::Mask::Circle {
+                    transform,
+                    feather,
+                    invert,
+                } => EditorMask::Circle {
+                    transform,
+                    feather,
+                    invert,
+                },
+                project_format::Mask::Gradient {
+                    transform,
+                    feather,
+                    invert,
+                } => EditorMask::Gradient {
+                    transform,
+                    feather,
+                    invert,
+                },
+                project_format::Mask::Texture { path, invert } => EditorMask::Texture {
+                    path: Some(project_dir.join(path)),
+                    invert,
+                },
+            },
+            enabled: effect.enabled,
+        })
+        .collect()
+}
+
 impl EditorLayer {
     fn label(&self) -> &'static str {
         match self {
@@ -299,10 +440,21 @@ impl EditorLayer {
 
     fn is_complete(&self) -> bool {
         match self {
-            EditorLayer::Image { path } => path.is_some(),
-            EditorLayer::Xray { base, overlay, .. } => base.is_some() && overlay.is_some(),
-            EditorLayer::Gif { path } => path.is_some(),
-            EditorLayer::Parallax { path, .. } => path.is_some(),
+            EditorLayer::Image { path, effects } => {
+                path.is_some() && effects.iter().all(EditorEffect::is_complete)
+            }
+            EditorLayer::Xray {
+                base,
+                overlay,
+                effects,
+                ..
+            } => base.is_some() && overlay.is_some() && effects.iter().all(EditorEffect::is_complete),
+            EditorLayer::Gif { path, effects } => {
+                path.is_some() && effects.iter().all(EditorEffect::is_complete)
+            }
+            EditorLayer::Parallax { path, effects, .. } => {
+                path.is_some() && effects.iter().all(EditorEffect::is_complete)
+            }
             // No external asset -- always ready to preview/save, even
             // with an empty string.
             EditorLayer::Text { .. } => true,
@@ -310,19 +462,68 @@ impl EditorLayer {
     }
 }
 
-/// What a `Preview` was last built from -- resolved asset paths only, not
-/// radius (see `Preview::sync_radii`) or fps (gif timing is derived from
-/// each gif's own per-frame delays, never from the project's target fps --
-/// see project-format's `Project::fps` doc comment). Compared each frame
+/// What one effect's *shape* was last built from -- not its numeric
+/// params (strength, transform, feather, ...), which are all
+/// live-updatable in place via `LoadedLayer::set_effect_params` (see
+/// `Preview::sync_live_params`) and so deliberately excluded here, same
+/// rationale as `LayerSignature` excluding radius/strength/smoothing.
+/// What *does* need a reload: adding/removing/reordering an effect,
+/// switching its kind (different pipeline/bind-group-layout) or its
+/// mask's variant, or repointing a `Mask::Texture` at a different file
+/// (a real texture load, not just a uniform-buffer write).
+#[derive(Clone, PartialEq, Eq)]
+struct EffectSignature {
+    kind: EffectKindSignature,
+    mask: MaskSignature,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum EffectKindSignature {
+    Vignette,
+    ColorAdjust,
+    Blur,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum MaskSignature {
+    None,
+    Circle,
+    Gradient,
+    Texture(PathBuf),
+}
+
+fn effect_signature(effect: &EditorEffect) -> EffectSignature {
+    EffectSignature {
+        kind: match effect.kind {
+            project_format::EffectKind::Vignette { .. } => EffectKindSignature::Vignette,
+            project_format::EffectKind::ColorAdjust { .. } => EffectKindSignature::ColorAdjust,
+            project_format::EffectKind::Blur { .. } => EffectKindSignature::Blur,
+        },
+        mask: match &effect.mask {
+            EditorMask::None => MaskSignature::None,
+            EditorMask::Circle { .. } => MaskSignature::Circle,
+            EditorMask::Gradient { .. } => MaskSignature::Gradient,
+            EditorMask::Texture { path, .. } => {
+                MaskSignature::Texture(path.clone().unwrap_or_default())
+            }
+        },
+    }
+}
+
+/// What a `Preview` was last built from -- resolved asset paths (plus
+/// each effect's shape, see `EffectSignature`) only, not radius (see
+/// `Preview::sync_radii`) or fps (gif timing is derived from each gif's
+/// own per-frame delays, never from the project's target fps -- see
+/// project-format's `Project::fps` doc comment). Compared each frame
 /// so a rebuild (re-decoding images, re-uploading GPU textures) only
 /// happens on an actual structural change, not every frame of, say, a
 /// slider drag.
 #[derive(Clone, PartialEq, Eq)]
 enum LayerSignature {
-    Image(PathBuf),
-    Xray(PathBuf, PathBuf),
-    Gif(PathBuf),
-    Parallax(PathBuf),
+    Image(PathBuf, Vec<EffectSignature>),
+    Xray(PathBuf, PathBuf, Vec<EffectSignature>),
+    Gif(PathBuf, Vec<EffectSignature>),
+    Parallax(PathBuf, Vec<EffectSignature>),
     // No payload -- unlike every other layer, nothing about a Text
     // layer ever requires a GPU reload; every property (including the
     // text itself) is updatable live via `SceneRenderer::set_text_params`
@@ -448,13 +649,18 @@ impl Preview {
         let scale = self.width as f32 / natural_width.max(1) as f32;
         for (loaded, editor_layer) in self.layers.iter_mut().zip(editor_layers) {
             match editor_layer {
-                EditorLayer::Xray { radius, .. } => loaded.set_xray_radius(*radius * scale),
+                EditorLayer::Xray { radius, effects, .. } => {
+                    loaded.set_xray_radius(*radius * scale);
+                    sync_effect_params(loaded, &self.renderer.queue, effects);
+                }
                 EditorLayer::Parallax {
                     strength,
                     smoothing,
+                    effects,
                     ..
                 } => {
                     loaded.set_parallax_params(*strength, *smoothing);
+                    sync_effect_params(loaded, &self.renderer.queue, effects);
                 }
                 EditorLayer::Text {
                     x,
@@ -469,7 +675,9 @@ impl Preview {
                     // button handler.
                     loaded.set_text_params(&source.to_project(), *x, *y, *font_size, *color, true);
                 }
-                EditorLayer::Image { .. } | EditorLayer::Gif { .. } => {}
+                EditorLayer::Image { effects, .. } | EditorLayer::Gif { effects, .. } => {
+                    sync_effect_params(loaded, &self.renderer.queue, effects);
+                }
             }
         }
     }
@@ -495,6 +703,20 @@ impl Preview {
 
         self.layers.iter().any(LoadedLayer::is_dynamic)
     }
+}
+
+/// Converts `effects` to `project_format::Effect` and pushes them into
+/// `loaded` via `LoadedLayer::set_effect_params` -- the per-layer-kind
+/// arms of `Preview::sync_live_params` all do exactly this on top of
+/// their own kind-specific live params, so it's pulled out here rather
+/// than repeated three times. A no-op if `loaded`'s chain isn't shaped
+/// like `effects` yet (see `set_effect_params`'s doc comment) -- that
+/// only happens for the one frame between an edit that needs a reload
+/// (see `EffectSignature`) and `ensure_scene` actually landing it.
+fn sync_effect_params(loaded: &mut LoadedLayer, queue: &wgpu::Queue, effects: &[EditorEffect]) {
+    let projected: Vec<project_format::Effect> =
+        effects.iter().map(EditorEffect::to_project).collect();
+    loaded.set_effect_params(queue, &projected);
 }
 
 fn create_preview_texture(
@@ -547,22 +769,24 @@ fn build_preview_project(layers: &[EditorLayer]) -> Option<project_format::Proje
             // `SceneRenderer::load_scene` joins them onto a base
             // directory, and `Path::join` with an absolute right-hand
             // side just returns that absolute path unchanged, so passing
-            // `Path::new("")` as the base works out.
-            // `effects: Vec::new()` throughout -- `EditorLayer` has
-            // nowhere to keep a per-layer effect stack yet (that's M4),
-            // so the preview never shows one either.
-            EditorLayer::Image { path } => project_format::Layer::Image {
+            // `Path::new("")` as the base works out. The same trick
+            // applies to a `Mask::Texture`'s path inside `effects` below
+            // -- `EditorMask::to_project` always emits an absolute
+            // display-string path, unconditionally, so it needs no
+            // special-casing here either.
+            EditorLayer::Image { path, effects } => project_format::Layer::Image {
                 path: path
                     .as_ref()
                     .expect("checked complete above")
                     .display()
                     .to_string(),
-                effects: Vec::new(),
+                effects: effects.iter().map(EditorEffect::to_project).collect(),
             },
             EditorLayer::Xray {
                 base,
                 overlay,
                 radius,
+                effects,
             } => project_format::Layer::Xray {
                 base: base
                     .as_ref()
@@ -575,20 +799,21 @@ fn build_preview_project(layers: &[EditorLayer]) -> Option<project_format::Proje
                     .display()
                     .to_string(),
                 radius: *radius,
-                effects: Vec::new(),
+                effects: effects.iter().map(EditorEffect::to_project).collect(),
             },
-            EditorLayer::Gif { path } => project_format::Layer::Gif {
+            EditorLayer::Gif { path, effects } => project_format::Layer::Gif {
                 path: path
                     .as_ref()
                     .expect("checked complete above")
                     .display()
                     .to_string(),
-                effects: Vec::new(),
+                effects: effects.iter().map(EditorEffect::to_project).collect(),
             },
             EditorLayer::Parallax {
                 path,
                 strength,
                 smoothing,
+                effects,
             } => project_format::Layer::Parallax {
                 path: path
                     .as_ref()
@@ -597,7 +822,7 @@ fn build_preview_project(layers: &[EditorLayer]) -> Option<project_format::Proje
                     .to_string(),
                 strength: *strength,
                 smoothing: *smoothing,
-                effects: Vec::new(),
+                effects: effects.iter().map(EditorEffect::to_project).collect(),
             },
             EditorLayer::Text {
                 x,
@@ -632,19 +857,28 @@ fn build_signature(layers: &[EditorLayer]) -> Vec<LayerSignature> {
     layers
         .iter()
         .map(|layer| match layer {
-            EditorLayer::Image { path } => {
-                LayerSignature::Image(path.clone().expect("checked complete by caller"))
-            }
-            EditorLayer::Xray { base, overlay, .. } => LayerSignature::Xray(
+            EditorLayer::Image { path, effects } => LayerSignature::Image(
+                path.clone().expect("checked complete by caller"),
+                effects.iter().map(effect_signature).collect(),
+            ),
+            EditorLayer::Xray {
+                base,
+                overlay,
+                effects,
+                ..
+            } => LayerSignature::Xray(
                 base.clone().expect("checked complete by caller"),
                 overlay.clone().expect("checked complete by caller"),
+                effects.iter().map(effect_signature).collect(),
             ),
-            EditorLayer::Gif { path } => {
-                LayerSignature::Gif(path.clone().expect("checked complete by caller"))
-            }
-            EditorLayer::Parallax { path, .. } => {
-                LayerSignature::Parallax(path.clone().expect("checked complete by caller"))
-            }
+            EditorLayer::Gif { path, effects } => LayerSignature::Gif(
+                path.clone().expect("checked complete by caller"),
+                effects.iter().map(effect_signature).collect(),
+            ),
+            EditorLayer::Parallax { path, effects, .. } => LayerSignature::Parallax(
+                path.clone().expect("checked complete by caller"),
+                effects.iter().map(effect_signature).collect(),
+            ),
             EditorLayer::Text { .. } => LayerSignature::Text,
         })
         .collect()
@@ -1346,7 +1580,10 @@ impl EditorApp {
         // and stop the panel from ever shrinking down to it.
         ui.horizontal_wrapped(|ui| {
             if ui.button("+ Image").clicked() {
-                self.layers.push(EditorLayer::Image { path: None });
+                self.layers.push(EditorLayer::Image {
+                    path: None,
+                    effects: Vec::new(),
+                });
                 self.selected = Some(self.layers.len() - 1);
             }
             if ui.button("+ Xray").clicked() {
@@ -1354,11 +1591,15 @@ impl EditorApp {
                     base: None,
                     overlay: None,
                     radius: 200.0,
+                    effects: Vec::new(),
                 });
                 self.selected = Some(self.layers.len() - 1);
             }
             if ui.button("+ Gif").clicked() {
-                self.layers.push(EditorLayer::Gif { path: None });
+                self.layers.push(EditorLayer::Gif {
+                    path: None,
+                    effects: Vec::new(),
+                });
                 self.selected = Some(self.layers.len() - 1);
             }
             if ui.button("+ Parallax").clicked() {
@@ -1366,6 +1607,7 @@ impl EditorApp {
                     path: None,
                     strength: 0.05,
                     smoothing: 0.15,
+                    effects: Vec::new(),
                 });
                 self.selected = Some(self.layers.len() - 1);
             }
@@ -1735,18 +1977,20 @@ impl EditorApp {
 /// own shape one level down.
 fn show_layer_panel(ui: &mut eframe::egui::Ui, layer: &mut EditorLayer) {
     match layer {
-        EditorLayer::Image { path } => show_image_panel(ui, path),
+        EditorLayer::Image { path, effects } => show_image_panel(ui, path, effects),
         EditorLayer::Xray {
             base,
             overlay,
             radius,
-        } => show_xray_panel(ui, base, overlay, radius),
-        EditorLayer::Gif { path } => show_gif_panel(ui, path),
+            effects,
+        } => show_xray_panel(ui, base, overlay, radius, effects),
+        EditorLayer::Gif { path, effects } => show_gif_panel(ui, path, effects),
         EditorLayer::Parallax {
             path,
             strength,
             smoothing,
-        } => show_parallax_panel(ui, path, strength, smoothing),
+            effects,
+        } => show_parallax_panel(ui, path, strength, smoothing, effects),
         EditorLayer::Text {
             x,
             y,
@@ -1757,8 +2001,13 @@ fn show_layer_panel(ui: &mut eframe::egui::Ui, layer: &mut EditorLayer) {
     }
 }
 
-fn show_image_panel(ui: &mut eframe::egui::Ui, path: &mut Option<PathBuf>) {
+fn show_image_panel(
+    ui: &mut eframe::egui::Ui,
+    path: &mut Option<PathBuf>,
+    effects: &mut Vec<EditorEffect>,
+) {
     path_picker(ui, "Picture", path, &["png", "jpg", "jpeg", "webp"]);
+    show_effects_panel(ui, effects);
 }
 
 fn show_xray_panel(
@@ -1766,6 +2015,7 @@ fn show_xray_panel(
     base: &mut Option<PathBuf>,
     overlay: &mut Option<PathBuf>,
     radius: &mut f32,
+    effects: &mut Vec<EditorEffect>,
 ) {
     path_picker(ui, "Base picture", base, &["png", "jpg", "jpeg", "webp"]);
     path_picker(
@@ -1778,10 +2028,16 @@ fn show_xray_panel(
         ui.label("Radius (px):");
         scroll_slider(ui, radius, 20.0..=800.0);
     });
+    show_effects_panel(ui, effects);
 }
 
-fn show_gif_panel(ui: &mut eframe::egui::Ui, path: &mut Option<PathBuf>) {
+fn show_gif_panel(
+    ui: &mut eframe::egui::Ui,
+    path: &mut Option<PathBuf>,
+    effects: &mut Vec<EditorEffect>,
+) {
     path_picker(ui, "Gif file", path, &["gif"]);
+    show_effects_panel(ui, effects);
 }
 
 fn show_parallax_panel(
@@ -1789,6 +2045,7 @@ fn show_parallax_panel(
     path: &mut Option<PathBuf>,
     strength: &mut f32,
     smoothing: &mut f32,
+    effects: &mut Vec<EditorEffect>,
 ) {
     path_picker(
         ui,
@@ -1806,6 +2063,231 @@ fn show_parallax_panel(
             "How long the pan takes to ease towards the cursor. 0 = track instantly.",
         );
         scroll_slider(ui, smoothing, 0.0..=1.0);
+    });
+    show_effects_panel(ui, effects);
+}
+
+/// Add/remove/reorder/configure a layer's post-processing stack --
+/// shared by every layer kind that has one (Image/Xray/Gif/Parallax;
+/// Text never does, see `project_format::Layer::Text`'s doc comment).
+/// Mirrors `show_layers_panel`'s own list -- a compact row per effect
+/// (enabled checkbox, kind label, reorder/remove) with the effect's own
+/// param sliders and mask config nested inside via `ui.group`.
+fn show_effects_panel(ui: &mut eframe::egui::Ui, effects: &mut Vec<EditorEffect>) {
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(8.0);
+    ui.strong("Effects");
+    ui.add_space(4.0);
+
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("+ Vignette").clicked() {
+            effects.push(EditorEffect {
+                kind: project_format::EffectKind::Vignette {
+                    strength: 0.5,
+                    softness: 0.5,
+                },
+                mask: EditorMask::None,
+                enabled: true,
+            });
+        }
+        if ui.button("+ Color adjust").clicked() {
+            effects.push(EditorEffect {
+                kind: project_format::EffectKind::ColorAdjust {
+                    brightness: 0.0,
+                    contrast: 0.0,
+                    saturation: 0.0,
+                },
+                mask: EditorMask::None,
+                enabled: true,
+            });
+        }
+        if ui.button("+ Blur").clicked() {
+            effects.push(EditorEffect {
+                kind: project_format::EffectKind::Blur { radius: 0.02 },
+                mask: EditorMask::None,
+                enabled: true,
+            });
+        }
+    });
+
+    let mut move_up = None;
+    let mut move_down = None;
+    let mut remove = None;
+
+    for (index, effect) in effects.iter_mut().enumerate() {
+        ui.add_space(4.0);
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut effect.enabled, "");
+                ui.strong(format!("#{} {}", index + 1, effect_kind_label(&effect.kind)));
+                ui.with_layout(
+                    eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
+                    |ui| {
+                        if ui.small_button("remove").clicked() {
+                            remove = Some(index);
+                        }
+                        if ui.small_button("down").clicked() {
+                            move_down = Some(index);
+                        }
+                        if ui.small_button("up").clicked() {
+                            move_up = Some(index);
+                        }
+                    },
+                );
+            });
+            ui.add_space(4.0);
+            show_effect_kind_panel(ui, &mut effect.kind);
+            ui.add_space(4.0);
+            show_mask_panel(ui, &mut effect.mask);
+        });
+    }
+
+    if let Some(index) = remove {
+        effects.remove(index);
+    }
+    if let Some(index) = move_up
+        && index > 0
+    {
+        effects.swap(index, index - 1);
+    }
+    if let Some(index) = move_down
+        && index + 1 < effects.len()
+    {
+        effects.swap(index, index + 1);
+    }
+}
+
+fn effect_kind_label(kind: &project_format::EffectKind) -> &'static str {
+    match kind {
+        project_format::EffectKind::Vignette { .. } => "Vignette",
+        project_format::EffectKind::ColorAdjust { .. } => "Color adjust",
+        project_format::EffectKind::Blur { .. } => "Blur",
+    }
+}
+
+fn show_effect_kind_panel(ui: &mut eframe::egui::Ui, kind: &mut project_format::EffectKind) {
+    match kind {
+        project_format::EffectKind::Vignette { strength, softness } => {
+            ui.horizontal(|ui| {
+                ui.label("Strength:");
+                scroll_slider(ui, strength, 0.0..=1.0);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Softness:");
+                scroll_slider(ui, softness, 0.0..=1.0);
+            });
+        }
+        project_format::EffectKind::ColorAdjust {
+            brightness,
+            contrast,
+            saturation,
+        } => {
+            ui.horizontal(|ui| {
+                ui.label("Brightness:");
+                scroll_slider(ui, brightness, -1.0..=1.0);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Contrast:");
+                scroll_slider(ui, contrast, -1.0..=1.0);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Saturation:");
+                scroll_slider(ui, saturation, -1.0..=1.0);
+            });
+        }
+        project_format::EffectKind::Blur { radius } => {
+            ui.horizontal(|ui| {
+                ui.label("Radius:");
+                scroll_slider(ui, radius, 0.0..=0.1);
+            });
+        }
+    }
+}
+
+/// Mask config for one effect -- type selector (pill buttons, same
+/// pattern as `show_text_panel`'s source selector) plus whatever fields
+/// that type needs. `None` has none; `Circle`/`Gradient` share a
+/// transform/feather/invert; `Texture` is a picked picture instead of a
+/// transform (see `EditorMask`'s doc comment).
+fn show_mask_panel(ui: &mut eframe::egui::Ui, mask: &mut EditorMask) {
+    ui.horizontal(|ui| {
+        ui.label("Mask:");
+        let is_none = matches!(mask, EditorMask::None);
+        if ui.selectable_label(is_none, "None").clicked() && !is_none {
+            *mask = EditorMask::None;
+        }
+        let is_circle = matches!(mask, EditorMask::Circle { .. });
+        if ui.selectable_label(is_circle, "Circle").clicked() && !is_circle {
+            *mask = EditorMask::Circle {
+                transform: project_format::Transform2D::default(),
+                feather: 0.2,
+                invert: false,
+            };
+        }
+        let is_gradient = matches!(mask, EditorMask::Gradient { .. });
+        if ui.selectable_label(is_gradient, "Gradient").clicked() && !is_gradient {
+            *mask = EditorMask::Gradient {
+                transform: project_format::Transform2D::default(),
+                feather: 0.2,
+                invert: false,
+            };
+        }
+        let is_texture = matches!(mask, EditorMask::Texture { .. });
+        if ui.selectable_label(is_texture, "Texture").clicked() && !is_texture {
+            *mask = EditorMask::Texture {
+                path: None,
+                invert: false,
+            };
+        }
+    });
+    match mask {
+        EditorMask::None => {}
+        EditorMask::Circle {
+            transform,
+            feather,
+            invert,
+        }
+        | EditorMask::Gradient {
+            transform,
+            feather,
+            invert,
+        } => {
+            show_transform_panel(ui, transform);
+            ui.horizontal(|ui| {
+                ui.label("Feather:");
+                scroll_slider(ui, feather, 0.0..=1.0);
+            });
+            ui.checkbox(invert, "Invert");
+        }
+        EditorMask::Texture { path, invert } => {
+            path_picker(
+                ui,
+                "Mask picture (brightness = mask)",
+                path,
+                &["png", "jpg", "jpeg", "webp"],
+            );
+            ui.checkbox(invert, "Invert");
+        }
+    }
+}
+
+fn show_transform_panel(ui: &mut eframe::egui::Ui, transform: &mut project_format::Transform2D) {
+    ui.horizontal(|ui| {
+        ui.label("X:");
+        scroll_slider(ui, &mut transform.x, 0.0..=1.0);
+    });
+    ui.horizontal(|ui| {
+        ui.label("Y:");
+        scroll_slider(ui, &mut transform.y, 0.0..=1.0);
+    });
+    ui.horizontal(|ui| {
+        ui.label("Scale:");
+        scroll_slider(ui, &mut transform.scale, 0.05..=3.0);
+    });
+    ui.horizontal(|ui| {
+        ui.label("Rotation (\u{b0}):");
+        scroll_slider(ui, &mut transform.rotation, 0.0..=360.0);
     });
 }
 
@@ -2140,37 +2622,35 @@ fn open_project(project_dir: &Path) -> Result<(Vec<EditorLayer>, u32, String), S
         .layers
         .into_iter()
         .map(|layer| match layer {
-            // `effects` dropped on the floor here -- `EditorLayer` has
-            // nowhere to keep it yet (that's M4). Until then, opening
-            // and re-saving a project with hand-authored effects in its
-            // project.json silently wipes them; nothing can create a
-            // non-empty `effects` list any other way yet, so this is a
-            // narrow, temporary gap rather than a real loss today.
-            project_format::Layer::Image { path, .. } => EditorLayer::Image {
+            project_format::Layer::Image { path, effects } => EditorLayer::Image {
                 path: Some(project_dir.join(path)),
+                effects: editor_effects_from_project(effects, &project_dir),
             },
             project_format::Layer::Xray {
                 base,
                 overlay,
                 radius,
-                ..
+                effects,
             } => EditorLayer::Xray {
                 base: Some(project_dir.join(base)),
                 overlay: Some(project_dir.join(overlay)),
                 radius,
+                effects: editor_effects_from_project(effects, &project_dir),
             },
-            project_format::Layer::Gif { path, .. } => EditorLayer::Gif {
+            project_format::Layer::Gif { path, effects } => EditorLayer::Gif {
                 path: Some(project_dir.join(path)),
+                effects: editor_effects_from_project(effects, &project_dir),
             },
             project_format::Layer::Parallax {
                 path,
                 strength,
                 smoothing,
-                ..
+                effects,
             } => EditorLayer::Parallax {
                 path: Some(project_dir.join(path)),
                 strength,
                 smoothing,
+                effects: editor_effects_from_project(effects, &project_dir),
             },
             project_format::Layer::Text {
                 x,
@@ -2228,54 +2708,80 @@ fn save_project(
             };
 
             let saved = match layer {
-                // `effects: Vec::new()` throughout -- see the matching
-                // note on `open_project`'s conversion the other
-                // direction; `EditorLayer` can't carry a non-empty one
-                // yet, so there's nothing to save until M4.
-                EditorLayer::Image { path } => {
+                EditorLayer::Image { path, effects } => {
                     let path = path.as_ref().expect("save is disabled until complete");
                     let file_name = stage(path, &format!("layer_{index}_image"))?;
+                    let effects = effects
+                        .iter()
+                        .enumerate()
+                        .map(|(effect_index, effect)| {
+                            stage_effect(&mut stage, index, effect_index, effect)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
                     project_format::Layer::Image {
                         path: file_name,
-                        effects: Vec::new(),
+                        effects,
                     }
                 }
                 EditorLayer::Xray {
                     base,
                     overlay,
                     radius,
+                    effects,
                 } => {
                     let base = base.as_ref().expect("save is disabled until complete");
                     let overlay = overlay.as_ref().expect("save is disabled until complete");
                     let base_name = stage(base, &format!("layer_{index}_xray_base"))?;
                     let overlay_name = stage(overlay, &format!("layer_{index}_xray_overlay"))?;
+                    let effects = effects
+                        .iter()
+                        .enumerate()
+                        .map(|(effect_index, effect)| {
+                            stage_effect(&mut stage, index, effect_index, effect)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
                     project_format::Layer::Xray {
                         base: base_name,
                         overlay: overlay_name,
                         radius: *radius,
-                        effects: Vec::new(),
+                        effects,
                     }
                 }
-                EditorLayer::Gif { path } => {
+                EditorLayer::Gif { path, effects } => {
                     let path = path.as_ref().expect("save is disabled until complete");
                     let file_name = stage(path, &format!("layer_{index}_anim"))?;
+                    let effects = effects
+                        .iter()
+                        .enumerate()
+                        .map(|(effect_index, effect)| {
+                            stage_effect(&mut stage, index, effect_index, effect)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
                     project_format::Layer::Gif {
                         path: file_name,
-                        effects: Vec::new(),
+                        effects,
                     }
                 }
                 EditorLayer::Parallax {
                     path,
                     strength,
                     smoothing,
+                    effects,
                 } => {
                     let path = path.as_ref().expect("save is disabled until complete");
                     let file_name = stage(path, &format!("layer_{index}_parallax"))?;
+                    let effects = effects
+                        .iter()
+                        .enumerate()
+                        .map(|(effect_index, effect)| {
+                            stage_effect(&mut stage, index, effect_index, effect)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
                     project_format::Layer::Parallax {
                         path: file_name,
                         strength: *strength,
                         smoothing: *smoothing,
-                        effects: Vec::new(),
+                        effects,
                     }
                 }
                 // No asset to stage.
@@ -2316,6 +2822,59 @@ fn save_project(
 
     let _ = std::fs::remove_dir_all(&staging_dir);
     result
+}
+
+/// Converts one effect to its saved form, staging its mask's picture
+/// (if it has one -- only `Mask::Texture` does) through `stage` the
+/// same way its owning layer's own picture(s) already are. `stage` is
+/// generic over the closure type rather than a `Box<dyn FnMut>` since
+/// each of `save_project`'s four call sites constructs its own
+/// distinctly-typed closure capturing that layer's `staged_names`/
+/// `staging_dir` -- `impl Trait` here just monomorphizes per call site,
+/// same as passing any other closure through a helper.
+fn stage_effect(
+    stage: &mut impl FnMut(&Path, &str) -> Result<String, String>,
+    layer_index: usize,
+    effect_index: usize,
+    effect: &EditorEffect,
+) -> Result<project_format::Effect, String> {
+    let mask = match &effect.mask {
+        EditorMask::None => project_format::Mask::None,
+        EditorMask::Circle {
+            transform,
+            feather,
+            invert,
+        } => project_format::Mask::Circle {
+            transform: *transform,
+            feather: *feather,
+            invert: *invert,
+        },
+        EditorMask::Gradient {
+            transform,
+            feather,
+            invert,
+        } => project_format::Mask::Gradient {
+            transform: *transform,
+            feather: *feather,
+            invert: *invert,
+        },
+        EditorMask::Texture { path, invert } => {
+            let path = path.as_ref().expect("save is disabled until complete");
+            let file_name = stage(
+                path,
+                &format!("layer_{layer_index}_effect_{effect_index}_mask"),
+            )?;
+            project_format::Mask::Texture {
+                path: file_name,
+                invert: *invert,
+            }
+        }
+    };
+    Ok(project_format::Effect {
+        kind: effect.kind.clone(),
+        mask,
+        enabled: effect.enabled,
+    })
 }
 
 /// Copies `source` into `staging_dir` under `stem` plus `source`'s
@@ -2378,12 +2937,15 @@ mod tests {
         let reordered = vec![
             EditorLayer::Image {
                 path: Some(project_dir.join("layer_2_image.png")),
+                effects: Vec::new(),
             },
             EditorLayer::Image {
                 path: Some(project_dir.join("layer_0_image.png")),
+                effects: Vec::new(),
             },
             EditorLayer::Image {
                 path: Some(project_dir.join("layer_1_image.png")),
+                effects: Vec::new(),
             },
         ];
 

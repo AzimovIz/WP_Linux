@@ -44,6 +44,8 @@ const IMAGE_SHADER: &str = include_str!("shader.wgsl");
 const XRAY_SHADER: &str = include_str!("xray.wgsl");
 const PARALLAX_SHADER: &str = include_str!("parallax.wgsl");
 const VIGNETTE_SHADER: &str = include_str!("vignette.wgsl");
+const COLORADJUST_SHADER: &str = include_str!("coloradjust.wgsl");
+const BLUR_SHADER: &str = include_str!("blur.wgsl");
 const MASK_BLEND_SHADER: &str = include_str!("mask_blend.wgsl");
 
 pub struct GifFrame {
@@ -118,6 +120,15 @@ struct EffectChain {
     accumulator_view: wgpu::TextureView,
     _scratch_texture: wgpu::Texture,
     scratch_view: wgpu::TextureView,
+    // A third offscreen buffer, unconditionally allocated alongside the
+    // two above (same rationale as `scratch` existing even for a chain
+    // that's all Vignette/ColorAdjust) -- used only by `Blur`, as the
+    // landing spot for its horizontal pass before its vertical pass
+    // reads it back out into `scratch` (see `record_draw`'s
+    // `LoadedEffectKind::Blur` handling). Every other effect kind
+    // ignores it entirely.
+    _blur_temp_texture: wgpu::Texture,
+    blur_temp_view: wgpu::TextureView,
     // Samples `accumulator_view` -- what the final composite pass in
     // `record_draw` draws through `image_pipeline` in place of the
     // layer's own native bind group, once its whole effect chain has
@@ -131,20 +142,40 @@ struct EffectChain {
 struct LoadedEffect {
     kind: LoadedEffectKind,
     mask: LoadedMask,
+    // Not baked into any bind group or shader -- checked in plain Rust
+    // by `record_draw`'s effect loop (`if !effect.enabled { continue }`),
+    // so toggling this needs no GPU write at all, just a field flip
+    // (see `LoadedLayer::set_effect_params`).
     enabled: bool,
 }
 
-/// GPU-side counterpart of [`project_format::EffectKind`] -- only
-/// `Vignette` exists yet (Фаза 1's first effect, M2); `ColorAdjust`/
-/// `Blur` (M3) add sibling variants the same way, each with its own
-/// pipeline/bind-group-layout on `SceneRenderer`.
+/// GPU-side counterpart of [`project_format::EffectKind`]. Each variant
+/// owns its own uniform buffer(s)/bind group(s) against its own
+/// pipeline/bind-group-layout on `SceneRenderer`; `uniform_buffer` (and
+/// `Blur`'s pair) are genuinely read again by
+/// `LoadedLayer::set_effect_params` on every editor frame -- unlike
+/// `LoadedMask`'s texture handles below, these aren't a "kept alive
+/// only" situation.
 enum LoadedEffectKind {
     Vignette {
-        // Not read again yet -- kept for M4's live-update
-        // (`queue.write_buffer` on slider drag, same pattern as
-        // `XrayLayer::uniform_buffer`), which doesn't exist yet.
-        _uniform_buffer: wgpu::Buffer,
+        uniform_buffer: wgpu::Buffer,
         bind_group: wgpu::BindGroup,
+    },
+    ColorAdjust {
+        uniform_buffer: wgpu::Buffer,
+        bind_group: wgpu::BindGroup,
+    },
+    // Two independent passes (see `EffectChain::blur_temp_view`'s doc
+    // comment) -- each needs its own bind group since one samples the
+    // accumulator and the other samples `blur_temp`, and its own
+    // uniform buffer since `direction` differs between them (baked in
+    // at creation time, never touched again -- only `radius` changes
+    // live, into both buffers identically).
+    Blur {
+        horizontal_uniform_buffer: wgpu::Buffer,
+        horizontal_bind_group: wgpu::BindGroup,
+        vertical_uniform_buffer: wgpu::Buffer,
+        vertical_bind_group: wgpu::BindGroup,
     },
 }
 
@@ -153,13 +184,19 @@ enum LoadedEffectKind {
 /// branches on `mask_mode` -- see `mask_blend.wgsl`), so `record_draw`'s
 /// mask-blend pass never needs its own special case for "unmasked".
 struct LoadedMask {
-    // Same "kept for M4's live-update, not read yet" situation as
-    // `LoadedEffectKind::Vignette`'s.
-    _uniform_buffer: wgpu::Buffer,
+    // Read again by `LoadedLayer::set_effect_params` (live transform/
+    // feather/invert updates), same rationale as `LoadedEffectKind`'s
+    // buffers above.
+    uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     // Only `Some` for `Mask::Texture` -- kept alive so the bind group's
     // texture view isn't dangling; never read back on the Rust side.
     _mask_texture: Option<wgpu::Texture>,
+    // `mask_uniform_bytes`' aspect-correction input -- stashed here so
+    // `set_effect_params` can rebuild this mask's uniform bytes on a
+    // live update without needing the layer's width/height threaded
+    // all the way back down to it.
+    canvas_aspect: f32,
 }
 
 pub enum LoadedLayer {
@@ -666,6 +703,95 @@ impl LoadedLayer {
         }
     }
 
+    /// Pushes each of `effects`' current numeric params (per-kind
+    /// params, mask transform/feather/invert, enabled) into an
+    /// already-loaded layer's effect chain in place, via
+    /// `queue.write_buffer` -- no GPU reload, same live-update
+    /// rationale as `set_xray_radius`/`set_text_params`. No-op on a
+    /// layer kind that never has an effect chain (Text), or one whose
+    /// chain is currently `None` (no effects).
+    ///
+    /// `effects` must be the *same shape* this layer's chain was last
+    /// built with -- same length, and each entry's `kind`/mask variant
+    /// matching what's already loaded at that index. A structural
+    /// change (added/removed effect, changed kind or mask variant,
+    /// changed a `Mask::Texture` path) needs a real reload instead (see
+    /// editor's `LayerSignature`, which is what decides whether this
+    /// method or a reload runs for a given frame). Any index past
+    /// whichever list is shorter, or whose kind/mask variant doesn't
+    /// match, is silently skipped rather than panicking -- a caller
+    /// approaching a reload decision may still call this once more
+    /// with the old (about-to-be-stale) shape before the reload lands.
+    pub fn set_effect_params(&mut self, queue: &wgpu::Queue, effects: &[Effect]) {
+        let chain = match self {
+            LoadedLayer::Image(image) | LoadedLayer::Gif { image, .. } => &mut image.effects,
+            LoadedLayer::Xray(xray) => &mut xray.effects,
+            LoadedLayer::Parallax(parallax) => &mut parallax.effects,
+            LoadedLayer::Text(_) => return,
+        };
+        let Some(chain) = chain else { return };
+
+        for (loaded, effect) in chain.effects.iter_mut().zip(effects) {
+            loaded.enabled = effect.enabled;
+
+            match (&loaded.kind, &effect.kind) {
+                (
+                    LoadedEffectKind::Vignette { uniform_buffer, .. },
+                    EffectKind::Vignette { strength, softness },
+                ) => {
+                    queue.write_buffer(
+                        uniform_buffer,
+                        0,
+                        &vignette_uniform_bytes(*strength, *softness),
+                    );
+                }
+                (
+                    LoadedEffectKind::ColorAdjust { uniform_buffer, .. },
+                    EffectKind::ColorAdjust {
+                        brightness,
+                        contrast,
+                        saturation,
+                    },
+                ) => {
+                    queue.write_buffer(
+                        uniform_buffer,
+                        0,
+                        &coloradjust_uniform_bytes(*brightness, *contrast, *saturation),
+                    );
+                }
+                (
+                    LoadedEffectKind::Blur {
+                        horizontal_uniform_buffer,
+                        vertical_uniform_buffer,
+                        ..
+                    },
+                    EffectKind::Blur { radius },
+                ) => {
+                    queue.write_buffer(
+                        horizontal_uniform_buffer,
+                        0,
+                        &blur_uniform_bytes(*radius, (1.0, 0.0)),
+                    );
+                    queue.write_buffer(
+                        vertical_uniform_buffer,
+                        0,
+                        &blur_uniform_bytes(*radius, (0.0, 1.0)),
+                    );
+                }
+                // Mismatched shape (mid-reload) -- this effect's kind
+                // params are skipped for this frame, but its mask
+                // below is independent of `kind` and still applies.
+                _ => {}
+            }
+
+            queue.write_buffer(
+                &loaded.mask.uniform_buffer,
+                0,
+                &mask_uniform_bytes(&effect.mask, loaded.mask.canvas_aspect),
+            );
+        }
+    }
+
     /// Pixel width/height of a Text layer's shaped text, in the same
     /// canvas-pixel space `x`/`y` (multiplied by canvas width/height)
     /// already use -- i.e. before any further scaling a caller (editor's
@@ -680,6 +806,111 @@ impl LoadedLayer {
             _ => None,
         }
     }
+}
+
+/// Builds the bind group layout shared by every single-input-texture
+/// effect pass (Vignette/ColorAdjust/Blur -- each direction of Blur
+/// alike): one sampled texture, one sampler, one uniform buffer of
+/// that effect's own params. `mask_pipeline`'s layout is a fourth
+/// binding (the mask texture) on top of this same shape, so it builds
+/// its own rather than reusing this helper.
+fn build_effect_bind_group_layout(device: &wgpu::Device, label: &str) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(label),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+/// Packs `VignetteParams`' bytes (`vignette.wgsl`) -- shared by
+/// `create_effect_chain`'s initial load and
+/// `LoadedLayer::set_effect_params`'s live update, so the two can never
+/// drift out of sync with each other's layout.
+fn vignette_uniform_bytes(strength: f32, softness: f32) -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    bytes[0..4].copy_from_slice(&strength.to_le_bytes());
+    bytes[4..8].copy_from_slice(&softness.to_le_bytes());
+    bytes
+}
+
+/// Packs `ColorAdjustParams`' bytes (`coloradjust.wgsl`) -- same
+/// load/live-update sharing rationale as [`vignette_uniform_bytes`].
+fn coloradjust_uniform_bytes(brightness: f32, contrast: f32, saturation: f32) -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    bytes[0..4].copy_from_slice(&brightness.to_le_bytes());
+    bytes[4..8].copy_from_slice(&contrast.to_le_bytes());
+    bytes[8..12].copy_from_slice(&saturation.to_le_bytes());
+    bytes
+}
+
+/// Packs `BlurParams`' bytes (`blur.wgsl`) for one pass -- `direction`
+/// is `(1.0, 0.0)` for the horizontal pass, `(0.0, 1.0)` for the
+/// vertical one (see `LoadedEffectKind::Blur`'s doc comment). Same
+/// load/live-update sharing rationale as [`vignette_uniform_bytes`].
+fn blur_uniform_bytes(radius: f32, direction: (f32, f32)) -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    bytes[0..4].copy_from_slice(&radius.to_le_bytes());
+    bytes[4..8].copy_from_slice(&direction.0.to_le_bytes());
+    bytes[8..12].copy_from_slice(&direction.1.to_le_bytes());
+    bytes
+}
+
+/// Packs `MaskParams`' bytes (`mask_blend.wgsl`) -- shared by
+/// `create_loaded_mask`'s initial load and
+/// `LoadedLayer::set_effect_params`'s live update. `canvas_aspect`
+/// isn't derived from `mask` itself (see `LoadedMask::canvas_aspect`'s
+/// doc comment for why a live update still has it on hand).
+fn mask_uniform_bytes(mask: &Mask, canvas_aspect: f32) -> [u8; 32] {
+    let (transform, feather, invert, mode): (Transform2D, f32, bool, f32) = match mask {
+        Mask::None => (Transform2D::default(), 0.0, false, 0.0),
+        Mask::Circle {
+            transform,
+            feather,
+            invert,
+        } => (*transform, *feather, *invert, 1.0),
+        Mask::Gradient {
+            transform,
+            feather,
+            invert,
+        } => (*transform, *feather, *invert, 2.0),
+        Mask::Texture { invert, .. } => (Transform2D::default(), 0.0, *invert, 3.0),
+    };
+    let mut bytes = [0u8; 32];
+    bytes[0..4].copy_from_slice(&transform.x.to_le_bytes());
+    bytes[4..8].copy_from_slice(&transform.y.to_le_bytes());
+    bytes[8..12].copy_from_slice(&transform.scale.to_le_bytes());
+    bytes[12..16].copy_from_slice(&transform.rotation.to_le_bytes());
+    bytes[16..20].copy_from_slice(&feather.to_le_bytes());
+    bytes[20..24].copy_from_slice(&(if invert { 1.0f32 } else { 0.0f32 }).to_le_bytes());
+    bytes[24..28].copy_from_slice(&mode.to_le_bytes());
+    bytes[28..32].copy_from_slice(&canvas_aspect.to_le_bytes());
+    bytes
 }
 
 /// Builds a single-fragment-shader, fullscreen-triangle render pipeline
@@ -743,6 +974,10 @@ pub struct SceneRenderer {
     parallax_bind_group_layout: wgpu::BindGroupLayout,
     vignette_pipeline: wgpu::RenderPipeline,
     vignette_bind_group_layout: wgpu::BindGroupLayout,
+    coloradjust_pipeline: wgpu::RenderPipeline,
+    coloradjust_bind_group_layout: wgpu::BindGroupLayout,
+    blur_pipeline: wgpu::RenderPipeline,
+    blur_bind_group_layout: wgpu::BindGroupLayout,
     mask_pipeline: wgpu::RenderPipeline,
     mask_bind_group_layout: wgpu::BindGroupLayout,
     dummy_mask_view: wgpu::TextureView,
@@ -1016,37 +1251,7 @@ impl SceneRenderer {
         // `target_view`. --
 
         let vignette_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("vignette-bind-group-layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
-            });
+            build_effect_bind_group_layout(&device, "vignette-bind-group-layout");
 
         let vignette_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("vignette-shader"),
@@ -1063,12 +1268,65 @@ impl SceneRenderer {
         // No blend -- writes its full, unmasked result straight into a
         // freshly cleared scratch texture; the following mask-blend
         // pass is what actually mixes it back against the layer's
-        // accumulated appearance.
+        // accumulated appearance. Same rationale for `coloradjust_pipeline`/
+        // `blur_pipeline` below.
         let vignette_pipeline = build_fullscreen_pipeline(
             &device,
             "vignette-pipeline",
             &vignette_pipeline_layout,
             &vignette_shader,
+            OFFSCREEN_FORMAT,
+            None,
+        );
+
+        let coloradjust_bind_group_layout =
+            build_effect_bind_group_layout(&device, "coloradjust-bind-group-layout");
+
+        let coloradjust_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("coloradjust-shader"),
+            source: wgpu::ShaderSource::Wgsl(COLORADJUST_SHADER.into()),
+        });
+
+        let coloradjust_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("coloradjust-pipeline-layout"),
+                bind_group_layouts: &[Some(&coloradjust_bind_group_layout)],
+                immediate_size: 0,
+            });
+
+        let coloradjust_pipeline = build_fullscreen_pipeline(
+            &device,
+            "coloradjust-pipeline",
+            &coloradjust_pipeline_layout,
+            &coloradjust_shader,
+            OFFSCREEN_FORMAT,
+            None,
+        );
+
+        // Same bind group layout shape as vignette/coloradjust (one
+        // input texture, reused for both the horizontal and vertical
+        // pass -- see `LoadedEffectKind::Blur`'s doc comment) -- one
+        // pipeline serves both passes, only the bind group (which
+        // texture, which `direction`) differs between them.
+        let blur_bind_group_layout =
+            build_effect_bind_group_layout(&device, "blur-bind-group-layout");
+
+        let blur_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("blur-shader"),
+            source: wgpu::ShaderSource::Wgsl(BLUR_SHADER.into()),
+        });
+
+        let blur_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("blur-pipeline-layout"),
+            bind_group_layouts: &[Some(&blur_bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        let blur_pipeline = build_fullscreen_pipeline(
+            &device,
+            "blur-pipeline",
+            &blur_pipeline_layout,
+            &blur_shader,
             OFFSCREEN_FORMAT,
             None,
         );
@@ -1218,6 +1476,10 @@ impl SceneRenderer {
             parallax_bind_group_layout,
             vignette_pipeline,
             vignette_bind_group_layout,
+            coloradjust_pipeline,
+            coloradjust_bind_group_layout,
+            blur_pipeline,
+            blur_bind_group_layout,
             mask_pipeline,
             mask_bind_group_layout,
             dummy_mask_view,
@@ -1315,6 +1577,8 @@ impl SceneRenderer {
         let (accumulator_texture, accumulator_view) =
             self.create_offscreen_render_target(width, height);
         let (scratch_texture, scratch_view) = self.create_offscreen_render_target(width, height);
+        let (blur_temp_texture, blur_temp_view) =
+            self.create_offscreen_render_target(width, height);
 
         let composite_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("effect-composite-bind-group"),
@@ -1342,10 +1606,11 @@ impl SceneRenderer {
                         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                         mapped_at_creation: false,
                     });
-                    let mut bytes = [0u8; 16];
-                    bytes[0..4].copy_from_slice(&strength.to_le_bytes());
-                    bytes[4..8].copy_from_slice(&softness.to_le_bytes());
-                    self.queue.write_buffer(&uniform_buffer, 0, &bytes);
+                    self.queue.write_buffer(
+                        &uniform_buffer,
+                        0,
+                        &vignette_uniform_bytes(*strength, *softness),
+                    );
 
                     let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("vignette-bind-group"),
@@ -1367,15 +1632,130 @@ impl SceneRenderer {
                     });
 
                     LoadedEffectKind::Vignette {
-                        _uniform_buffer: uniform_buffer,
+                        uniform_buffer,
                         bind_group,
                     }
                 }
-                // M3's job -- see the plan.
-                EffectKind::ColorAdjust { .. } | EffectKind::Blur { .. } => {
-                    return Err(
-                        "this effect kind isn't implemented by the renderer yet".to_string()
+                EffectKind::ColorAdjust {
+                    brightness,
+                    contrast,
+                    saturation,
+                } => {
+                    let uniform_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("coloradjust-params"),
+                        size: 16,
+                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    self.queue.write_buffer(
+                        &uniform_buffer,
+                        0,
+                        &coloradjust_uniform_bytes(*brightness, *contrast, *saturation),
                     );
+
+                    let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("coloradjust-bind-group"),
+                        layout: &self.coloradjust_bind_group_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(&accumulator_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(&self.sampler),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: uniform_buffer.as_entire_binding(),
+                            },
+                        ],
+                    });
+
+                    LoadedEffectKind::ColorAdjust {
+                        uniform_buffer,
+                        bind_group,
+                    }
+                }
+                EffectKind::Blur { radius } => {
+                    let horizontal_uniform_buffer =
+                        self.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("blur-horizontal-params"),
+                            size: 16,
+                            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        });
+                    self.queue.write_buffer(
+                        &horizontal_uniform_buffer,
+                        0,
+                        &blur_uniform_bytes(*radius, (1.0, 0.0)),
+                    );
+                    // Horizontal pass reads the layer's own accumulated
+                    // content (same input every other effect kind reads)
+                    // and writes into `blur_temp`.
+                    let horizontal_bind_group =
+                        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("blur-horizontal-bind-group"),
+                            layout: &self.blur_bind_group_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: wgpu::BindingResource::TextureView(
+                                        &accumulator_view,
+                                    ),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: horizontal_uniform_buffer.as_entire_binding(),
+                                },
+                            ],
+                        });
+
+                    let vertical_uniform_buffer =
+                        self.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("blur-vertical-params"),
+                            size: 16,
+                            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        });
+                    self.queue.write_buffer(
+                        &vertical_uniform_buffer,
+                        0,
+                        &blur_uniform_bytes(*radius, (0.0, 1.0)),
+                    );
+                    // Vertical pass reads the horizontal pass's own
+                    // output and writes into `scratch`, same as every
+                    // other effect kind's single pass does.
+                    let vertical_bind_group =
+                        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("blur-vertical-bind-group"),
+                            layout: &self.blur_bind_group_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: wgpu::BindingResource::TextureView(&blur_temp_view),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: vertical_uniform_buffer.as_entire_binding(),
+                                },
+                            ],
+                        });
+
+                    LoadedEffectKind::Blur {
+                        horizontal_uniform_buffer,
+                        horizontal_bind_group,
+                        vertical_uniform_buffer,
+                        vertical_bind_group,
+                    }
                 }
             };
 
@@ -1395,6 +1775,8 @@ impl SceneRenderer {
             accumulator_view,
             _scratch_texture: scratch_texture,
             scratch_view,
+            _blur_temp_texture: blur_temp_texture,
+            blur_temp_view,
             composite_bind_group,
         }))
     }
@@ -1412,21 +1794,6 @@ impl SceneRenderer {
         scratch_view: &wgpu::TextureView,
         canvas_aspect: f32,
     ) -> Result<LoadedMask, String> {
-        let (transform, feather, invert, mode): (Transform2D, f32, bool, f32) = match mask {
-            Mask::None => (Transform2D::default(), 0.0, false, 0.0),
-            Mask::Circle {
-                transform,
-                feather,
-                invert,
-            } => (*transform, *feather, *invert, 1.0),
-            Mask::Gradient {
-                transform,
-                feather,
-                invert,
-            } => (*transform, *feather, *invert, 2.0),
-            Mask::Texture { invert, .. } => (Transform2D::default(), 0.0, *invert, 3.0),
-        };
-
         // Only `Mask::Texture` actually loads a picture -- every other
         // mode's bind group points at `dummy_mask_view` instead (see its
         // own doc comment), since the shader never samples it for them.
@@ -1450,16 +1817,11 @@ impl SceneRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let mut bytes = [0u8; 32];
-        bytes[0..4].copy_from_slice(&transform.x.to_le_bytes());
-        bytes[4..8].copy_from_slice(&transform.y.to_le_bytes());
-        bytes[8..12].copy_from_slice(&transform.scale.to_le_bytes());
-        bytes[12..16].copy_from_slice(&transform.rotation.to_le_bytes());
-        bytes[16..20].copy_from_slice(&feather.to_le_bytes());
-        bytes[20..24].copy_from_slice(&(if invert { 1.0f32 } else { 0.0f32 }).to_le_bytes());
-        bytes[24..28].copy_from_slice(&mode.to_le_bytes());
-        bytes[28..32].copy_from_slice(&canvas_aspect.to_le_bytes());
-        self.queue.write_buffer(&uniform_buffer, 0, &bytes);
+        self.queue.write_buffer(
+            &uniform_buffer,
+            0,
+            &mask_uniform_bytes(mask, canvas_aspect),
+        );
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("mask-bind-group"),
@@ -1485,9 +1847,10 @@ impl SceneRenderer {
         });
 
         Ok(LoadedMask {
-            _uniform_buffer: uniform_buffer,
+            uniform_buffer,
             bind_group,
             _mask_texture: mask_texture,
+            canvas_aspect,
         })
     }
 
@@ -2119,34 +2482,107 @@ impl SceneRenderer {
                     continue;
                 }
 
-                // Effect pass: this effect's raw, unmasked result into
-                // scratch -- reads whatever the accumulator holds so
-                // far (the layer's base content, or the previous
-                // effect's already-masked-in result).
-                {
-                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("effect-pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &chain.scratch_view,
-                            depth_slice: None,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                        multiview_mask: None,
-                    });
-                    match &effect.kind {
-                        LoadedEffectKind::Vignette { bind_group, .. } => {
-                            pass.set_pipeline(&self.vignette_pipeline);
-                            pass.set_bind_group(0, bind_group, &[]);
+                // Effect pass(es): this effect's raw, unmasked result
+                // into scratch -- reads whatever the accumulator holds
+                // so far (the layer's base content, or the previous
+                // effect's already-masked-in result). Every kind but
+                // Blur is a single pass straight into `scratch`; Blur
+                // needs its own horizontal-then-vertical pair first
+                // (see `LoadedEffectKind::Blur`'s doc comment), so it's
+                // the one case with two passes here instead of one.
+                match &effect.kind {
+                    LoadedEffectKind::Vignette { bind_group, .. } => {
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("effect-pass"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &chain.scratch_view,
+                                depth_slice: None,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                            multiview_mask: None,
+                        });
+                        pass.set_pipeline(&self.vignette_pipeline);
+                        pass.set_bind_group(0, bind_group, &[]);
+                        pass.draw(0..3, 0..1);
+                    }
+                    LoadedEffectKind::ColorAdjust { bind_group, .. } => {
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("effect-pass"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &chain.scratch_view,
+                                depth_slice: None,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                            multiview_mask: None,
+                        });
+                        pass.set_pipeline(&self.coloradjust_pipeline);
+                        pass.set_bind_group(0, bind_group, &[]);
+                        pass.draw(0..3, 0..1);
+                    }
+                    LoadedEffectKind::Blur {
+                        horizontal_bind_group,
+                        vertical_bind_group,
+                        ..
+                    } => {
+                        {
+                            let mut pass =
+                                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                    label: Some("blur-horizontal-pass"),
+                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                        view: &chain.blur_temp_view,
+                                        depth_slice: None,
+                                        resolve_target: None,
+                                        ops: wgpu::Operations {
+                                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                            store: wgpu::StoreOp::Store,
+                                        },
+                                    })],
+                                    depth_stencil_attachment: None,
+                                    timestamp_writes: None,
+                                    occlusion_query_set: None,
+                                    multiview_mask: None,
+                                });
+                            pass.set_pipeline(&self.blur_pipeline);
+                            pass.set_bind_group(0, horizontal_bind_group, &[]);
+                            pass.draw(0..3, 0..1);
+                        }
+                        {
+                            let mut pass =
+                                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                    label: Some("blur-vertical-pass"),
+                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                        view: &chain.scratch_view,
+                                        depth_slice: None,
+                                        resolve_target: None,
+                                        ops: wgpu::Operations {
+                                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                            store: wgpu::StoreOp::Store,
+                                        },
+                                    })],
+                                    depth_stencil_attachment: None,
+                                    timestamp_writes: None,
+                                    occlusion_query_set: None,
+                                    multiview_mask: None,
+                                });
+                            pass.set_pipeline(&self.blur_pipeline);
+                            pass.set_bind_group(0, vertical_bind_group, &[]);
+                            pass.draw(0..3, 0..1);
                         }
                     }
-                    pass.draw(0..3, 0..1);
                 }
 
                 // Mask-blend pass: mixes scratch back into the
