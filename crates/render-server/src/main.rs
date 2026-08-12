@@ -861,6 +861,118 @@ fn text_response(code: u16, body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::encode_bmp;
+    use crate::renderer;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn unique_temp_dir() -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "wplinux-render-server-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Full round-trip through the *real* rendering code
+    /// (`SceneRenderer::load_scene`/`record_draw`), headless (no display
+    /// needed -- `SceneRenderer::new_headless` is exactly what this
+    /// process itself uses), reading pixels back to actually verify the
+    /// effect chain (M2) does something, not just that it compiles: a
+    /// vignette over a solid white picture should leave the center
+    /// close to white but darken the corner well below it.
+    #[test]
+    fn vignette_effect_darkens_corners_relative_to_center() {
+        let project_dir = unique_temp_dir();
+        let width = 64u32;
+        let height = 64u32;
+        image::RgbaImage::from_pixel(width, height, image::Rgba([255, 255, 255, 255]))
+            .save(project_dir.join("bg.png"))
+            .expect("failed to write test fixture PNG");
+
+        let project = project_format::Project {
+            name: String::new(),
+            description: String::new(),
+            fps: 30,
+            layers: vec![project_format::Layer::Image {
+                path: "bg.png".to_string(),
+                effects: vec![project_format::Effect {
+                    kind: project_format::EffectKind::Vignette {
+                        strength: 1.0,
+                        softness: 0.0,
+                    },
+                    mask: project_format::Mask::None,
+                    enabled: true,
+                }],
+            }],
+        };
+
+        let scene_renderer =
+            pollster::block_on(super::SceneRenderer::new_headless(renderer::CANVAS_FORMAT));
+        let layers = scene_renderer
+            .load_scene(&project_dir, &project, true)
+            .expect("load_scene failed");
+
+        let canvas = renderer::create_canvas(&scene_renderer, width, height);
+        let pixels = renderer::render_frame(&scene_renderer, &canvas, &layers);
+
+        let pixel_at = |x: u32, y: u32| -> [u8; 4] {
+            let i = ((y * width + x) * 4) as usize;
+            [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+        };
+        let center = pixel_at(width / 2, height / 2);
+        let corner = pixel_at(0, 0);
+
+        assert!(
+            center[0] > 200,
+            "center should stay close to the original white, got {center:?}"
+        );
+        assert!(
+            corner[0] < center[0],
+            "corner should be darkened by the vignette relative to the center -- corner={corner:?} center={center:?}"
+        );
+    }
+
+    /// The other half of the M2 regression check: a layer with an empty
+    /// `effects` list must render byte-for-byte as if the whole effect
+    /// chain machinery didn't exist -- `record_draw`'s fast path for the
+    /// common (no-effects) case is the point of `EffectChain` being
+    /// `Option`-al in the first place.
+    #[test]
+    fn layer_without_effects_is_pixel_identical_to_its_source() {
+        let project_dir = unique_temp_dir();
+        let width = 16u32;
+        let height = 16u32;
+        image::RgbaImage::from_pixel(width, height, image::Rgba([10, 20, 30, 255]))
+            .save(project_dir.join("bg.png"))
+            .expect("failed to write test fixture PNG");
+
+        let project = project_format::Project {
+            name: String::new(),
+            description: String::new(),
+            fps: 30,
+            layers: vec![project_format::Layer::Image {
+                path: "bg.png".to_string(),
+                effects: Vec::new(),
+            }],
+        };
+
+        let scene_renderer =
+            pollster::block_on(super::SceneRenderer::new_headless(renderer::CANVAS_FORMAT));
+        let layers = scene_renderer
+            .load_scene(&project_dir, &project, true)
+            .expect("load_scene failed");
+
+        let canvas = renderer::create_canvas(&scene_renderer, width, height);
+        let pixels = renderer::render_frame(&scene_renderer, &canvas, &layers);
+
+        assert_eq!(&pixels[0..4], &[10, 20, 30, 255]);
+    }
 
     /// Round-trips a small, non-uniform RGBA buffer through our BMP
     /// encoder and `image`'s own BMP decoder (a completely independent
