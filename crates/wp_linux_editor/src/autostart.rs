@@ -28,7 +28,9 @@ fn render_server_path() -> io::Result<PathBuf> {
     let exe = std::env::current_exe()?;
     let candidate = exe
         .parent()
-        .ok_or_else(|| io::Error::other("wp_linux_editor's own executable path has no parent directory"))?
+        .ok_or_else(|| {
+            io::Error::other("wp_linux_editor's own executable path has no parent directory")
+        })?
         .join("render-server");
     if candidate.is_file() {
         Ok(candidate)

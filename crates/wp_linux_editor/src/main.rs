@@ -645,6 +645,36 @@ impl EditorLayer {
             EditorLayer::Adjustment { effects } => effects.iter().all(EditorEffect::is_complete),
         }
     }
+
+    /// This layer's own effects list, if it has one -- every layer kind
+    /// but `Text` does. Pulled out to replace a five-armed match
+    /// (`Image`/`Xray`/`Gif`/`Parallax`/`Adjustment` all resolving to
+    /// `Some(effects)`, `Text` to `None`) that otherwise turns up
+    /// wherever code only cares about the effects list, independent of
+    /// which layer kind owns it (mask gizmos, painted-mask restore).
+    fn effects(&self) -> Option<&Vec<EditorEffect>> {
+        match self {
+            EditorLayer::Image { effects, .. }
+            | EditorLayer::Xray { effects, .. }
+            | EditorLayer::Gif { effects, .. }
+            | EditorLayer::Parallax { effects, .. }
+            | EditorLayer::Adjustment { effects } => Some(effects),
+            EditorLayer::Text { .. } => None,
+        }
+    }
+
+    /// Mutable counterpart of [`EditorLayer::effects`] -- see its doc
+    /// comment.
+    fn effects_mut(&mut self) -> Option<&mut Vec<EditorEffect>> {
+        match self {
+            EditorLayer::Image { effects, .. }
+            | EditorLayer::Xray { effects, .. }
+            | EditorLayer::Gif { effects, .. }
+            | EditorLayer::Parallax { effects, .. }
+            | EditorLayer::Adjustment { effects } => Some(effects),
+            EditorLayer::Text { .. } => None,
+        }
+    }
 }
 
 /// What one effect's *shape* was last built from -- not its numeric
@@ -948,15 +978,9 @@ fn sync_effect_params(loaded: &mut LoadedLayer, queue: &wgpu::Queue, effects: &[
 /// `build_preview_project`).
 fn restore_painted_masks(layers: &[LoadedLayer], editor_layers: &[EditorLayer], queue: &wgpu::Queue) {
     for (layer, editor_layer) in layers.iter().zip(editor_layers) {
-        let effects = match editor_layer {
-            EditorLayer::Image { effects, .. }
-            | EditorLayer::Xray { effects, .. }
-            | EditorLayer::Gif { effects, .. }
-            | EditorLayer::Parallax { effects, .. }
-            | EditorLayer::Adjustment { effects } => Some(effects),
-            EditorLayer::Text { .. } => None,
+        let Some(effects) = editor_layer.effects() else {
+            continue;
         };
-        let Some(effects) = effects else { continue };
         for (effect_index, effect) in effects.iter().enumerate() {
             if let EditorMask::Texture {
                 paint: Some(buffer),
@@ -2277,98 +2301,89 @@ impl EditorApp {
             if let Some(layer_index) = self.selected
                 && let Some(effect_index) = self.selected_effect
                 && let Some(layer) = self.layers.get_mut(layer_index)
-            {
-                let effects = match layer {
-                    EditorLayer::Image { effects, .. }
-                    | EditorLayer::Xray { effects, .. }
-                    | EditorLayer::Gif { effects, .. }
-                    | EditorLayer::Parallax { effects, .. }
-                    | EditorLayer::Adjustment { effects } => Some(effects),
-                    EditorLayer::Text { .. } => None,
-                };
-                if let Some(mask) = effects
+                && let Some(mask) = layer
+                    .effects_mut()
                     .and_then(|effects| effects.get_mut(effect_index))
                     .map(|effect| &mut effect.mask)
-                {
-                    match mask {
-                        EditorMask::Circle { transform, .. } => {
-                            show_circle_mask_gizmo(ui, &response, transform);
-                        }
-                        EditorMask::Gradient { transform, .. } => {
-                            show_gradient_mask_gizmo(ui, &response, transform);
-                        }
-                        EditorMask::Texture {
-                            painting: true,
-                            paint: Some(buffer),
-                            brush_radius,
-                            brush_softness,
-                            last_paint_pos,
-                            ..
-                        } => {
-                            // A dedicated interact region over the whole
-                            // preview, same pattern the gizmos above use
-                            // for their own handles -- `response` itself
-                            // only senses hover (see its own
-                            // construction above), not drag.
-                            let paint_interact = ui.interact(
-                                response.rect,
-                                ui.id().with("mask_paint"),
-                                eframe::egui::Sense::drag(),
-                            );
-                            if let Some(pos) = paint_interact.interact_pointer_pos() {
-                                let uv = (
-                                    (pos.x - response.rect.min.x) / response.rect.width().max(1.0),
-                                    (pos.y - response.rect.min.y)
-                                        / response.rect.height().max(1.0),
-                                );
-                                let erase = ui.input(|i| i.modifiers.shift);
-                                stamp_paint_buffer(
-                                    buffer,
-                                    PAINT_MASK_RESOLUTION,
-                                    *last_paint_pos,
-                                    uv,
-                                    *brush_radius,
-                                    *brush_softness,
-                                    erase,
-                                );
-                                *last_paint_pos = Some(uv);
-                                if let Some(loaded) = preview.layers.get(layer_index) {
-                                    let rgba = expand_gray_to_rgba(buffer);
-                                    loaded.write_mask_paint(
-                                        &preview.renderer.queue,
-                                        effect_index,
-                                        &rgba,
-                                        PAINT_MASK_RESOLUTION,
-                                        PAINT_MASK_RESOLUTION,
-                                    );
-                                }
-                            } else {
-                                *last_paint_pos = None;
-                            }
-                            // Brush-size feedback ring at the cursor,
-                            // aspect-corrected the same way
-                            // `show_circle_mask_gizmo` already corrects
-                            // its own radius -- painting is *not*
-                            // aspect-corrected in the buffer itself (see
-                            // `stamp_paint_buffer`'s doc comment), but
-                            // the on-screen cursor still ought to show
-                            // roughly the shape that'll land given the
-                            // canvas's own aspect ratio isn't 1:1.
-                            if let Some(pos) = response.hover_pos() {
-                                let color = if ui.input(|i| i.modifiers.shift) {
-                                    eframe::egui::Color32::LIGHT_RED
-                                } else {
-                                    eframe::egui::Color32::WHITE
-                                };
-                                ui.painter().circle_stroke(
-                                    pos,
-                                    *brush_radius * response.rect.height(),
-                                    eframe::egui::Stroke::new(1.5, color),
-                                );
-                            }
-                        }
-                        EditorMask::None | EditorMask::Texture { .. } => {}
+            {
+                match mask {
+                    EditorMask::Circle { transform, .. } => {
+                        show_circle_mask_gizmo(ui, &response, transform);
                     }
+                    EditorMask::Gradient { transform, .. } => {
+                        show_gradient_mask_gizmo(ui, &response, transform);
+                    }
+                    EditorMask::Texture {
+                        painting: true,
+                        paint: Some(buffer),
+                        brush_radius,
+                        brush_softness,
+                        last_paint_pos,
+                        ..
+                    } => {
+                        // A dedicated interact region over the whole
+                        // preview, same pattern the gizmos above use
+                        // for their own handles -- `response` itself
+                        // only senses hover (see its own
+                        // construction above), not drag.
+                        let paint_interact = ui.interact(
+                            response.rect,
+                            ui.id().with("mask_paint"),
+                            eframe::egui::Sense::drag(),
+                        );
+                        if let Some(pos) = paint_interact.interact_pointer_pos() {
+                            let uv = (
+                                (pos.x - response.rect.min.x) / response.rect.width().max(1.0),
+                                (pos.y - response.rect.min.y)
+                                    / response.rect.height().max(1.0),
+                            );
+                            let erase = ui.input(|i| i.modifiers.shift);
+                            stamp_paint_buffer(
+                                buffer,
+                                PAINT_MASK_RESOLUTION,
+                                *last_paint_pos,
+                                uv,
+                                *brush_radius,
+                                *brush_softness,
+                                erase,
+                            );
+                            *last_paint_pos = Some(uv);
+                            if let Some(loaded) = preview.layers.get(layer_index) {
+                                let rgba = expand_gray_to_rgba(buffer);
+                                loaded.write_mask_paint(
+                                    &preview.renderer.queue,
+                                    effect_index,
+                                    &rgba,
+                                    PAINT_MASK_RESOLUTION,
+                                    PAINT_MASK_RESOLUTION,
+                                );
+                            }
+                        } else {
+                            *last_paint_pos = None;
+                        }
+                        // Brush-size feedback ring at the cursor,
+                        // aspect-corrected the same way
+                        // `show_circle_mask_gizmo` already corrects
+                        // its own radius -- painting is *not*
+                        // aspect-corrected in the buffer itself (see
+                        // `stamp_paint_buffer`'s doc comment), but
+                        // the on-screen cursor still ought to show
+                        // roughly the shape that'll land given the
+                        // canvas's own aspect ratio isn't 1:1.
+                        if let Some(pos) = response.hover_pos() {
+                            let color = if ui.input(|i| i.modifiers.shift) {
+                                eframe::egui::Color32::LIGHT_RED
+                            } else {
+                                eframe::egui::Color32::WHITE
+                            };
+                            ui.painter().circle_stroke(
+                                pos,
+                                *brush_radius * response.rect.height(),
+                                eframe::egui::Stroke::new(1.5, color),
+                            );
+                        }
+                    }
+                    EditorMask::None | EditorMask::Texture { .. } => {}
                 }
             }
 
@@ -2626,10 +2641,7 @@ fn show_xray_panel(
         overlay,
         &["png", "jpg", "jpeg", "webp"],
     );
-    ui.horizontal(|ui| {
-        ui.label("Radius (px):");
-        scroll_slider(ui, radius, 20.0..=800.0);
-    });
+    labeled_slider(ui, "Radius (px):", radius, 20.0..=800.0);
     show_effects_panel(ui, effects, selected_effect);
 }
 
@@ -2657,17 +2669,11 @@ fn show_parallax_panel(
         path,
         &["png", "jpg", "jpeg", "webp"],
     );
-    ui.horizontal(|ui| {
-        ui.label("Strength:")
-            .on_hover_text("How far the layer pans at the screen edge, as a fraction of its own size. Negative pans towards the cursor instead of away from it.");
-        scroll_slider(ui, strength, -0.4..=0.4);
-    });
-    ui.horizontal(|ui| {
-        ui.label("Smoothing (s):").on_hover_text(
-            "How long the pan takes to ease towards the cursor. 0 = track instantly.",
-        );
-        scroll_slider(ui, smoothing, 0.0..=1.0);
-    });
+    labeled_slider(ui, "Strength:", strength, -0.4..=0.4)
+        .on_hover_text("How far the layer pans at the screen edge, as a fraction of its own size. Negative pans towards the cursor instead of away from it.");
+    labeled_slider(ui, "Smoothing (s):", smoothing, 0.0..=1.0).on_hover_text(
+        "How long the pan takes to ease towards the cursor. 0 = track instantly.",
+    );
     show_effects_panel(ui, effects, selected_effect);
 }
 
@@ -2829,38 +2835,20 @@ fn effect_kind_label(kind: &EditorEffectKind) -> &'static str {
 fn show_effect_kind_panel(ui: &mut eframe::egui::Ui, kind: &mut EditorEffectKind) {
     match kind {
         EditorEffectKind::Vignette { strength, softness } => {
-            ui.horizontal(|ui| {
-                ui.label("Strength:");
-                scroll_slider(ui, strength, 0.0..=1.0);
-            });
-            ui.horizontal(|ui| {
-                ui.label("Softness:");
-                scroll_slider(ui, softness, 0.0..=1.0);
-            });
+            labeled_slider(ui, "Strength:", strength, 0.0..=1.0);
+            labeled_slider(ui, "Softness:", softness, 0.0..=1.0);
         }
         EditorEffectKind::ColorAdjust {
             brightness,
             contrast,
             saturation,
         } => {
-            ui.horizontal(|ui| {
-                ui.label("Brightness:");
-                scroll_slider(ui, brightness, -1.0..=1.0);
-            });
-            ui.horizontal(|ui| {
-                ui.label("Contrast:");
-                scroll_slider(ui, contrast, -1.0..=1.0);
-            });
-            ui.horizontal(|ui| {
-                ui.label("Saturation:");
-                scroll_slider(ui, saturation, -1.0..=1.0);
-            });
+            labeled_slider(ui, "Brightness:", brightness, -1.0..=1.0);
+            labeled_slider(ui, "Contrast:", contrast, -1.0..=1.0);
+            labeled_slider(ui, "Saturation:", saturation, -1.0..=1.0);
         }
         EditorEffectKind::Blur { radius } => {
-            ui.horizontal(|ui| {
-                ui.label("Radius:");
-                scroll_slider(ui, radius, 0.0..=0.1);
-            });
+            labeled_slider(ui, "Radius:", radius, 0.0..=0.1);
         }
         EditorEffectKind::Smoke {
             color,
@@ -2871,16 +2859,10 @@ fn show_effect_kind_panel(ui: &mut eframe::egui::Ui, kind: &mut EditorEffectKind
                 ui.label("Color:");
                 ui.color_edit_button_rgba_unmultiplied(color);
             });
-            ui.horizontal(|ui| {
-                ui.label("Decay:").on_hover_text(
-                    "Fraction of the trail kept each frame -- closer to 1.0 fades slower.",
-                );
-                scroll_slider(ui, decay, 0.8..=0.999);
-            });
-            ui.horizontal(|ui| {
-                ui.label("Splat radius:");
-                scroll_slider(ui, radius, 0.0..=0.3);
-            });
+            labeled_slider(ui, "Decay:", decay, 0.8..=0.999).on_hover_text(
+                "Fraction of the trail kept each frame -- closer to 1.0 fades slower.",
+            );
+            labeled_slider(ui, "Splat radius:", radius, 0.0..=0.3);
         }
         EditorEffectKind::Shader { wgsl_path, params } => {
             show_shader_effect_panel(ui, wgsl_path, params);
@@ -2939,10 +2921,12 @@ fn show_shader_effect_panel(
     }
 
     for (spec, value) in specs.iter().zip(params.iter_mut()) {
-        ui.horizontal(|ui| {
-            ui.label(format!("{}:", spec.label));
-            scroll_slider(ui, value, spec.range.0..=spec.range.1);
-        });
+        labeled_slider(
+            ui,
+            &format!("{}:", spec.label),
+            value,
+            spec.range.0..=spec.range.1,
+        );
     }
 }
 
@@ -3015,10 +2999,7 @@ fn show_mask_panel(
             invert,
         } => {
             show_transform_panel(ui, transform);
-            ui.horizontal(|ui| {
-                ui.label("Feather:");
-                scroll_slider(ui, feather, 0.0..=1.0);
-            });
+            labeled_slider(ui, "Feather:", feather, 0.0..=1.0);
             ui.checkbox(invert, "Invert");
         }
         EditorMask::Texture {
@@ -3086,14 +3067,8 @@ fn show_mask_panel(
                 }
             });
             if paint.is_some() {
-                ui.horizontal(|ui| {
-                    ui.label("Brush size:");
-                    scroll_slider(ui, brush_radius, 0.01..=0.3);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Brush softness:");
-                    scroll_slider(ui, brush_softness, 0.0..=1.0);
-                });
+                labeled_slider(ui, "Brush size:", brush_radius, 0.01..=0.3);
+                labeled_slider(ui, "Brush softness:", brush_softness, 0.0..=1.0);
             }
         }
     }
@@ -3235,22 +3210,10 @@ fn stamp_once(
 }
 
 fn show_transform_panel(ui: &mut eframe::egui::Ui, transform: &mut project_format::Transform2D) {
-    ui.horizontal(|ui| {
-        ui.label("X:");
-        scroll_slider(ui, &mut transform.x, 0.0..=1.0);
-    });
-    ui.horizontal(|ui| {
-        ui.label("Y:");
-        scroll_slider(ui, &mut transform.y, 0.0..=1.0);
-    });
-    ui.horizontal(|ui| {
-        ui.label("Scale:");
-        scroll_slider(ui, &mut transform.scale, 0.05..=3.0);
-    });
-    ui.horizontal(|ui| {
-        ui.label("Rotation (\u{b0}):");
-        scroll_slider(ui, &mut transform.rotation, 0.0..=360.0);
-    });
+    labeled_slider(ui, "X:", &mut transform.x, 0.0..=1.0);
+    labeled_slider(ui, "Y:", &mut transform.y, 0.0..=1.0);
+    labeled_slider(ui, "Scale:", &mut transform.scale, 0.05..=3.0);
+    labeled_slider(ui, "Rotation (\u{b0}):", &mut transform.rotation, 0.0..=360.0);
 }
 
 fn show_text_panel(
@@ -3314,23 +3277,14 @@ fn show_text_panel(
             });
         }
     }
-    ui.horizontal(|ui| {
-        ui.label("Font size:")
-            .on_hover_text("Fraction of canvas height -- resolution-independent.");
-        scroll_slider(ui, font_size, 0.01..=0.3);
-    });
+    labeled_slider(ui, "Font size:", font_size, 0.01..=0.3)
+        .on_hover_text("Fraction of canvas height -- resolution-independent.");
     ui.horizontal(|ui| {
         ui.label("Color:");
         ui.color_edit_button_rgba_unmultiplied(color);
     });
-    ui.horizontal(|ui| {
-        ui.label("X:");
-        scroll_slider(ui, x, 0.0..=1.0);
-    });
-    ui.horizontal(|ui| {
-        ui.label("Y:");
-        scroll_slider(ui, y, 0.0..=1.0);
-    });
+    labeled_slider(ui, "X:", x, 0.0..=1.0);
+    labeled_slider(ui, "Y:", y, 0.0..=1.0);
 }
 
 /// Thumbnails saved into the library -- deliberately smaller than the
@@ -3535,6 +3489,25 @@ fn scroll_slider<Num: eframe::egui::emath::Numeric>(
     }
     ui.add(eframe::egui::DragValue::new(value));
     slider_response
+}
+
+/// `ui.label(label)` followed by [`scroll_slider`] on the same row -- the
+/// shape a labeled slider takes at every one of this file's ~20 call
+/// sites. Returns the label's own `Response`, not the slider's, so a
+/// caller that documents a non-obvious unit or behavior can still chain
+/// `.on_hover_text(...)` exactly as if it had written `ui.label` by hand.
+fn labeled_slider<Num: eframe::egui::emath::Numeric>(
+    ui: &mut eframe::egui::Ui,
+    label: &str,
+    value: &mut Num,
+    range: std::ops::RangeInclusive<Num>,
+) -> eframe::egui::Response {
+    let mut label_response = None;
+    ui.horizontal(|ui| {
+        label_response = Some(ui.label(label));
+        scroll_slider(ui, value, range);
+    });
+    label_response.expect("the horizontal closure above always runs exactly once")
 }
 
 /// Shows `label`, a Browse button, and the chosen file's name -- full

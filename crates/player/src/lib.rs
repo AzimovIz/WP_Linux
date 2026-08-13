@@ -822,6 +822,37 @@ impl LoadedLayer {
         }
     }
 
+    /// This layer's own effect chain, if it has one -- every layer kind
+    /// but `Text` can (`None` either because it's a layer kind that
+    /// never gets one, or because its `effects` list happened to be
+    /// empty at load time -- see `EffectChain`'s doc comment; callers
+    /// don't need to tell the two apart). The read-only counterpart of
+    /// [`LoadedLayer::effects_mut`] -- kept as a pair of small dispatch
+    /// methods rather than a `RenderOp`-style trait since, unlike
+    /// drawing, there's no per-kind behavior here to specialize, only a
+    /// field to reach through five near-identical shapes.
+    fn effects(&self) -> Option<&EffectChain> {
+        match self {
+            LoadedLayer::Image(image) | LoadedLayer::Gif { image, .. } => image.effects.as_ref(),
+            LoadedLayer::Xray(xray) => xray.effects.as_ref(),
+            LoadedLayer::Parallax(parallax) => parallax.effects.as_ref(),
+            LoadedLayer::Adjustment(adjustment) => adjustment.effects.as_ref(),
+            LoadedLayer::Text(_) => None,
+        }
+    }
+
+    /// Mutable counterpart of [`LoadedLayer::effects`] -- see its doc
+    /// comment.
+    fn effects_mut(&mut self) -> Option<&mut EffectChain> {
+        match self {
+            LoadedLayer::Image(image) | LoadedLayer::Gif { image, .. } => image.effects.as_mut(),
+            LoadedLayer::Xray(xray) => xray.effects.as_mut(),
+            LoadedLayer::Parallax(parallax) => parallax.effects.as_mut(),
+            LoadedLayer::Adjustment(adjustment) => adjustment.effects.as_mut(),
+            LoadedLayer::Text(_) => None,
+        }
+    }
+
     /// Pushes each of `effects`' current numeric params (per-kind
     /// params, mask transform/feather/invert, enabled) into an
     /// already-loaded layer's effect chain in place, via
@@ -842,14 +873,9 @@ impl LoadedLayer {
     /// approaching a reload decision may still call this once more
     /// with the old (about-to-be-stale) shape before the reload lands.
     pub fn set_effect_params(&mut self, queue: &wgpu::Queue, effects: &[Effect]) {
-        let chain = match self {
-            LoadedLayer::Image(image) | LoadedLayer::Gif { image, .. } => &mut image.effects,
-            LoadedLayer::Xray(xray) => &mut xray.effects,
-            LoadedLayer::Parallax(parallax) => &mut parallax.effects,
-            LoadedLayer::Adjustment(adjustment) => &mut adjustment.effects,
-            LoadedLayer::Text(_) => return,
+        let Some(chain) = self.effects_mut() else {
+            return;
         };
-        let Some(chain) = chain else { return };
 
         for (loaded, effect) in chain.effects.iter_mut().zip(effects) {
             loaded.enabled = effect.enabled;
@@ -970,14 +996,9 @@ impl LoadedLayer {
         width: u32,
         height: u32,
     ) {
-        let chain = match self {
-            LoadedLayer::Image(image) | LoadedLayer::Gif { image, .. } => &image.effects,
-            LoadedLayer::Xray(xray) => &xray.effects,
-            LoadedLayer::Parallax(parallax) => &parallax.effects,
-            LoadedLayer::Adjustment(adjustment) => &adjustment.effects,
-            LoadedLayer::Text(_) => return,
+        let Some(chain) = self.effects() else {
+            return;
         };
-        let Some(chain) = chain else { return };
         let Some(effect) = chain.effects.get(effect_index) else {
             return;
         };
@@ -1061,6 +1082,39 @@ trait RenderOp {
     );
 }
 
+/// Opens a single-color-attachment render pass on `view` -- the shape
+/// every render pass in this module shares (a fullscreen-triangle draw
+/// needs nothing else: no depth/stencil, no multisampling resolve, no
+/// timestamp/occlusion queries), differing only in which texture it
+/// targets and whether it starts from the target's existing contents
+/// (`LoadOp::Load`) or replaces them (`LoadOp::Clear`). Pulled out once
+/// M10's per-`RenderOp` dispatch multiplied this module's total number of
+/// passes -- every call site used to spell out the same eight-field
+/// `RenderPassDescriptor` by hand.
+fn begin_pass<'e>(
+    encoder: &'e mut wgpu::CommandEncoder,
+    label: &str,
+    view: &wgpu::TextureView,
+    load: wgpu::LoadOp<wgpu::Color>,
+) -> wgpu::RenderPass<'e> {
+    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load,
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    })
+}
+
 /// Draws one fullscreen triangle through `pipeline`/`bind_group` onto
 /// `target.view`, blending (`Load`) with whatever's already there -- the
 /// common shape every `RenderOp::record` impl below ends with.
@@ -1070,22 +1124,7 @@ fn blend_onto(
     bind_group: &wgpu::BindGroup,
     target: &SceneAccumulator,
 ) {
-    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-        label: Some("render-op-pass"),
-        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-            view: &target.view,
-            depth_slice: None,
-            resolve_target: None,
-            ops: wgpu::Operations {
-                load: wgpu::LoadOp::Load,
-                store: wgpu::StoreOp::Store,
-            },
-        })],
-        depth_stencil_attachment: None,
-        timestamp_writes: None,
-        occlusion_query_set: None,
-        multiview_mask: None,
-    });
+    let mut pass = begin_pass(encoder, "render-op-pass", &target.view, wgpu::LoadOp::Load);
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, bind_group, &[]);
     pass.draw(0..3, 0..1);
@@ -1115,22 +1154,12 @@ fn run_own_chain_if_any<'a>(
     // own private accumulator -- no blending needed, it's the first
     // and only thing drawn onto a texture just cleared to transparent.
     {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("effect-base-pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &chain.accumulator_view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
+        let mut pass = begin_pass(
+            encoder,
+            "effect-base-pass",
+            &chain.accumulator_view,
+            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+        );
         pass.set_pipeline(native_pipeline_offscreen);
         pass.set_bind_group(0, native_bind_group, &[]);
         pass.draw(0..3, 0..1);
@@ -1242,22 +1271,7 @@ impl RenderOp for TextLayer {
                 .expect("glyphon text layout failed");
         }
 
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("text-pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &target.view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
+        let mut pass = begin_pass(encoder, "text-pass", &target.view, wgpu::LoadOp::Load);
         text_renderer
             .render(&glyphon.atlas, &glyphon.viewport, &mut pass)
             .expect("glyphon text render failed");
@@ -2298,24 +2312,12 @@ impl SceneRenderer {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        {
-            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("clear-texture-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-        }
+        begin_pass(
+            &mut encoder,
+            "clear-texture-pass",
+            view,
+            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+        );
         self.queue.submit(Some(encoder.finish()));
     }
 
@@ -3265,14 +3267,9 @@ impl SceneRenderer {
             (glyphon.canvas_width, glyphon.canvas_height)
         };
         for layer in layers {
-            let chain = match layer {
-                LoadedLayer::Image(image) | LoadedLayer::Gif { image, .. } => &image.effects,
-                LoadedLayer::Xray(xray) => &xray.effects,
-                LoadedLayer::Parallax(parallax) => &parallax.effects,
-                LoadedLayer::Adjustment(adjustment) => &adjustment.effects,
-                LoadedLayer::Text(_) => continue,
+            let Some(chain) = layer.effects() else {
+                continue;
             };
-            let Some(chain) = chain else { continue };
             for effect in &chain.effects {
                 if let LoadedEffectKind::Smoke(smoke) = &effect.kind {
                     let cursor_uv = (
@@ -3314,14 +3311,9 @@ impl SceneRenderer {
             cursor_px.1 / canvas_height.max(1) as f32,
         );
         for layer in layers {
-            let chain = match layer {
-                LoadedLayer::Image(image) | LoadedLayer::Gif { image, .. } => &image.effects,
-                LoadedLayer::Xray(xray) => &xray.effects,
-                LoadedLayer::Parallax(parallax) => &parallax.effects,
-                LoadedLayer::Adjustment(adjustment) => &adjustment.effects,
-                LoadedLayer::Text(_) => continue,
+            let Some(chain) = layer.effects() else {
+                continue;
             };
-            let Some(chain) = chain else { continue };
             let canvas_aspect = {
                 let (width, height) = layer.size();
                 width as f32 / (height.max(1) as f32)
@@ -3545,22 +3537,12 @@ impl SceneRenderer {
         // Establishes the whole frame's starting state -- every draw
         // after this uses `Load` unconditionally, whether it's the very
         // first ordinary layer or a Text layer prepared alone.
-        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("scene-accumulator-clear-pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &accumulator.view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(clear_color),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
+        begin_pass(
+            encoder,
+            "scene-accumulator-clear-pass",
+            &accumulator.view,
+            wgpu::LoadOp::Clear(clear_color),
+        );
 
         for layer in layers {
             if let Some(op) = layer.as_render_op() {
@@ -3568,22 +3550,12 @@ impl SceneRenderer {
             }
         }
 
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("composite-pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: target_view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(clear_color),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
+        let mut pass = begin_pass(
+            encoder,
+            "composite-pass",
+            target_view,
+            wgpu::LoadOp::Clear(clear_color),
+        );
         pass.set_pipeline(&self.image_pipeline);
         pass.set_bind_group(0, &accumulator.bind_group, &[]);
         pass.draw(0..3, 0..1);
@@ -3616,43 +3588,23 @@ impl SceneRenderer {
             // case with two passes here instead of one.
             match &effect.kind {
                 LoadedEffectKind::Vignette { bind_group, .. } => {
-                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("effect-pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &chain.scratch_view,
-                            depth_slice: None,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                        multiview_mask: None,
-                    });
+                    let mut pass = begin_pass(
+                        encoder,
+                        "effect-pass",
+                        &chain.scratch_view,
+                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    );
                     pass.set_pipeline(&self.vignette_pipeline);
                     pass.set_bind_group(0, bind_group, &[]);
                     pass.draw(0..3, 0..1);
                 }
                 LoadedEffectKind::ColorAdjust { bind_group, .. } => {
-                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("effect-pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &chain.scratch_view,
-                            depth_slice: None,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                        multiview_mask: None,
-                    });
+                    let mut pass = begin_pass(
+                        encoder,
+                        "effect-pass",
+                        &chain.scratch_view,
+                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    );
                     pass.set_pipeline(&self.coloradjust_pipeline);
                     pass.set_bind_group(0, bind_group, &[]);
                     pass.draw(0..3, 0..1);
@@ -3663,43 +3615,23 @@ impl SceneRenderer {
                     ..
                 } => {
                     {
-                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("blur-horizontal-pass"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &chain.blur_temp_view,
-                                depth_slice: None,
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                    store: wgpu::StoreOp::Store,
-                                },
-                            })],
-                            depth_stencil_attachment: None,
-                            timestamp_writes: None,
-                            occlusion_query_set: None,
-                            multiview_mask: None,
-                        });
+                        let mut pass = begin_pass(
+                            encoder,
+                            "blur-horizontal-pass",
+                            &chain.blur_temp_view,
+                            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        );
                         pass.set_pipeline(&self.blur_pipeline);
                         pass.set_bind_group(0, horizontal_bind_group, &[]);
                         pass.draw(0..3, 0..1);
                     }
                     {
-                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("blur-vertical-pass"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &chain.scratch_view,
-                                depth_slice: None,
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                    store: wgpu::StoreOp::Store,
-                                },
-                            })],
-                            depth_stencil_attachment: None,
-                            timestamp_writes: None,
-                            occlusion_query_set: None,
-                            multiview_mask: None,
-                        });
+                        let mut pass = begin_pass(
+                            encoder,
+                            "blur-vertical-pass",
+                            &chain.scratch_view,
+                            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        );
                         pass.set_pipeline(&self.blur_pipeline);
                         pass.set_bind_group(0, vertical_bind_group, &[]);
                         pass.draw(0..3, 0..1);
@@ -3740,22 +3672,12 @@ impl SceneRenderer {
                     // output for the mask-blend pass below (see
                     // `create_effect_chain`'s `mask_source_view`
                     // selection).
-                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("smoke-pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &smoke.state_view,
-                            depth_slice: None,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                        multiview_mask: None,
-                    });
+                    let mut pass = begin_pass(
+                        encoder,
+                        "smoke-pass",
+                        &smoke.state_view,
+                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    );
                     pass.set_pipeline(&self.smoke_pipeline);
                     pass.set_bind_group(0, &smoke.bind_group, &[]);
                     pass.draw(0..3, 0..1);
@@ -3771,22 +3693,12 @@ impl SceneRenderer {
                     // per instance (its own compiled shader module, not
                     // one shared on `SceneRenderer` -- see
                     // `ShaderEffect`'s doc comment).
-                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("shader-effect-pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &chain.scratch_view,
-                            depth_slice: None,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                        multiview_mask: None,
-                    });
+                    let mut pass = begin_pass(
+                        encoder,
+                        "shader-effect-pass",
+                        &chain.scratch_view,
+                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    );
                     pass.set_pipeline(&shader.pipeline);
                     pass.set_bind_group(0, &shader.bind_group, &[]);
                     pass.draw(0..3, 0..1);
@@ -3798,22 +3710,12 @@ impl SceneRenderer {
             // module doc comment for why this only needs to read
             // `scratch`, not the accumulator too.
             {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("mask-blend-pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &chain.accumulator_view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
+                let mut pass = begin_pass(
+                    encoder,
+                    "mask-blend-pass",
+                    &chain.accumulator_view,
+                    wgpu::LoadOp::Load,
+                );
                 pass.set_pipeline(&self.mask_pipeline);
                 pass.set_bind_group(0, &effect.mask.bind_group, &[]);
                 pass.draw(0..3, 0..1);
