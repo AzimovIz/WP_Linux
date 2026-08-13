@@ -53,8 +53,31 @@ desktops aren't supported yet.
   depth; stack several with increasing strength for a full parallax effect.
   Auto-zoomed just enough that no edge is ever exposed, regardless of the
   source picture's own size.
+- **Text** layers -- a string drawn at an arbitrary position, dragged
+  directly on the live preview rather than typed into sliders. Three
+  sources: a fixed string, a live clock (any strftime-style format), or a
+  shell command's output, re-run on a timer. Uses a bundled font (Noto
+  Sans, full Latin/Cyrillic coverage) by default, or your own `.ttf`/`.otf`.
+- **Adjustment** layers -- no picture of their own; take whatever every
+  layer below them has already composited and run their own effect stack
+  on *that* -- one color-grade or pulse effect over the whole finished
+  picture instead of repeating it on every layer.
+- Any Image/Gif/Xray/Parallax/Adjustment layer can carry a stack of
+  **post-processing effects**: Vignette, Color adjust, Blur, a persistent
+  cursor-following Smoke trail, or a fully custom effect you write
+  yourself in WGSL (see
+  [Writing your own Shader effect](#writing-your-own-shader-effect)) --
+  edited live, with the preview updating immediately.
+- Each effect can be **masked** to only part of the layer: a circle or
+  gradient (dragged/scaled/rotated directly on the preview, not just
+  sliders), or a picture -- either picked from disk or painted by hand
+  with a brush right on the preview.
+- A Text layer's Command source only ever runs for projects you've saved
+  yourself in the editor (auto-trusted on save) -- opening someone else's
+  project file never silently executes a shell command; an untrusted
+  Command source just shows "NULL".
 - Layers composite bottom to top with alpha blending on the GPU (wgpu,
-  Vulkan or GL).
+  Vulkan or GL), in the order they appear in the layer list.
 - Rendering automatically freezes on the last frame when the system's power
   profile switches to power-saver (via `power-profiles-daemon`), and resumes
   when it switches back -- nothing to pause by hand.
@@ -62,14 +85,14 @@ desktops aren't supported yet.
   laptops, avoiding a multi-hundred-millisecond wake-up on every frame.
 - `wp_linux_editor` has a live GPU preview built from the exact same compositor and
   shaders `render-server` uses in production, not a separate
-  reimplementation -- gif animation and xray cursor reactivity look right
-  while you're still editing.
+  reimplementation -- gif animation, xray cursor reactivity, and every
+  effect/mask above look right while you're still editing.
 
 ## How it's put together
 
 | Component | What it does |
 |---|---|
-| `crates/project-format` | Shared `project.json` schema (layers + target fps) -- the on-disk wallpaper project format. |
+| `crates/project-format` | Shared `project.json` schema -- layers (their post-processing effects, masks, and, for Text, its font) plus target fps -- the on-disk wallpaper project format. |
 | `crates/player` | Shared GPU compositor library (`SceneRenderer`) used by everything below, plus its own standalone Wayland/layer-shell test binary. |
 | `crates/render-server` | The actual runtime renderer: a headless wgpu process that serves composited frames to the Plasma plugin over local HTTP, receives the cursor position over D-Bus, and watches the power profile. |
 | `crates/wp_linux_editor` | Desktop app (egui) for building and editing wallpaper projects, with the live preview. |
@@ -156,8 +179,8 @@ extension on a fresh start.
 
 ## Usage
 
-1. Run `wp_linux_editor`, build a layer stack (Image / Gif / Xray / Parallax), and
-   save it as a project folder.
+1. Run `wp_linux_editor`, build a layer stack (Image / Gif / Xray / Parallax /
+   Text / Adjustment), and save it as a project folder.
 2. Make sure `render-server` is running (the install script sets it up as
    a background service; from a source build, run it by hand).
 3. **KDE**: Right-click the desktop -> **Configure Desktop and Wallpaper**
@@ -191,6 +214,77 @@ extension on a fresh start.
   a temp file, `metadata.json` needs a version bump on every new GNOME
   release, the Overview workspace preview integration is best-effort and can
   silently stop working, and more).
+
+## Writing your own Shader effect
+
+A Shader effect (available on any layer that supports effects, or on an
+Adjustment layer to post-process the whole composite) is a `.wgsl`
+fragment shader you write and point the editor at -- no engine changes,
+no recompiling anything. It has to follow one fixed shape:
+
+- Bind group 0 has exactly three bindings, in this order: the input
+  texture (`binding(0)`), a sampler (`binding(1)`), and a uniform buffer
+  with your parameters (`binding(2)`).
+- Two entry points, `vs_main` and `fs_main` -- `vs_main` is always the
+  same fullscreen-triangle boilerplate below, only `fs_main` is yours to
+  write.
+- Your uniform struct's first three fields, in this exact order, are
+  filled in by the engine every frame: `cursor: vec2<f32>` (current
+  cursor position, 0.0..=1.0, or far off-canvas if the pointer isn't over
+  the wallpaper), `time: f32` (seconds since the layer loaded), and
+  `canvas_aspect: f32` (width / height).
+- Any `f32` field after that becomes a parameter, with a slider
+  automatically generated for it in the editor -- annotate each one with
+  a trailing JSON comment: `// {"label": "...", "default": ...,
+  "range": [min, max]}`. Only `f32` params are supported for now (no
+  color/vec or texture params yet).
+
+A minimal effect that pulses the picture's brightness over time:
+
+```wgsl
+struct ShaderEffectParams {
+    cursor: vec2<f32>,
+    time: f32,
+    canvas_aspect: f32,
+    u_speed: f32,    // {"label": "Speed", "default": 2.0, "range": [0.1, 10.0]}
+    u_strength: f32, // {"label": "Strength", "default": 0.3, "range": [0.0, 1.0]}
+};
+
+@group(0) @binding(0) var input_texture: texture_2d<f32>;
+@group(0) @binding(1) var input_sampler: sampler;
+@group(0) @binding(2) var<uniform> params: ShaderEffectParams;
+
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(3.0, -1.0),
+        vec2<f32>(-1.0, 3.0),
+    );
+    let pos = positions[vertex_index];
+    var out: VertexOutput;
+    out.clip_position = vec4<f32>(pos, 0.0, 1.0);
+    out.uv = vec2<f32>(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let color = textureSample(input_texture, input_sampler, in.uv);
+    let pulse = 1.0 + sin(params.time * params.u_speed) * params.u_strength;
+    return vec4<f32>(color.rgb * pulse, color.a);
+}
+```
+
+Pick this file in the effect's "Shader" panel like any other asset; a
+shader that fails to compile shows the error right there instead of
+crashing the editor. Whatever mask is set on this effect (see Features
+above) still applies on top, same as any built-in effect.
 
 ## License
 
