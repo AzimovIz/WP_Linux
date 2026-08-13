@@ -51,24 +51,37 @@ jobs:
       #   bin/{render-server,player,wp_linux_editor}
       #   adapters/kde/{plasma-plugin,kwin-script}/package  (kpackagetool6-ready)
       #   adapters/gnome/extension/  (GNOME Shell extension, gnome-extensions-ready)
+      #   adapters/x11/{install.sh,wp-linux-x11-adapter}  (prebuilt binary, not
+      #                                 source -- see adapters/x11/install.sh)
       #   dev.wplinux.editor.desktop  (Exec= has an @EDITOR_BIN@ placeholder,
       #                                 filled in by install.sh)
       #   assets/{wp_linux_editor_128.png,wp_linux_editor_256.png,wp_linux_editor.svg}
-      # No systemd unit -- render-server autostarts via an XDG autostart
-      # .desktop file that install.sh writes directly (and wp_linux_editor's
-      # own "Launch at login" checkbox manages afterwards), nothing to ship
-      # here for it.
-      # tar, not zip, so the executable bit on bin/* survives extraction.
+      # No systemd unit -- render-server and the X11 adapter both autostart
+      # via an XDG autostart .desktop file their own install step writes
+      # directly (and wp_linux_editor's own "Launch at login" checkbox
+      # manages render-server's afterwards), nothing to ship here for it.
+      # tar, not zip, so the executable bit on bin/* (and
+      # adapters/x11/wp-linux-x11-adapter) survives extraction.
       # Fixed filename (no tag in it) so install.sh can pull it via
       # GitHub's stable releases/latest/download/<name> URL without
       # calling the API to resolve the current tag.
+      #
+      # adapters/kde and adapters/gnome are copied as plain directories --
+      # QML/GJS source, interpreted at runtime by KWin/gnome-shell, ships
+      # as-is. adapters/x11 is different: it's a compiled Rust crate (see
+      # its own Cargo.toml), so copying the directory wholesale would ship
+      # its source tree into the release archive instead of a binary --
+      # copied explicitly file by file instead, deliberately leaving
+      # adapters/x11/{Cargo.toml,src} behind.
       - name: Stage release archive
         run: |
           set -eu
           root=dist/wp-linux
-          mkdir -p "$root/bin"
+          mkdir -p "$root/bin" "$root/adapters/x11"
           cp target/release/render-server target/release/player target/release/wp_linux_editor "$root/bin/"
-          cp -r adapters "$root/adapters"
+          cp -r adapters/kde "$root/adapters/kde"
+          cp -r adapters/gnome "$root/adapters/gnome"
+          cp adapters/x11/install.sh target/release/wp-linux-x11-adapter "$root/adapters/x11/"
           cp packaging/dev.wplinux.editor.desktop "$root/"
           cp -r assets "$root/assets"
           tar czf dist/wp-linux-linux-x86_64.tar.gz -C dist wp-linux

@@ -2,14 +2,16 @@
 # Reverses install.sh: stops render-server, removes its autostart entry,
 # the desktop-agnostic core binaries from ~/.local/bin, and whatever
 # desktop adapter install.sh installed -- the two KDE packages (see
-# adapters/kde) and/or the GNOME Shell extension (see adapters/gnome),
+# adapters/kde), the GNOME Shell extension (see adapters/gnome), and/or
+# the X11 adapter binary + its autostart entry (see adapters/x11),
 # removed below via the same `command -v kpackagetool6`/`kwriteconfig6`/
-# `gnome-extensions` guards install.sh's own adapter steps use, which is
-# why this is safe to run unconditionally regardless of which desktop
-# you're on -- each block below is a no-op on any desktop it doesn't
-# apply to. This script is distributed standalone (curl | bash, no
-# release archive download), so unlike install.sh it can't hand off to an
-# adapters/<de>/uninstall.sh file -- if a future adapter needs its own
+# `gnome-extensions` guards (or plain `rm -f`, for the X11 adapter, which
+# has no equivalent marker command) install.sh's own adapter steps use,
+# which is why this is safe to run unconditionally regardless of which
+# desktop you're on -- each block below is a no-op on any desktop it
+# doesn't apply to. This script is distributed standalone (curl | bash,
+# no release archive download), so unlike install.sh it can't hand off to
+# an adapters/<de>/uninstall.sh file -- if a future adapter needs its own
 # cleanup, inline it here the same way, guarded the same way. Does NOT
 # touch any wallpaper projects you saved -- those are your data, wherever
 # you put them, and are left alone. This also includes the wallpaper
@@ -29,6 +31,8 @@ PLASMA_PLUGIN_ID="dev.wplinux.wallpaper"
 KWIN_SCRIPT_ID="dev.wplinux.cursorbridge"
 GNOME_EXT_UUID="wp-linux@wplinux.dev"
 GNOME_EXT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/${GNOME_EXT_UUID}"
+X11_ADAPTER_BIN="wp-linux-x11-adapter"
+X11_ADAPTER_AUTOSTART_ID="dev.wplinux.x11-adapter"
 DESKTOP_FILE_ID="dev.wplinux.editor"
 
 log()  { echo "uninstall.sh: $*"; }
@@ -72,8 +76,14 @@ if [ -d "$GNOME_EXT_DIR" ]; then
     rm -rf "$GNOME_EXT_DIR"
 fi
 
+# X11 adapter cleanup (see adapters/x11) -- no-op if it was never
+# installed (e.g. this was a KDE/GNOME-on-Wayland session).
+log "removing X11 adapter autostart entry and stopping it"
+rm -f "${AUTOSTART_DIR}/${X11_ADAPTER_AUTOSTART_ID}.desktop"
+pkill -x "$X11_ADAPTER_BIN" >/dev/null 2>&1 || true
+
 log "removing binaries from ${BIN_DIR}"
-rm -f "${BIN_DIR}/render-server" "${BIN_DIR}/player" "${BIN_DIR}/wp_linux_editor"
+rm -f "${BIN_DIR}/render-server" "${BIN_DIR}/player" "${BIN_DIR}/wp_linux_editor" "${BIN_DIR}/${X11_ADAPTER_BIN}"
 
 log "removing application menu entry and icons"
 rm -f "${APPLICATIONS_DIR}/${DESKTOP_FILE_ID}.desktop"

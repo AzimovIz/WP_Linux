@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "adapters/x11",
     "crates/player",
     "crates/project-format",
     "crates/render-server",
