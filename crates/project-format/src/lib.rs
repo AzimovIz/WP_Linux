@@ -103,6 +103,19 @@ pub enum Layer {
         color: [f32; 4],
         source: TextSource,
     },
+    /// Not a picture of its own -- takes whatever every layer *below* it
+    /// in this project's layer list has already composited into and
+    /// runs its own post-processing stack on that, same generic
+    /// `Effect`/`Mask` machinery as any other layer. See `Ideas.md`,
+    /// "Adjustment-слой". Like `Text`, it has an exception to the usual
+    /// "layers stack in list order" rule: a `Text` layer always draws
+    /// on top of *everything*, including any `Adjustment` layer above
+    /// it in the list, so an `Adjustment` layer can never affect text
+    /// (see player's `record_draw`).
+    Adjustment {
+        #[serde(default)]
+        effects: Vec<Effect>,
+    },
 }
 
 /// Where a `Layer::Text`'s displayed string comes from.
@@ -147,7 +160,8 @@ impl Layer {
             Layer::Image { effects, .. }
             | Layer::Xray { effects, .. }
             | Layer::Gif { effects, .. }
-            | Layer::Parallax { effects, .. } => effects,
+            | Layer::Parallax { effects, .. }
+            | Layer::Adjustment { effects, .. } => effects,
             Layer::Text { .. } => &[],
         }
     }
@@ -167,7 +181,7 @@ impl Layer {
         let dynamic_regardless_of_effects = match self {
             Layer::Xray { .. } | Layer::Gif { .. } | Layer::Parallax { .. } => true,
             Layer::Text { source, .. } => source.is_dynamic(),
-            Layer::Image { .. } => false,
+            Layer::Image { .. } | Layer::Adjustment { .. } => false,
         };
         dynamic_regardless_of_effects
             || self.effects().iter().any(|effect| {
@@ -729,5 +743,53 @@ struct ShaderEffectParams {
             Layer::Image { effects, .. } => assert!(effects.is_empty()),
             _ => panic!("expected Layer::Image"),
         }
+    }
+
+    #[test]
+    fn adjustment_layer_round_trips_and_exposes_its_effects() {
+        let layer = Layer::Adjustment {
+            effects: vec![Effect {
+                kind: EffectKind::Vignette {
+                    strength: 0.6,
+                    softness: 0.3,
+                },
+                mask: Mask::None,
+                enabled: true,
+            }],
+        };
+        assert_eq!(layer.effects().len(), 1);
+        assert!(!layer.is_dynamic());
+
+        let json = serde_json::to_string(&layer).unwrap();
+        let round_tripped: Layer = serde_json::from_str(&json).unwrap();
+        match round_tripped {
+            Layer::Adjustment { effects } => {
+                assert_eq!(effects.len(), 1);
+                assert!(matches!(effects[0].kind, EffectKind::Vignette { .. }));
+            }
+            _ => panic!("expected Layer::Adjustment"),
+        }
+    }
+
+    #[test]
+    fn an_enabled_shader_effect_makes_an_adjustment_layer_dynamic() {
+        let layer = Layer::Adjustment {
+            effects: vec![Effect {
+                kind: EffectKind::Shader {
+                    wgsl_path: "pulse.wgsl".to_string(),
+                    params: vec![1.0],
+                },
+                mask: Mask::None,
+                enabled: true,
+            }],
+        };
+        assert!(layer.is_dynamic());
+    }
+
+    #[test]
+    fn adjustment_layer_without_effects_field_defaults_to_empty() {
+        let layer: Layer =
+            serde_json::from_str(r#"{"type":"adjustment"}"#).expect("should still parse");
+        assert!(layer.effects().is_empty());
     }
 }

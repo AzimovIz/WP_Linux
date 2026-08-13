@@ -235,6 +235,9 @@ enum EditorLayer {
         color: [f32; 4],
         source: EditorTextSource,
     },
+    /// No picture/path of its own -- see
+    /// `project_format::Layer::Adjustment`'s doc comment.
+    Adjustment { effects: Vec<EditorEffect> },
 }
 
 /// Mirrors `project_format::TextSource`'s variants -- kept as a separate
@@ -613,6 +616,7 @@ impl EditorLayer {
             EditorLayer::Gif { .. } => "Gif",
             EditorLayer::Parallax { .. } => "Parallax",
             EditorLayer::Text { .. } => "Text",
+            EditorLayer::Adjustment { .. } => "Adjustment",
         }
     }
 
@@ -636,6 +640,9 @@ impl EditorLayer {
             // No external asset -- always ready to preview/save, even
             // with an empty string.
             EditorLayer::Text { .. } => true,
+            // No external asset either -- ready as soon as its own
+            // effects are (an empty stack is trivially "all complete").
+            EditorLayer::Adjustment { effects } => effects.iter().all(EditorEffect::is_complete),
         }
     }
 }
@@ -714,6 +721,10 @@ enum LayerSignature {
     Xray(PathBuf, PathBuf, Vec<EffectSignature>),
     Gif(PathBuf, Vec<EffectSignature>),
     Parallax(PathBuf, Vec<EffectSignature>),
+    // No path -- an Adjustment layer has no asset of its own, just its
+    // own effects list, same structural-signature treatment as any
+    // other layer's `effects`.
+    Adjustment(Vec<EffectSignature>),
     // No payload -- unlike every other layer, nothing about a Text
     // layer ever requires a GPU reload; every property (including the
     // text itself) is updatable live via `SceneRenderer::set_text_params`
@@ -879,7 +890,9 @@ impl Preview {
                     // button handler.
                     loaded.set_text_params(&source.to_project(), *x, *y, *font_size, *color, true);
                 }
-                EditorLayer::Image { effects, .. } | EditorLayer::Gif { effects, .. } => {
+                EditorLayer::Image { effects, .. }
+                | EditorLayer::Gif { effects, .. }
+                | EditorLayer::Adjustment { effects } => {
                     sync_effect_params(loaded, &self.renderer.queue, effects);
                 }
             }
@@ -939,7 +952,8 @@ fn restore_painted_masks(layers: &[LoadedLayer], editor_layers: &[EditorLayer], 
             EditorLayer::Image { effects, .. }
             | EditorLayer::Xray { effects, .. }
             | EditorLayer::Gif { effects, .. }
-            | EditorLayer::Parallax { effects, .. } => Some(effects),
+            | EditorLayer::Parallax { effects, .. }
+            | EditorLayer::Adjustment { effects } => Some(effects),
             EditorLayer::Text { .. } => None,
         };
         let Some(effects) = effects else { continue };
@@ -1080,6 +1094,9 @@ fn build_preview_project(layers: &[EditorLayer]) -> Option<project_format::Proje
                 color: *color,
                 source: source.to_project(),
             },
+            EditorLayer::Adjustment { effects } => project_format::Layer::Adjustment {
+                effects: effects.iter().map(EditorEffect::to_project).collect(),
+            },
         })
         .collect();
     Some(project_format::Project {
@@ -1123,6 +1140,9 @@ fn build_signature(layers: &[EditorLayer]) -> Vec<LayerSignature> {
                 effects.iter().map(effect_signature).collect(),
             ),
             EditorLayer::Text { .. } => LayerSignature::Text,
+            EditorLayer::Adjustment { effects } => {
+                LayerSignature::Adjustment(effects.iter().map(effect_signature).collect())
+            }
         })
         .collect()
 }
@@ -1816,6 +1836,13 @@ impl EditorApp {
                 self.selected = Some(self.layers.len() - 1);
                 self.selected_effect = None;
             }
+            if ui.button("+ Adjustment").clicked() {
+                self.layers.push(EditorLayer::Adjustment {
+                    effects: Vec::new(),
+                });
+                self.selected = Some(self.layers.len() - 1);
+                self.selected_effect = None;
+            }
         });
 
         ui.add_space(4.0);
@@ -2255,7 +2282,8 @@ impl EditorApp {
                     EditorLayer::Image { effects, .. }
                     | EditorLayer::Xray { effects, .. }
                     | EditorLayer::Gif { effects, .. }
-                    | EditorLayer::Parallax { effects, .. } => Some(effects),
+                    | EditorLayer::Parallax { effects, .. }
+                    | EditorLayer::Adjustment { effects } => Some(effects),
                     EditorLayer::Text { .. } => None,
                 };
                 if let Some(mask) = effects
@@ -2555,6 +2583,7 @@ fn show_layer_panel(
             color,
             source,
         } => show_text_panel(ui, x, y, font_size, color, source),
+        EditorLayer::Adjustment { effects } => show_adjustment_panel(ui, effects, selected_effect),
     }
 }
 
@@ -2565,6 +2594,20 @@ fn show_image_panel(
     selected_effect: &mut Option<usize>,
 ) {
     path_picker(ui, "Picture", path, &["png", "jpg", "jpeg", "webp"]);
+    show_effects_panel(ui, effects, selected_effect);
+}
+
+/// No path/other fields to show -- an Adjustment layer is entirely its
+/// own effects stack, applied to the composite of every layer below it
+/// (see `project_format::Layer::Adjustment`'s doc comment). Reuses
+/// `show_effects_panel` as-is; the only thing specific to this layer
+/// kind is the explanatory label.
+fn show_adjustment_panel(
+    ui: &mut eframe::egui::Ui,
+    effects: &mut Vec<EditorEffect>,
+    selected_effect: &mut Option<usize>,
+) {
+    ui.label("Applies to everything below this layer in the list.");
     show_effects_panel(ui, effects, selected_effect);
 }
 
@@ -3584,6 +3627,9 @@ fn open_project(project_dir: &Path) -> Result<(Vec<EditorLayer>, u32, String), S
                 color,
                 source: EditorTextSource::from_project(source),
             },
+            project_format::Layer::Adjustment { effects } => EditorLayer::Adjustment {
+                effects: editor_effects_from_project(effects, &project_dir),
+            },
         })
         .collect();
 
@@ -3717,6 +3763,18 @@ fn save_project(
                     color: *color,
                     source: source.to_project(),
                 },
+                // No layer-level asset to stage -- just its own effects,
+                // same as every other layer kind's `effects` field.
+                EditorLayer::Adjustment { effects } => {
+                    let effects = effects
+                        .iter()
+                        .enumerate()
+                        .map(|(effect_index, effect)| {
+                            stage_effect(&mut stage, index, effect_index, effect)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    project_format::Layer::Adjustment { effects }
+                }
             };
             saved_layers.push(saved);
         }
@@ -4018,6 +4076,59 @@ mod tests {
             std::fs::read(project_dir.join("layer_2_image.png")).unwrap(),
             b"BBBB"
         );
+
+        std::fs::remove_dir_all(&project_dir).ok();
+    }
+
+    /// M9: an `Adjustment` layer has no asset of its own to stage, just
+    /// its own effects -- `save_project`/`open_project` should round-trip
+    /// it exactly like any other layer's `effects` list, and
+    /// `build_signature` should give it a real structural signature (not
+    /// panic, not silently drop it) so `ensure_scene` can tell when its
+    /// effects change shape.
+    #[test]
+    fn adjustment_layer_round_trips_through_save_and_open() {
+        let project_dir = unique_temp_dir();
+        let layers = vec![
+            EditorLayer::Image {
+                path: {
+                    let path = project_dir.join("source.png");
+                    image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]))
+                        .save(&path)
+                        .unwrap();
+                    Some(path)
+                },
+                effects: Vec::new(),
+            },
+            EditorLayer::Adjustment {
+                effects: vec![EditorEffect {
+                    kind: EditorEffectKind::Vignette {
+                        strength: 0.5,
+                        softness: 0.2,
+                    },
+                    mask: EditorMask::None,
+                    enabled: true,
+                }],
+            },
+        ];
+
+        assert_eq!(build_signature(&layers).len(), 2);
+
+        save_project(&project_dir, &layers, 30, "Test Project", "").expect("save_project failed");
+        let (reopened, _fps, _description) =
+            open_project(&project_dir).expect("open_project failed");
+
+        assert_eq!(reopened.len(), 2);
+        match &reopened[1] {
+            EditorLayer::Adjustment { effects } => {
+                assert_eq!(effects.len(), 1);
+                assert!(matches!(
+                    effects[0].kind,
+                    EditorEffectKind::Vignette { strength, .. } if strength == 0.5
+                ));
+            }
+            other => panic!("expected EditorLayer::Adjustment, got a different variant: {}", other.label()),
+        }
 
         std::fs::remove_dir_all(&project_dir).ok();
     }

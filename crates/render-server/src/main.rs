@@ -993,6 +993,121 @@ mod tests {
         assert_eq!(&pixels[0..4], &[10, 20, 30, 255]);
     }
 
+    /// M9: an `Adjustment` layer's own effect chain has to run against
+    /// the *composite* of every layer below it, not just one of them --
+    /// this stacks an opaque white layer under a 50%-alpha black layer
+    /// (composite: flat mid-gray, ~127, everywhere, no natural vignette
+    /// of its own) and checks that a `Vignette` on an `Adjustment` layer
+    /// on top a) still darkens the corner relative to the center (same
+    /// real-pipeline assertion as `vignette_effect_darkens_corners_
+    /// relative_to_center`, just through the M9 compositing path instead
+    /// of a single layer's own chain), and b) the center itself sits at
+    /// the blended gray value, not either input layer's own original
+    /// color -- proof it's reading the composite, not one layer alone.
+    #[test]
+    fn adjustment_layer_darkens_the_composite_of_two_layers_below_it() {
+        let project_dir = unique_temp_dir();
+        let width = 64u32;
+        let height = 64u32;
+        image::RgbaImage::from_pixel(width, height, image::Rgba([255, 255, 255, 255]))
+            .save(project_dir.join("bg.png"))
+            .expect("failed to write test fixture PNG");
+        image::RgbaImage::from_pixel(width, height, image::Rgba([0, 0, 0, 128]))
+            .save(project_dir.join("overlay.png"))
+            .expect("failed to write test fixture PNG");
+
+        let project = project_format::Project {
+            name: String::new(),
+            description: String::new(),
+            fps: 30,
+            layers: vec![
+                project_format::Layer::Image {
+                    path: "bg.png".to_string(),
+                    effects: Vec::new(),
+                },
+                project_format::Layer::Image {
+                    path: "overlay.png".to_string(),
+                    effects: Vec::new(),
+                },
+                project_format::Layer::Adjustment {
+                    effects: vec![project_format::Effect {
+                        kind: project_format::EffectKind::Vignette {
+                            strength: 1.0,
+                            softness: 0.0,
+                        },
+                        mask: project_format::Mask::None,
+                        enabled: true,
+                    }],
+                },
+            ],
+        };
+
+        let scene_renderer =
+            pollster::block_on(super::SceneRenderer::new_headless(renderer::CANVAS_FORMAT));
+        let layers = scene_renderer
+            .load_scene(&project_dir, &project, true)
+            .expect("load_scene failed");
+
+        let canvas = renderer::create_canvas(&scene_renderer, width, height);
+        let pixels = renderer::render_frame(&scene_renderer, &canvas, &layers);
+
+        let pixel_at = |x: u32, y: u32| -> [u8; 4] {
+            let i = ((y * width + x) * 4) as usize;
+            [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+        };
+        let center = pixel_at(width / 2, height / 2);
+        let corner = pixel_at(0, 0);
+
+        assert!(
+            (100..160).contains(&center[0]),
+            "center should sit at the ~127 blend of the two layers below, not either one's own color -- got {center:?}"
+        );
+        assert!(
+            corner[0] < center[0],
+            "corner should be darkened by the adjustment layer's vignette relative to the center -- corner={corner:?} center={center:?}"
+        );
+    }
+
+    /// The M9 equivalent of `layer_without_effects_is_pixel_identical_
+    /// to_its_source`: an `Adjustment` layer with an empty effects list
+    /// is a complete no-op, so a scene with one attached should render
+    /// byte-for-byte identical to the same scene without it.
+    #[test]
+    fn adjustment_layer_without_effects_is_a_no_op() {
+        let project_dir = unique_temp_dir();
+        let width = 16u32;
+        let height = 16u32;
+        image::RgbaImage::from_pixel(width, height, image::Rgba([10, 20, 30, 255]))
+            .save(project_dir.join("bg.png"))
+            .expect("failed to write test fixture PNG");
+
+        let project = project_format::Project {
+            name: String::new(),
+            description: String::new(),
+            fps: 30,
+            layers: vec![
+                project_format::Layer::Image {
+                    path: "bg.png".to_string(),
+                    effects: Vec::new(),
+                },
+                project_format::Layer::Adjustment {
+                    effects: Vec::new(),
+                },
+            ],
+        };
+
+        let scene_renderer =
+            pollster::block_on(super::SceneRenderer::new_headless(renderer::CANVAS_FORMAT));
+        let layers = scene_renderer
+            .load_scene(&project_dir, &project, true)
+            .expect("load_scene failed");
+
+        let canvas = renderer::create_canvas(&scene_renderer, width, height);
+        let pixels = renderer::render_frame(&scene_renderer, &canvas, &layers);
+
+        assert_eq!(&pixels[0..4], &[10, 20, 30, 255]);
+    }
+
     /// M3's ColorAdjust, same real-pipeline round-trip as the Vignette
     /// test above: a mid-gray picture pushed hard negative on brightness
     /// should come out noticeably darker than it started.

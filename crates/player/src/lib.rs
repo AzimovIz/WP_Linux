@@ -117,9 +117,13 @@ struct EffectChain {
     // effect has run. `scratch` only ever holds one effect's raw,
     // unmasked output, just long enough for the following mask-blend
     // pass to read it back into `accumulator`.
-    // Kept alive only so `accumulator_view`/`scratch_view` aren't
-    // dangling -- their contents are never read back on the Rust side.
-    _accumulator_texture: wgpu::Texture,
+    // `accumulator_texture` used to be "kept alive only" (never read
+    // back on the Rust side, only through `accumulator_view`) -- M9
+    // changed that: an `Adjustment` layer's chain hands the running
+    // composite off to the next one via `copy_texture_to_texture`,
+    // which needs the `wgpu::Texture` itself, not just a view. Every
+    // other layer kind still never reads it directly.
+    accumulator_texture: wgpu::Texture,
     accumulator_view: wgpu::TextureView,
     _scratch_texture: wgpu::Texture,
     scratch_view: wgpu::TextureView,
@@ -305,6 +309,18 @@ pub enum LoadedLayer {
     Xray(XrayLayer),
     Parallax(ParallaxLayer),
     Text(TextLayer),
+    Adjustment(AdjustmentLayer),
+}
+
+/// GPU-side counterpart of [`project_format::Layer::Adjustment`] -- no
+/// native picture of its own, just a post-processing stack applied to
+/// whatever every layer below it in the list has already composited.
+/// `effects` is `None` for an empty stack, same "common case pays
+/// nothing" convention as every other layer's own `effects` field --
+/// though here an empty stack also means the layer is a complete no-op
+/// (see `record_draw`, which skips it entirely in that case).
+pub struct AdjustmentLayer {
+    effects: Option<EffectChain>,
 }
 
 /// What a Text layer currently displays, recomputed fresh on every call
@@ -702,12 +718,12 @@ impl LoadedLayer {
             LoadedLayer::Gif { width, height, .. } => (*width, *height),
             LoadedLayer::Xray(xray) => (xray.width, xray.height),
             LoadedLayer::Parallax(parallax) => (parallax.width, parallax.height),
-            // Text has no source asset of its own to derive a canvas
-            // size from -- callers that pick canvas size from
-            // `layers.first()` (render-server, editor) should put a
-            // picture layer first if precise sizing matters; this is a
-            // soft product constraint, not solved generally here.
-            LoadedLayer::Text(_) => (1920, 1080),
+            // Neither Text nor Adjustment has a source asset of its own
+            // to derive a canvas size from -- callers that pick canvas
+            // size from `layers.first()` (render-server, editor) should
+            // put a picture layer first if precise sizing matters; this
+            // is a soft product constraint, not solved generally here.
+            LoadedLayer::Text(_) | LoadedLayer::Adjustment(_) => (1920, 1080),
         }
     }
 
@@ -720,7 +736,7 @@ impl LoadedLayer {
     /// which `LoadedProject::dynamic` is computed from).
     pub fn is_dynamic(&self) -> bool {
         match self {
-            LoadedLayer::Image(_) => false,
+            LoadedLayer::Image(_) | LoadedLayer::Adjustment(_) => false,
             LoadedLayer::Gif { .. } | LoadedLayer::Xray(_) | LoadedLayer::Parallax(_) => true,
             LoadedLayer::Text(text) => text.source.is_dynamic(),
         }
@@ -814,6 +830,7 @@ impl LoadedLayer {
             LoadedLayer::Image(image) | LoadedLayer::Gif { image, .. } => &mut image.effects,
             LoadedLayer::Xray(xray) => &mut xray.effects,
             LoadedLayer::Parallax(parallax) => &mut parallax.effects,
+            LoadedLayer::Adjustment(adjustment) => &mut adjustment.effects,
             LoadedLayer::Text(_) => return,
         };
         let Some(chain) = chain else { return };
@@ -941,6 +958,7 @@ impl LoadedLayer {
             LoadedLayer::Image(image) | LoadedLayer::Gif { image, .. } => &image.effects,
             LoadedLayer::Xray(xray) => &xray.effects,
             LoadedLayer::Parallax(parallax) => &parallax.effects,
+            LoadedLayer::Adjustment(adjustment) => &adjustment.effects,
             LoadedLayer::Text(_) => return,
         };
         let Some(chain) = chain else { return };
@@ -1831,7 +1849,18 @@ impl SceneRenderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: OFFSCREEN_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            // COPY_SRC/COPY_DST: unused by most callers of this helper
+            // (accumulator/scratch/blur_temp for an ordinary layer never
+            // get copied into or out of), but an `Adjustment` layer's own
+            // accumulator does -- `record_draw` hands the running
+            // composite off between adjustment layers via
+            // `copy_texture_to_texture` (see its module doc comment on
+            // the M9 compositing path). Harmless extra usage bits on
+            // every other texture built through this same helper.
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -2313,7 +2342,7 @@ impl SceneRenderer {
 
         Ok(Some(EffectChain {
             effects: loaded_effects,
-            _accumulator_texture: accumulator_texture,
+            accumulator_texture,
             accumulator_view,
             _scratch_texture: scratch_texture,
             scratch_view,
@@ -2688,6 +2717,36 @@ impl SceneRenderer {
                         allow_commands,
                     )));
                 }
+                Layer::Adjustment { effects } => {
+                    // No native asset of its own, so no natural
+                    // width/height to build its chain at -- unlike
+                    // every other layer, whose chain runs at its own
+                    // picture's resolution, this one has to run at
+                    // *canvas* resolution instead. `glyphon`'s current
+                    // canvas_width/height is the best available answer:
+                    // every real caller calls `set_text_viewport` with
+                    // the true canvas size right after `load_scene`
+                    // returns, so on any reload after the first, this
+                    // already holds last frame's correct value. Only
+                    // the very first scene ever loaded on a fresh
+                    // `SceneRenderer` (before `set_text_viewport` has
+                    // run even once) sees the hardcoded 1920x1080
+                    // default instead -- affects only the aspect ratio
+                    // used to keep Circle/Gradient masks round inside
+                    // this effect chain, not whether the effect runs at
+                    // all, and only until the next structural reload.
+                    let (canvas_width, canvas_height) = {
+                        let glyphon = self.glyphon.lock().unwrap();
+                        (glyphon.canvas_width, glyphon.canvas_height)
+                    };
+                    let chain = self.create_effect_chain(
+                        project_dir,
+                        canvas_width,
+                        canvas_height,
+                        effects,
+                    )?;
+                    layers.push(LoadedLayer::Adjustment(AdjustmentLayer { effects: chain }));
+                }
             }
         }
         Ok(layers)
@@ -2781,6 +2840,7 @@ impl SceneRenderer {
                 LoadedLayer::Image(image) | LoadedLayer::Gif { image, .. } => &image.effects,
                 LoadedLayer::Xray(xray) => &xray.effects,
                 LoadedLayer::Parallax(parallax) => &parallax.effects,
+                LoadedLayer::Adjustment(adjustment) => &adjustment.effects,
                 LoadedLayer::Text(_) => continue,
             };
             let Some(chain) = chain else { continue };
@@ -2829,6 +2889,7 @@ impl SceneRenderer {
                 LoadedLayer::Image(image) | LoadedLayer::Gif { image, .. } => &image.effects,
                 LoadedLayer::Xray(xray) => &xray.effects,
                 LoadedLayer::Parallax(parallax) => &parallax.effects,
+                LoadedLayer::Adjustment(adjustment) => &adjustment.effects,
                 LoadedLayer::Text(_) => continue,
             };
             let Some(chain) = chain else { continue };
@@ -3099,8 +3160,12 @@ impl SceneRenderer {
                     &parallax.effects,
                 ),
                 // Text never has an effect chain -- see M1's scope note
-                // on `project_format::Layer::Text`.
-                LoadedLayer::Text(_) => continue,
+                // on `project_format::Layer::Text`. Adjustment has one,
+                // but it's built and run entirely differently (against
+                // the running composite, not a "base draw" of its own
+                // picture -- it has none) -- see the `has_adjustment`
+                // handling further down in `record_draw`.
+                LoadedLayer::Text(_) | LoadedLayer::Adjustment(_) => continue,
             };
             let Some(chain) = chain else { continue };
 
@@ -3130,211 +3195,218 @@ impl SceneRenderer {
                 pass.draw(0..3, 0..1);
             }
 
-            for effect in &chain.effects {
-                if !effect.enabled {
-                    continue;
-                }
+            self.run_effect_chain_passes(encoder, chain);
+        }
 
-                // Effect pass(es): this effect's raw, unmasked result
-                // into scratch -- reads whatever the accumulator holds
-                // so far (the layer's base content, or the previous
-                // effect's already-masked-in result). Every kind but
-                // Blur is a single pass straight into `scratch`; Blur
-                // needs its own horizontal-then-vertical pair first
-                // (see `LoadedEffectKind::Blur`'s doc comment), so it's
-                // the one case with two passes here instead of one.
-                match &effect.kind {
-                    LoadedEffectKind::Vignette { bind_group, .. } => {
-                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("effect-pass"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &chain.scratch_view,
-                                depth_slice: None,
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                    store: wgpu::StoreOp::Store,
-                                },
-                            })],
-                            depth_stencil_attachment: None,
-                            timestamp_writes: None,
-                            occlusion_query_set: None,
-                            multiview_mask: None,
-                        });
-                        pass.set_pipeline(&self.vignette_pipeline);
-                        pass.set_bind_group(0, bind_group, &[]);
-                        pass.draw(0..3, 0..1);
-                    }
-                    LoadedEffectKind::ColorAdjust { bind_group, .. } => {
-                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("effect-pass"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &chain.scratch_view,
-                                depth_slice: None,
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                    store: wgpu::StoreOp::Store,
-                                },
-                            })],
-                            depth_stencil_attachment: None,
-                            timestamp_writes: None,
-                            occlusion_query_set: None,
-                            multiview_mask: None,
-                        });
-                        pass.set_pipeline(&self.coloradjust_pipeline);
-                        pass.set_bind_group(0, bind_group, &[]);
-                        pass.draw(0..3, 0..1);
-                    }
-                    LoadedEffectKind::Blur {
-                        horizontal_bind_group,
-                        vertical_bind_group,
-                        ..
-                    } => {
-                        {
-                            let mut pass =
-                                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                    label: Some("blur-horizontal-pass"),
-                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                        view: &chain.blur_temp_view,
-                                        depth_slice: None,
-                                        resolve_target: None,
-                                        ops: wgpu::Operations {
-                                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                            store: wgpu::StoreOp::Store,
-                                        },
-                                    })],
-                                    depth_stencil_attachment: None,
-                                    timestamp_writes: None,
-                                    occlusion_query_set: None,
-                                    multiview_mask: None,
-                                });
-                            pass.set_pipeline(&self.blur_pipeline);
-                            pass.set_bind_group(0, horizontal_bind_group, &[]);
-                            pass.draw(0..3, 0..1);
-                        }
-                        {
-                            let mut pass =
-                                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                    label: Some("blur-vertical-pass"),
-                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                        view: &chain.scratch_view,
-                                        depth_slice: None,
-                                        resolve_target: None,
-                                        ops: wgpu::Operations {
-                                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                            store: wgpu::StoreOp::Store,
-                                        },
-                                    })],
-                                    depth_stencil_attachment: None,
-                                    timestamp_writes: None,
-                                    occlusion_query_set: None,
-                                    multiview_mask: None,
-                                });
-                            pass.set_pipeline(&self.blur_pipeline);
-                            pass.set_bind_group(0, vertical_bind_group, &[]);
-                            pass.draw(0..3, 0..1);
+        // M9: whether any layer's own post-processing stack needs to run
+        // against the *composite so far* rather than its own picture --
+        // see `project_format::Layer::Adjustment`'s doc comment. An
+        // adjustment layer with an empty stack (`effects: None`) is a
+        // complete no-op, same convention as any other empty-stack layer,
+        // so it doesn't count here.
+        let has_adjustment = layers
+            .iter()
+            .any(|l| matches!(l, LoadedLayer::Adjustment(a) if a.effects.is_some()));
+
+        if !has_adjustment {
+            // The overwhelming common case: everything below is exactly
+            // what this function always did, byte-for-byte, before M9 --
+            // one pass, every layer blended straight into `target_view`
+            // in list order. No adjustment layer means no reason to pay
+            // for the extra offscreen texture/passes the branch below
+            // needs.
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("composite-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(clear_color),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            for layer in layers {
+                // Every variant here draws the same way -- one fullscreen
+                // triangle through its own pipeline and bind group -- so
+                // this only needs to pick which of those two, not repeat
+                // the three draw calls per variant. A layer with an
+                // effect chain (already fully resolved by the pre-pass
+                // loop above) composites through the ordinary
+                // `image_pipeline` sampling its accumulator, exactly like
+                // a plain Image layer would -- its own native
+                // pipeline/bind group was only needed for that chain's
+                // now-finished base-draw pass.
+                let (pipeline, bind_group) = match layer {
+                    LoadedLayer::Image(image) | LoadedLayer::Gif { image, .. } => {
+                        match &image.effects {
+                            Some(chain) => (&self.image_pipeline, &chain.composite_bind_group),
+                            None => (&self.image_pipeline, &image.bind_group),
                         }
                     }
-                    LoadedEffectKind::Smoke(smoke) => {
-                        // Snapshot last frame's persistent state into
-                        // `temp` -- a plain GPU-to-GPU copy, not a
-                        // render pass, so it doesn't hit the
-                        // can't-read-and-write-the-same-texture
-                        // restriction the decay+splat pass below would
-                        // otherwise run into by sampling and targeting
-                        // `state_texture` at once.
+                    LoadedLayer::Xray(xray) => match &xray.effects {
+                        Some(chain) => (&self.image_pipeline, &chain.composite_bind_group),
+                        None => (&self.xray_pipeline, &xray.bind_group),
+                    },
+                    LoadedLayer::Parallax(parallax) => match &parallax.effects {
+                        Some(chain) => (&self.image_pipeline, &chain.composite_bind_group),
+                        None => (&self.parallax_pipeline, &parallax.bind_group),
+                    },
+                    // An adjustment layer with an empty stack is a no-op
+                    // here (see `has_adjustment` above); with a non-empty
+                    // one this branch never runs at all.
+                    LoadedLayer::Adjustment(_) => continue,
+                    // Text isn't part of this per-layer pipeline dispatch
+                    // at all -- glyphon batches every prepared text area
+                    // into one `render()` call below instead, so it
+                    // always draws on top of everything else regardless
+                    // of its position in the project's own layer list.
+                    LoadedLayer::Text(_) => continue,
+                };
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+
+            let GlyphonState {
+                atlas,
+                viewport,
+                text_renderer,
+                ..
+            } = &*glyphon;
+            text_renderer
+                .render(atlas, viewport, &mut pass)
+                .expect("glyphon text render failed");
+            return;
+        }
+
+        // At least one adjustment layer: everything below draws into a
+        // running "composite so far" texture instead of straight into
+        // `target_view`, because `target_view` might not even be
+        // `OFFSCREEN_FORMAT` (see `EffectChain`'s doc comment on M2's own
+        // format nuance) -- an adjustment layer's effect chain, like
+        // every other, only ever reads `OFFSCREEN_FORMAT` input. Rather
+        // than allocate a whole separate texture just to hold that
+        // running composite, the *first* adjustment layer's own
+        // `accumulator_texture` plays that role for the entire frame:
+        // every ordinary layer below it draws straight into it (instead
+        // of into its own, now-unused chain -- there is none, it's not
+        // processing its own picture), and every ordinary layer between
+        // it and the next adjustment layer keeps doing the same. Each
+        // later adjustment layer gets the running composite handed to it
+        // via one `copy_texture_to_texture` (both textures always
+        // `OFFSCREEN_FORMAT`, always the same canvas size -- see
+        // `load_scene`'s `Layer::Adjustment` arm), then becomes the new
+        // "current" in turn.
+        let first_adjustment_index = layers
+            .iter()
+            .position(|l| matches!(l, LoadedLayer::Adjustment(a) if a.effects.is_some()))
+            .expect("has_adjustment is true");
+        let first_chain = match &layers[first_adjustment_index] {
+            LoadedLayer::Adjustment(a) => a.effects.as_ref().expect("checked by position above"),
+            _ => unreachable!("position() only matches LoadedLayer::Adjustment"),
+        };
+        let mut current_accumulator_texture = &first_chain.accumulator_texture;
+        let mut current_accumulator_view = &first_chain.accumulator_view;
+        let mut current_composite_bind_group = &first_chain.composite_bind_group;
+
+        // Establishes the running composite's initial state -- no draws,
+        // just the same clear every layer would otherwise start from at
+        // the top of `target_view`. Every draw after this uses `Load`
+        // unconditionally, whether it's the very first ordinary layer or
+        // the tenth adjustment layer's hand-off.
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("adjustment-stack-clear-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: current_accumulator_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(clear_color),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+
+        for (i, layer) in layers.iter().enumerate() {
+            match layer {
+                // Always on top of everything, including any adjustment
+                // layer -- unchanged pre-existing limitation, see
+                // `project_format::Layer::Adjustment`'s doc comment.
+                LoadedLayer::Text(_) => continue,
+                LoadedLayer::Adjustment(adjustment) => {
+                    let Some(chain) = &adjustment.effects else {
+                        continue;
+                    };
+                    if i != first_adjustment_index {
+                        let extent = chain.accumulator_texture.size();
                         encoder.copy_texture_to_texture(
                             wgpu::TexelCopyTextureInfo {
-                                texture: &smoke.state_texture,
+                                texture: current_accumulator_texture,
                                 mip_level: 0,
                                 origin: wgpu::Origin3d::ZERO,
                                 aspect: wgpu::TextureAspect::All,
                             },
                             wgpu::TexelCopyTextureInfo {
-                                texture: &smoke.temp_texture,
+                                texture: &chain.accumulator_texture,
                                 mip_level: 0,
                                 origin: wgpu::Origin3d::ZERO,
                                 aspect: wgpu::TextureAspect::All,
                             },
-                            wgpu::Extent3d {
-                                width: smoke.width,
-                                height: smoke.height,
-                                depth_or_array_layers: 1,
-                            },
+                            extent,
                         );
-
-                        // Reads `temp` (the snapshot just taken above),
-                        // writes the decayed-plus-splatted result back
-                        // into `state_view` directly -- there's no
-                        // separate `scratch` write for Smoke, this *is*
-                        // both its next frame's persistent state and
-                        // this frame's raw output for the mask-blend
-                        // pass below (see `create_effect_chain`'s
-                        // `mask_source_view` selection).
-                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("smoke-pass"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &smoke.state_view,
-                                depth_slice: None,
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                    store: wgpu::StoreOp::Store,
-                                },
-                            })],
-                            depth_stencil_attachment: None,
-                            timestamp_writes: None,
-                            occlusion_query_set: None,
-                            multiview_mask: None,
-                        });
-                        pass.set_pipeline(&self.smoke_pipeline);
-                        pass.set_bind_group(0, &smoke.bind_group, &[]);
-                        pass.draw(0..3, 0..1);
                     }
-                    LoadedEffectKind::Shader(shader) => {
-                        // Single pass into `scratch`, same shape as
-                        // Vignette/ColorAdjust above -- unlike Smoke, a
-                        // `Shader` effect is a pure function of the
-                        // layer's current content (plus cursor/time),
-                        // not its own persistent state, so it uses the
-                        // same `scratch`-then-mask-blend path as every
-                        // other non-stateful effect kind. Only the
-                        // pipeline differs per instance (its own
-                        // compiled shader module, not one shared on
-                        // `SceneRenderer` -- see `ShaderEffect`'s doc
-                        // comment).
-                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("shader-effect-pass"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &chain.scratch_view,
-                                depth_slice: None,
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                    store: wgpu::StoreOp::Store,
-                                },
-                            })],
-                            depth_stencil_attachment: None,
-                            timestamp_writes: None,
-                            occlusion_query_set: None,
-                            multiview_mask: None,
-                        });
-                        pass.set_pipeline(&shader.pipeline);
-                        pass.set_bind_group(0, &shader.bind_group, &[]);
-                        pass.draw(0..3, 0..1);
-                    }
+                    self.run_effect_chain_passes(encoder, chain);
+                    current_accumulator_texture = &chain.accumulator_texture;
+                    current_accumulator_view = &chain.accumulator_view;
+                    current_composite_bind_group = &chain.composite_bind_group;
                 }
-
-                // Mask-blend pass: mixes scratch back into the
-                // accumulator by the mask's value, in place -- see
-                // `mask_blend.wgsl`'s module doc comment for why this
-                // only needs to read `scratch`, not the accumulator too.
-                {
+                _ => {
+                    // Ordinary layer: same pipeline/bind-group selection
+                    // as the `!has_adjustment` branch above, just
+                    // targeting the running composite instead of
+                    // `target_view`, and always `Load` (the clear pass
+                    // above already handled the very first draw). One
+                    // render pass per layer here, not batched into a
+                    // segment the way the simple path above batches
+                    // every layer into one -- an adjustment layer is
+                    // rare enough that the extra pass-per-layer overhead
+                    // isn't worth the bookkeeping to avoid.
+                    let (pipeline, bind_group) = match layer {
+                        LoadedLayer::Image(image) | LoadedLayer::Gif { image, .. } => {
+                            match &image.effects {
+                                Some(chain) => {
+                                    (&self.image_pipeline, &chain.composite_bind_group)
+                                }
+                                None => (&self.image_pipeline, &image.bind_group),
+                            }
+                        }
+                        LoadedLayer::Xray(xray) => match &xray.effects {
+                            Some(chain) => (&self.image_pipeline, &chain.composite_bind_group),
+                            None => (&self.xray_pipeline, &xray.bind_group),
+                        },
+                        LoadedLayer::Parallax(parallax) => match &parallax.effects {
+                            Some(chain) => (&self.image_pipeline, &chain.composite_bind_group),
+                            None => (&self.parallax_pipeline, &parallax.bind_group),
+                        },
+                        LoadedLayer::Adjustment(_) | LoadedLayer::Text(_) => {
+                            unreachable!("handled by the outer match's own arms")
+                        }
+                    };
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("mask-blend-pass"),
+                        label: Some("adjustment-stack-layer-pass"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &chain.accumulator_view,
+                            view: current_accumulator_view,
                             depth_slice: None,
                             resolve_target: None,
                             ops: wgpu::Operations {
@@ -3347,8 +3419,8 @@ impl SceneRenderer {
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
-                    pass.set_pipeline(&self.mask_pipeline);
-                    pass.set_bind_group(0, &effect.mask.bind_group, &[]);
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, bind_group, &[]);
                     pass.draw(0..3, 0..1);
                 }
             }
@@ -3370,43 +3442,9 @@ impl SceneRenderer {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-
-        for layer in layers {
-            // Every variant here draws the same way -- one fullscreen
-            // triangle through its own pipeline and bind group -- so
-            // this only needs to pick which of those two, not repeat the
-            // three draw calls per variant. A layer with an effect
-            // chain (already fully resolved by the pre-pass loop above)
-            // composites through the ordinary `image_pipeline` sampling
-            // its accumulator, exactly like a plain Image layer would --
-            // its own native pipeline/bind group was only needed for
-            // that chain's now-finished base-draw pass.
-            let (pipeline, bind_group) = match layer {
-                LoadedLayer::Image(image) | LoadedLayer::Gif { image, .. } => {
-                    match &image.effects {
-                        Some(chain) => (&self.image_pipeline, &chain.composite_bind_group),
-                        None => (&self.image_pipeline, &image.bind_group),
-                    }
-                }
-                LoadedLayer::Xray(xray) => match &xray.effects {
-                    Some(chain) => (&self.image_pipeline, &chain.composite_bind_group),
-                    None => (&self.xray_pipeline, &xray.bind_group),
-                },
-                LoadedLayer::Parallax(parallax) => match &parallax.effects {
-                    Some(chain) => (&self.image_pipeline, &chain.composite_bind_group),
-                    None => (&self.parallax_pipeline, &parallax.bind_group),
-                },
-                // Text isn't part of this per-layer pipeline dispatch at
-                // all -- glyphon batches every prepared text area into
-                // one `render()` call below instead, so it always draws
-                // on top of everything else regardless of its position
-                // in the project's own layer list.
-                LoadedLayer::Text(_) => continue,
-            };
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, bind_group, &[]);
-            pass.draw(0..3, 0..1);
-        }
+        pass.set_pipeline(&self.image_pipeline);
+        pass.set_bind_group(0, current_composite_bind_group, &[]);
+        pass.draw(0..3, 0..1);
 
         let GlyphonState {
             atlas,
@@ -3417,6 +3455,238 @@ impl SceneRenderer {
         text_renderer
             .render(atlas, viewport, &mut pass)
             .expect("glyphon text render failed");
+    }
+
+    /// Runs one layer's (or, since M9, one adjustment layer's) full
+    /// post-processing stack against whatever `chain.accumulator_view`
+    /// currently holds -- every enabled effect's own pass(es) into
+    /// `scratch` (or, for `Smoke`, its own persistent state -- see
+    /// `LoadedEffectKind::Smoke`'s doc comment) followed by the generic
+    /// mask-blend pass that mixes it back into `accumulator` in place.
+    /// Pulled out of `record_draw`'s per-layer loop so the exact same
+    /// pass-building code serves both an ordinary layer's own chain (run
+    /// once per layer, against its own just-drawn picture) and an
+    /// adjustment layer's chain (run against the running composite
+    /// instead) without duplicating it.
+    fn run_effect_chain_passes(&self, encoder: &mut wgpu::CommandEncoder, chain: &EffectChain) {
+        for effect in &chain.effects {
+            if !effect.enabled {
+                continue;
+            }
+
+            // Effect pass(es): this effect's raw, unmasked result into
+            // scratch -- reads whatever the accumulator holds so far
+            // (the layer's base content, or the previous effect's
+            // already-masked-in result). Every kind but Blur is a single
+            // pass straight into `scratch`; Blur needs its own
+            // horizontal-then-vertical pair first (see
+            // `LoadedEffectKind::Blur`'s doc comment), so it's the one
+            // case with two passes here instead of one.
+            match &effect.kind {
+                LoadedEffectKind::Vignette { bind_group, .. } => {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("effect-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &chain.scratch_view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_pipeline(&self.vignette_pipeline);
+                    pass.set_bind_group(0, bind_group, &[]);
+                    pass.draw(0..3, 0..1);
+                }
+                LoadedEffectKind::ColorAdjust { bind_group, .. } => {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("effect-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &chain.scratch_view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_pipeline(&self.coloradjust_pipeline);
+                    pass.set_bind_group(0, bind_group, &[]);
+                    pass.draw(0..3, 0..1);
+                }
+                LoadedEffectKind::Blur {
+                    horizontal_bind_group,
+                    vertical_bind_group,
+                    ..
+                } => {
+                    {
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("blur-horizontal-pass"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &chain.blur_temp_view,
+                                depth_slice: None,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                            multiview_mask: None,
+                        });
+                        pass.set_pipeline(&self.blur_pipeline);
+                        pass.set_bind_group(0, horizontal_bind_group, &[]);
+                        pass.draw(0..3, 0..1);
+                    }
+                    {
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("blur-vertical-pass"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &chain.scratch_view,
+                                depth_slice: None,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                            multiview_mask: None,
+                        });
+                        pass.set_pipeline(&self.blur_pipeline);
+                        pass.set_bind_group(0, vertical_bind_group, &[]);
+                        pass.draw(0..3, 0..1);
+                    }
+                }
+                LoadedEffectKind::Smoke(smoke) => {
+                    // Snapshot last frame's persistent state into `temp`
+                    // -- a plain GPU-to-GPU copy, not a render pass, so
+                    // it doesn't hit the can't-read-and-write-the-same-
+                    // texture restriction the decay+splat pass below
+                    // would otherwise run into by sampling and targeting
+                    // `state_texture` at once.
+                    encoder.copy_texture_to_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &smoke.state_texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &smoke.temp_texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::Extent3d {
+                            width: smoke.width,
+                            height: smoke.height,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+
+                    // Reads `temp` (the snapshot just taken above),
+                    // writes the decayed-plus-splatted result back into
+                    // `state_view` directly -- there's no separate
+                    // `scratch` write for Smoke, this *is* both its next
+                    // frame's persistent state and this frame's raw
+                    // output for the mask-blend pass below (see
+                    // `create_effect_chain`'s `mask_source_view`
+                    // selection).
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("smoke-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &smoke.state_view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_pipeline(&self.smoke_pipeline);
+                    pass.set_bind_group(0, &smoke.bind_group, &[]);
+                    pass.draw(0..3, 0..1);
+                }
+                LoadedEffectKind::Shader(shader) => {
+                    // Single pass into `scratch`, same shape as
+                    // Vignette/ColorAdjust above -- unlike Smoke, a
+                    // `Shader` effect is a pure function of the layer's
+                    // current content (plus cursor/time), not its own
+                    // persistent state, so it uses the same
+                    // `scratch`-then-mask-blend path as every other
+                    // non-stateful effect kind. Only the pipeline differs
+                    // per instance (its own compiled shader module, not
+                    // one shared on `SceneRenderer` -- see
+                    // `ShaderEffect`'s doc comment).
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("shader-effect-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &chain.scratch_view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_pipeline(&shader.pipeline);
+                    pass.set_bind_group(0, &shader.bind_group, &[]);
+                    pass.draw(0..3, 0..1);
+                }
+            }
+
+            // Mask-blend pass: mixes scratch back into the accumulator
+            // by the mask's value, in place -- see `mask_blend.wgsl`'s
+            // module doc comment for why this only needs to read
+            // `scratch`, not the accumulator too.
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("mask-blend-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &chain.accumulator_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&self.mask_pipeline);
+                pass.set_bind_group(0, &effect.mask.bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+        }
     }
 
     /// Composites `layers` into `target_view` and submits immediately --
