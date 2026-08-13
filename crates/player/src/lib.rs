@@ -664,6 +664,20 @@ pub struct TextLayer {
     y: f32,
     font_size: f32,
     color: [f32; 4],
+    // M10: its own `TextRenderer` (just a small vertex buffer, wrapping
+    // a `wgpu::RenderPipeline` cached and shared via `glyphon::Cache` --
+    // see `create_text_layer`'s doc comment) instead of sharing one on
+    // `GlyphonState` -- lets `record_draw` call `prepare()`/`render()`
+    // for this one layer alone, at its own position in the layer stack,
+    // without stomping on any other Text layer's own prepared content.
+    // A single shared `TextRenderer` can't do this: it holds exactly
+    // one vertex buffer, so a second `prepare()` call before the first
+    // one's `render()` executes on the GPU overwrites it (see
+    // `record_draw`'s module-level doc comment on why this matters).
+    // `Mutex`-wrapped for the same purely-borrow-checker reason as
+    // `SceneRenderer::glyphon` -- `RenderOp::record` only gets `&self`,
+    // but `TextRenderer::prepare`/`render` both need `&mut`.
+    text_renderer: std::sync::Mutex<glyphon::TextRenderer>,
 }
 
 impl TextLayer {
@@ -685,17 +699,19 @@ impl TextLayer {
 
 /// Bundles every piece of glyphon/cosmic-text state needed to shape and
 /// draw text layers. One instance per [`SceneRenderer`] (not per scene,
-/// not per layer) -- glyphon's `TextAtlas`/`TextRenderer` are meant to be
-/// long-lived and shared across everything drawn through them. Held
-/// behind a `Mutex` purely to satisfy the borrow checker inside
-/// `&self`-taking methods like `record_draw`; every real caller
-/// (render-server's tick thread, editor's owned `Preview`, player's own
-/// owned `App`) is single-owner already, so there's no real contention.
+/// not per layer) -- `font_system`/`swash_cache`/`atlas`/`viewport` are
+/// meant to be long-lived and shared across everything drawn through
+/// them (the actual glyph rasterization cache lives on `atlas`; sharing
+/// it is what keeps M10's per-layer `TextRenderer`s cheap -- see
+/// `TextLayer::text_renderer`'s doc comment). Held behind a `Mutex`
+/// purely to satisfy the borrow checker inside `&self`-taking methods
+/// like `record_draw`; every real caller (render-server's tick thread,
+/// editor's owned `Preview`, player's own owned `App`) is single-owner
+/// already, so there's no real contention.
 struct GlyphonState {
     font_system: glyphon::FontSystem,
     swash_cache: glyphon::SwashCache,
     atlas: glyphon::TextAtlas,
-    text_renderer: glyphon::TextRenderer,
     viewport: glyphon::Viewport,
     // Last size passed to `set_text_viewport` -- the pixel basis that
     // every Text layer's normalized x/y/font_size get multiplied
@@ -1003,6 +1019,302 @@ impl LoadedLayer {
             _ => None,
         }
     }
+
+    /// This layer's own contribution to `record_draw`'s per-layer
+    /// dispatch (see `RenderOp`'s doc comment) -- `None` only for an
+    /// `Adjustment` layer with an empty effects stack, a complete no-op
+    /// by definition (same convention as everywhere else an empty
+    /// `effects` list is treated as "not really there").
+    fn as_render_op(&self) -> Option<&dyn RenderOp> {
+        match self {
+            LoadedLayer::Image(image) | LoadedLayer::Gif { image, .. } => {
+                Some(image as &dyn RenderOp)
+            }
+            LoadedLayer::Xray(xray) => Some(xray as &dyn RenderOp),
+            LoadedLayer::Parallax(parallax) => Some(parallax as &dyn RenderOp),
+            LoadedLayer::Text(text) => Some(text as &dyn RenderOp),
+            LoadedLayer::Adjustment(adjustment) if adjustment.effects.is_some() => {
+                Some(adjustment as &dyn RenderOp)
+            }
+            LoadedLayer::Adjustment(_) => None,
+        }
+    }
+}
+
+// -- M10: per-layer render dispatch -- see `record_draw`'s module doc
+// comment for the overall design (one shared scene accumulator, no more
+// `has_adjustment` branching) this replaces from M1-M9. --
+
+/// One layer's own contribution to the shared scene accumulator every
+/// frame, dispatched from `LoadedLayer::as_render_op` -- replaces three
+/// separate `match`es that used to live directly inside `record_draw`
+/// (the effect-chain pre-pass, the simple composite loop, and M9's
+/// adjustment loop) with one dispatch point, each kind's own drawing
+/// logic in its own `impl` block instead of interleaved into one giant
+/// function.
+trait RenderOp {
+    fn record(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        renderer: &SceneRenderer,
+        target: &SceneAccumulator,
+    );
+}
+
+/// Draws one fullscreen triangle through `pipeline`/`bind_group` onto
+/// `target.view`, blending (`Load`) with whatever's already there -- the
+/// common shape every `RenderOp::record` impl below ends with.
+fn blend_onto(
+    encoder: &mut wgpu::CommandEncoder,
+    pipeline: &wgpu::RenderPipeline,
+    bind_group: &wgpu::BindGroup,
+    target: &SceneAccumulator,
+) {
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("render-op-pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: &target.view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, bind_group, &[]);
+    pass.draw(0..3, 0..1);
+}
+
+/// If `effects` is `Some`, runs that chain's base-draw (this layer's own
+/// native content, straight into its own *private* accumulator -- never
+/// the shared one `target` in `RenderOp::record` refers to) followed by
+/// every enabled effect (`SceneRenderer::run_effect_chain_passes`), and
+/// returns the pipeline/bind-group needed to blend the finished result
+/// onto the shared accumulator. If `effects` is `None`, returns this
+/// layer's own native pipeline/bind-group unchanged -- there's nothing
+/// to isolate, it draws straight onto the shared accumulator itself.
+fn run_own_chain_if_any<'a>(
+    encoder: &mut wgpu::CommandEncoder,
+    renderer: &'a SceneRenderer,
+    native_pipeline_offscreen: &'a wgpu::RenderPipeline,
+    native_pipeline_offscreen_blend: &'a wgpu::RenderPipeline,
+    native_bind_group: &'a wgpu::BindGroup,
+    effects: &'a Option<EffectChain>,
+) -> (&'a wgpu::RenderPipeline, &'a wgpu::BindGroup) {
+    let Some(chain) = effects else {
+        return (native_pipeline_offscreen_blend, native_bind_group);
+    };
+
+    // Base draw: this layer's own native content, straight into its
+    // own private accumulator -- no blending needed, it's the first
+    // and only thing drawn onto a texture just cleared to transparent.
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("effect-base-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &chain.accumulator_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(native_pipeline_offscreen);
+        pass.set_bind_group(0, native_bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    renderer.run_effect_chain_passes(encoder, chain);
+    (&renderer.image_pipeline_offscreen_blend, &chain.composite_bind_group)
+}
+
+impl RenderOp for ImageLayer {
+    fn record(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        renderer: &SceneRenderer,
+        target: &SceneAccumulator,
+    ) {
+        let (pipeline, bind_group) = run_own_chain_if_any(
+            encoder,
+            renderer,
+            &renderer.image_pipeline_offscreen,
+            &renderer.image_pipeline_offscreen_blend,
+            &self.bind_group,
+            &self.effects,
+        );
+        blend_onto(encoder, pipeline, bind_group, target);
+    }
+}
+
+impl RenderOp for XrayLayer {
+    fn record(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        renderer: &SceneRenderer,
+        target: &SceneAccumulator,
+    ) {
+        let (pipeline, bind_group) = run_own_chain_if_any(
+            encoder,
+            renderer,
+            &renderer.xray_pipeline_offscreen,
+            &renderer.xray_pipeline_offscreen_blend,
+            &self.bind_group,
+            &self.effects,
+        );
+        blend_onto(encoder, pipeline, bind_group, target);
+    }
+}
+
+impl RenderOp for ParallaxLayer {
+    fn record(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        renderer: &SceneRenderer,
+        target: &SceneAccumulator,
+    ) {
+        let (pipeline, bind_group) = run_own_chain_if_any(
+            encoder,
+            renderer,
+            &renderer.parallax_pipeline_offscreen,
+            &renderer.parallax_pipeline_offscreen_blend,
+            &self.bind_group,
+            &self.effects,
+        );
+        blend_onto(encoder, pipeline, bind_group, target);
+    }
+}
+
+impl RenderOp for TextLayer {
+    fn record(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        renderer: &SceneRenderer,
+        target: &SceneAccumulator,
+    ) {
+        let mut glyphon = renderer.glyphon.lock().unwrap();
+        let mut text_renderer = self.text_renderer.lock().unwrap();
+
+        let text_area = glyphon::TextArea {
+            buffer: &self.buffer,
+            left: self.x * glyphon.canvas_width as f32,
+            top: self.y * glyphon.canvas_height as f32,
+            scale: 1.0,
+            bounds: glyphon::TextBounds::default(),
+            default_color: glyphon::Color::rgba(
+                srgb_u8_from_linear(self.color[0]),
+                srgb_u8_from_linear(self.color[1]),
+                srgb_u8_from_linear(self.color[2]),
+                (self.color[3].clamp(0.0, 1.0) * 255.0).round() as u8,
+            ),
+            custom_glyphs: &[],
+        };
+        {
+            let GlyphonState {
+                font_system,
+                swash_cache,
+                atlas,
+                viewport,
+                ..
+            } = &mut *glyphon;
+            text_renderer
+                .prepare(
+                    &renderer.device,
+                    &renderer.queue,
+                    font_system,
+                    atlas,
+                    viewport,
+                    [text_area],
+                    swash_cache,
+                )
+                .expect("glyphon text layout failed");
+        }
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("text-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target.view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        text_renderer
+            .render(&glyphon.atlas, &glyphon.viewport, &mut pass)
+            .expect("glyphon text render failed");
+    }
+}
+
+impl RenderOp for AdjustmentLayer {
+    fn record(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        renderer: &SceneRenderer,
+        target: &SceneAccumulator,
+    ) {
+        // `as_render_op` only ever hands out an `Adjustment` op when
+        // `effects` is `Some` -- see its own doc comment.
+        let chain = self.effects.as_ref().expect("as_render_op checked this");
+
+        // Sizes can differ by a frame's worth of staleness: `chain` was
+        // sized at `load_scene` time against whatever canvas size was
+        // known *then*, `target` against whatever's current *now* (see
+        // `SceneAccumulator`'s doc comment) -- normally identical, but
+        // clamped to the smaller of the two so a mismatch (e.g. the very
+        // first scene ever loaded on a fresh `SceneRenderer`, before any
+        // real canvas size was established) can't overrun either
+        // texture's bounds. Self-corrects on the next structural reload,
+        // same accepted-imprecision shape as `load_scene`'s own doc
+        // comment on this effect chain's aspect ratio.
+        let src_size = target.texture.size();
+        let dst_size = chain.accumulator_texture.size();
+        let extent = wgpu::Extent3d {
+            width: src_size.width.min(dst_size.width),
+            height: src_size.height.min(dst_size.height),
+            depth_or_array_layers: 1,
+        };
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &chain.accumulator_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            extent,
+        );
+        renderer.run_effect_chain_passes(encoder, chain);
+        blend_onto(
+            encoder,
+            &renderer.image_pipeline_offscreen_blend,
+            &chain.composite_bind_group,
+            target,
+        );
+    }
 }
 
 /// Builds the bind group layout shared by every single-input-texture
@@ -1206,12 +1518,15 @@ pub struct SceneRenderer {
     // targets `OFFSCREEN_FORMAT` and never blends -- see its own
     // creation site in `build` for why a second variant is needed.
     image_pipeline_offscreen: wgpu::RenderPipeline,
+    // M10: `OFFSCREEN_FORMAT` and blending both -- see its own creation
+    // site in `build` for why neither existing variant covers this.
+    image_pipeline_offscreen_blend: wgpu::RenderPipeline,
     image_bind_group_layout: wgpu::BindGroupLayout,
-    xray_pipeline: wgpu::RenderPipeline,
     xray_pipeline_offscreen: wgpu::RenderPipeline,
+    xray_pipeline_offscreen_blend: wgpu::RenderPipeline,
     xray_bind_group_layout: wgpu::BindGroupLayout,
-    parallax_pipeline: wgpu::RenderPipeline,
     parallax_pipeline_offscreen: wgpu::RenderPipeline,
+    parallax_pipeline_offscreen_blend: wgpu::RenderPipeline,
     parallax_bind_group_layout: wgpu::BindGroupLayout,
     vignette_pipeline: wgpu::RenderPipeline,
     vignette_bind_group_layout: wgpu::BindGroupLayout,
@@ -1236,6 +1551,38 @@ pub struct SceneRenderer {
     _dummy_mask_texture: wgpu::Texture,
     sampler: wgpu::Sampler,
     glyphon: std::sync::Mutex<GlyphonState>,
+    // M10: the one shared, canvas-sized `OFFSCREEN_FORMAT` surface every
+    // layer (ordinary, text, or adjustment) draws itself onto, in list
+    // order, before a final blit into `target_view` -- see `record_draw`'s
+    // module doc comment. `None` until the first `record_draw` call;
+    // rebuilt (not just resized) whenever `glyphon`'s `canvas_width`/
+    // `canvas_height` change, so a lazy rebuild here never risks a stale
+    // `wgpu::BindGroup` -- nothing else in this module holds a
+    // long-lived reference into it (see `SceneAccumulator`'s own doc
+    // comment for why that's safe).
+    scene_accumulator: std::sync::Mutex<Option<SceneAccumulator>>,
+}
+
+/// The shared surface `record_draw` composites the whole frame onto --
+/// see `SceneRenderer::scene_accumulator`'s doc comment. Unlike an
+/// `EffectChain`'s own accumulator (built once at `load_scene` time,
+/// whose effect bind groups are baked against its exact identity for the
+/// scene's whole lifetime), nothing holds a `wgpu::BindGroup` pointed at
+/// this one ahead of time -- every use (a render pass's color
+/// attachment, a `copy_texture_to_texture` source/dest, `bind_group`
+/// below for the final blit) is built fresh inside `record_draw`, each
+/// call. That's what makes it safe to recreate on a resize instead of
+/// needing to track down and rebuild whatever used to reference it.
+struct SceneAccumulator {
+    width: u32,
+    height: u32,
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    // Samples `view` -- what the final blit draws through `image_pipeline`
+    // to convert into `target_format` and land in `target_view`. Rebuilt
+    // alongside `texture`/`view` every time this struct is (their
+    // identities always change together), not reused independently.
+    bind_group: wgpu::BindGroup,
 }
 
 impl SceneRenderer {
@@ -1363,6 +1710,21 @@ impl SceneRenderer {
             OFFSCREEN_FORMAT,
             None,
         );
+        // M10: same shader/layout again, `OFFSCREEN_FORMAT` like the
+        // no-blend variant above, but *with* blending -- used to draw a
+        // layer's own content (or its finished effect-chain composite)
+        // onto the shared scene accumulator (`record_draw`'s module doc
+        // comment), which already holds every layer drawn before it and
+        // so needs real blending, unlike the freshly-cleared-to-
+        // transparent target the no-blend variant above draws into.
+        let image_pipeline_offscreen_blend = build_fullscreen_pipeline(
+            &device,
+            "image-pipeline-offscreen-blend",
+            &image_pipeline_layout,
+            &image_shader,
+            OFFSCREEN_FORMAT,
+            Some(wgpu::BlendState::ALPHA_BLENDING),
+        );
 
         let xray_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1418,14 +1780,12 @@ impl SceneRenderer {
             immediate_size: 0,
         });
 
-        let xray_pipeline = build_fullscreen_pipeline(
-            &device,
-            "xray-pipeline",
-            &xray_pipeline_layout,
-            &xray_shader,
-            target_format,
-            Some(wgpu::BlendState::ALPHA_BLENDING),
-        );
+        // M10 removed this shape's `target_format` sibling (used to be
+        // `xray_pipeline`) -- every layer now draws into the shared,
+        // always-`OFFSCREEN_FORMAT` scene accumulator (`record_draw`'s
+        // module doc comment), never `target_view` directly, so there's
+        // no more draw call that needs Xray's own shader compiled
+        // against `target_format`.
         let xray_pipeline_offscreen = build_fullscreen_pipeline(
             &device,
             "xray-pipeline-offscreen",
@@ -1433,6 +1793,15 @@ impl SceneRenderer {
             &xray_shader,
             OFFSCREEN_FORMAT,
             None,
+        );
+        // M10: see `image_pipeline_offscreen_blend`'s doc comment above.
+        let xray_pipeline_offscreen_blend = build_fullscreen_pipeline(
+            &device,
+            "xray-pipeline-offscreen-blend",
+            &xray_pipeline_layout,
+            &xray_shader,
+            OFFSCREEN_FORMAT,
+            Some(wgpu::BlendState::ALPHA_BLENDING),
         );
 
         let parallax_bind_group_layout =
@@ -1480,14 +1849,9 @@ impl SceneRenderer {
                 immediate_size: 0,
             });
 
-        let parallax_pipeline = build_fullscreen_pipeline(
-            &device,
-            "parallax-pipeline",
-            &parallax_pipeline_layout,
-            &parallax_shader,
-            target_format,
-            Some(wgpu::BlendState::ALPHA_BLENDING),
-        );
+        // M10 removed this shape's `target_format` sibling (used to be
+        // `parallax_pipeline`) -- see `xray_pipeline_offscreen`'s doc
+        // comment just above for why.
         let parallax_pipeline_offscreen = build_fullscreen_pipeline(
             &device,
             "parallax-pipeline-offscreen",
@@ -1495,6 +1859,15 @@ impl SceneRenderer {
             &parallax_shader,
             OFFSCREEN_FORMAT,
             None,
+        );
+        // M10: see `image_pipeline_offscreen_blend`'s doc comment above.
+        let parallax_pipeline_offscreen_blend = build_fullscreen_pipeline(
+            &device,
+            "parallax-pipeline-offscreen-blend",
+            &parallax_pipeline_layout,
+            &parallax_shader,
+            OFFSCREEN_FORMAT,
+            Some(wgpu::BlendState::ALPHA_BLENDING),
         );
 
         // -- Effect pipelines: always `OFFSCREEN_FORMAT`, since they
@@ -1739,19 +2112,19 @@ impl SceneRenderer {
 
         let glyphon_cache = glyphon::Cache::new(&device);
         let glyphon_viewport = glyphon::Viewport::new(&device, &glyphon_cache);
-        let mut glyphon_atlas =
-            glyphon::TextAtlas::new(&device, &queue, &glyphon_cache, target_format);
-        let glyphon_text_renderer = glyphon::TextRenderer::new(
-            &mut glyphon_atlas,
-            &device,
-            wgpu::MultisampleState::default(),
-            None,
-        );
+        // M10: always `OFFSCREEN_FORMAT`, never `target_format` -- a
+        // Text layer never draws directly into `target_view` any more,
+        // only into the shared scene accumulator (see `record_draw`'s
+        // module doc comment), which is always `OFFSCREEN_FORMAT`. The
+        // one and only place `target_format` still matters is the final
+        // accumulator-to-`target_view` blit, through `image_pipeline`
+        // (built against `target_format` below, unchanged).
+        let glyphon_atlas =
+            glyphon::TextAtlas::new(&device, &queue, &glyphon_cache, OFFSCREEN_FORMAT);
         let glyphon = std::sync::Mutex::new(GlyphonState {
             font_system: glyphon::FontSystem::new(),
             swash_cache: glyphon::SwashCache::new(),
             atlas: glyphon_atlas,
-            text_renderer: glyphon_text_renderer,
             viewport: glyphon_viewport,
             canvas_width: 1920,
             canvas_height: 1080,
@@ -1763,12 +2136,13 @@ impl SceneRenderer {
             queue,
             image_pipeline,
             image_pipeline_offscreen,
+            image_pipeline_offscreen_blend,
             image_bind_group_layout,
-            xray_pipeline,
             xray_pipeline_offscreen,
+            xray_pipeline_offscreen_blend,
             xray_bind_group_layout,
-            parallax_pipeline,
             parallax_pipeline_offscreen,
+            parallax_pipeline_offscreen_blend,
             parallax_bind_group_layout,
             vignette_pipeline,
             vignette_bind_group_layout,
@@ -1786,7 +2160,52 @@ impl SceneRenderer {
             _dummy_mask_texture: dummy_mask_texture,
             sampler,
             glyphon,
+            scene_accumulator: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Returns the shared scene accumulator sized for `(width, height)`,
+    /// rebuilding it first if this is the first call or the size
+    /// changed since the last one -- see `SceneAccumulator`'s doc
+    /// comment for why a plain rebuild (not an in-place resize) is
+    /// always safe here. Locks `scene_accumulator` for as long as the
+    /// returned guard is held; `record_draw` keeps it locked for its
+    /// whole call, same rationale as `glyphon`'s own lock.
+    fn ensure_scene_accumulator(
+        &self,
+        width: u32,
+        height: u32,
+    ) -> std::sync::MutexGuard<'_, Option<SceneAccumulator>> {
+        let mut guard = self.scene_accumulator.lock().unwrap();
+        let needs_rebuild = match &*guard {
+            Some(acc) => acc.width != width || acc.height != height,
+            None => true,
+        };
+        if needs_rebuild {
+            let (texture, view) = self.create_offscreen_render_target(width, height);
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("scene-accumulator-bind-group"),
+                layout: &self.image_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            *guard = Some(SceneAccumulator {
+                width,
+                height,
+                texture,
+                view,
+                bind_group,
+            });
+        }
+        guard
     }
 
     fn create_texture(&self, width: u32, height: u32) -> wgpu::Texture {
@@ -2612,6 +3031,15 @@ impl SceneRenderer {
             glyphon::Shaping::Advanced,
             None,
         );
+        // Cheap -- shares `glyphon.atlas`'s cached pipeline (see
+        // `TextLayer::text_renderer`'s doc comment), only allocates its
+        // own small vertex buffer.
+        let text_renderer = glyphon::TextRenderer::new(
+            &mut glyphon.atlas,
+            &self.device,
+            wgpu::MultisampleState::default(),
+            None,
+        );
         TextLayer {
             buffer,
             text,
@@ -2620,6 +3048,7 @@ impl SceneRenderer {
             y,
             font_size,
             color,
+            text_renderer: std::sync::Mutex::new(text_renderer),
         }
     }
 
@@ -3080,6 +3509,23 @@ impl SceneRenderer {
     /// caller that needs to record more commands in the same submission
     /// (render-server chains a copy-to-buffer for CPU readback) do so.
     /// Most callers want [`SceneRenderer::render_to_texture`] instead.
+    ///
+    /// M10: every layer -- ordinary, Text, or Adjustment -- draws itself
+    /// onto one shared, canvas-sized `OFFSCREEN_FORMAT` "scene
+    /// accumulator" (`ensure_scene_accumulator`), in list order, through
+    /// `RenderOp::record` (`LoadedLayer::as_render_op` picks which); a
+    /// final pass blits the accumulator into `target_view` (format-
+    /// converting via `image_pipeline`, built for `target_format`).
+    /// Replaces M1-M9's split between a batched, deferred glyphon
+    /// `render()` call (text always drew on top of literally everything,
+    /// regardless of its own position in the layer list -- a real,
+    /// reported bug, not a deliberate design) and a separate
+    /// `has_adjustment` branch (M9) with one unconditional path. See the
+    /// plan file's M10 section for the full design discussion, including
+    /// why a single shared `glyphon::TextRenderer` couldn't simply be
+    /// `prepare()`d more than once per frame to fix the ordering
+    /// directly -- the short version is on `TextLayer::text_renderer`'s
+    /// doc comment.
     pub fn record_draw(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -3087,244 +3533,22 @@ impl SceneRenderer {
         layers: &[LoadedLayer],
         clear_color: wgpu::Color,
     ) {
-        // glyphon's `prepare` only touches the device/queue/atlas -- like
-        // `update_xray_cursors`'s `queue.write_buffer` calls, it can't run
-        // once `pass` below already holds `encoder` mutably borrowed, so
-        // it has to happen first. Always called (even with zero text
-        // layers) so it clears out any glyphs prepared for a *previous*
-        // frame that had text when this one doesn't.
-        let mut glyphon = self.glyphon.lock().unwrap();
-        let text_areas: Vec<glyphon::TextArea> = layers
-            .iter()
-            .filter_map(|layer| match layer {
-                LoadedLayer::Text(text) => Some(glyphon::TextArea {
-                    buffer: &text.buffer,
-                    left: text.x * glyphon.canvas_width as f32,
-                    top: text.y * glyphon.canvas_height as f32,
-                    scale: 1.0,
-                    bounds: glyphon::TextBounds::default(),
-                    default_color: glyphon::Color::rgba(
-                        srgb_u8_from_linear(text.color[0]),
-                        srgb_u8_from_linear(text.color[1]),
-                        srgb_u8_from_linear(text.color[2]),
-                        (text.color[3].clamp(0.0, 1.0) * 255.0).round() as u8,
-                    ),
-                    custom_glyphs: &[],
-                }),
-                _ => None,
-            })
-            .collect();
-        {
-            let GlyphonState {
-                font_system,
-                swash_cache,
-                atlas,
-                viewport,
-                text_renderer,
-                ..
-            } = &mut *glyphon;
-            text_renderer
-                .prepare(
-                    &self.device,
-                    &self.queue,
-                    font_system,
-                    atlas,
-                    viewport,
-                    text_areas,
-                    swash_cache,
-                )
-                .expect("glyphon text layout failed");
-        }
-
-        // Effect chains run first, each in its own render pass(es) --
-        // they can't be interleaved with the shared composite pass below
-        // since every pass targets exactly one color attachment, and
-        // these target a layer's own accumulator/scratch textures, not
-        // `target_view`. A layer with no effects (`chain` is `None`,
-        // the common case) is skipped entirely here and draws straight
-        // into the composite pass below instead, same as before this
-        // existed.
-        for layer in layers {
-            let (base_pipeline, base_bind_group, chain) = match layer {
-                LoadedLayer::Image(image) | LoadedLayer::Gif { image, .. } => (
-                    &self.image_pipeline_offscreen,
-                    &image.bind_group,
-                    &image.effects,
-                ),
-                LoadedLayer::Xray(xray) => {
-                    (&self.xray_pipeline_offscreen, &xray.bind_group, &xray.effects)
-                }
-                LoadedLayer::Parallax(parallax) => (
-                    &self.parallax_pipeline_offscreen,
-                    &parallax.bind_group,
-                    &parallax.effects,
-                ),
-                // Text never has an effect chain -- see M1's scope note
-                // on `project_format::Layer::Text`. Adjustment has one,
-                // but it's built and run entirely differently (against
-                // the running composite, not a "base draw" of its own
-                // picture -- it has none) -- see the `has_adjustment`
-                // handling further down in `record_draw`.
-                LoadedLayer::Text(_) | LoadedLayer::Adjustment(_) => continue,
-            };
-            let Some(chain) = chain else { continue };
-
-            // Base draw: the layer's own native content, straight into
-            // the accumulator -- no blending needed, it's the first and
-            // only thing drawn onto a texture just cleared to
-            // transparent.
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("effect-base-pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &chain.accumulator_view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                pass.set_pipeline(base_pipeline);
-                pass.set_bind_group(0, base_bind_group, &[]);
-                pass.draw(0..3, 0..1);
-            }
-
-            self.run_effect_chain_passes(encoder, chain);
-        }
-
-        // M9: whether any layer's own post-processing stack needs to run
-        // against the *composite so far* rather than its own picture --
-        // see `project_format::Layer::Adjustment`'s doc comment. An
-        // adjustment layer with an empty stack (`effects: None`) is a
-        // complete no-op, same convention as any other empty-stack layer,
-        // so it doesn't count here.
-        let has_adjustment = layers
-            .iter()
-            .any(|l| matches!(l, LoadedLayer::Adjustment(a) if a.effects.is_some()));
-
-        if !has_adjustment {
-            // The overwhelming common case: everything below is exactly
-            // what this function always did, byte-for-byte, before M9 --
-            // one pass, every layer blended straight into `target_view`
-            // in list order. No adjustment layer means no reason to pay
-            // for the extra offscreen texture/passes the branch below
-            // needs.
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("composite-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear_color),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-
-            for layer in layers {
-                // Every variant here draws the same way -- one fullscreen
-                // triangle through its own pipeline and bind group -- so
-                // this only needs to pick which of those two, not repeat
-                // the three draw calls per variant. A layer with an
-                // effect chain (already fully resolved by the pre-pass
-                // loop above) composites through the ordinary
-                // `image_pipeline` sampling its accumulator, exactly like
-                // a plain Image layer would -- its own native
-                // pipeline/bind group was only needed for that chain's
-                // now-finished base-draw pass.
-                let (pipeline, bind_group) = match layer {
-                    LoadedLayer::Image(image) | LoadedLayer::Gif { image, .. } => {
-                        match &image.effects {
-                            Some(chain) => (&self.image_pipeline, &chain.composite_bind_group),
-                            None => (&self.image_pipeline, &image.bind_group),
-                        }
-                    }
-                    LoadedLayer::Xray(xray) => match &xray.effects {
-                        Some(chain) => (&self.image_pipeline, &chain.composite_bind_group),
-                        None => (&self.xray_pipeline, &xray.bind_group),
-                    },
-                    LoadedLayer::Parallax(parallax) => match &parallax.effects {
-                        Some(chain) => (&self.image_pipeline, &chain.composite_bind_group),
-                        None => (&self.parallax_pipeline, &parallax.bind_group),
-                    },
-                    // An adjustment layer with an empty stack is a no-op
-                    // here (see `has_adjustment` above); with a non-empty
-                    // one this branch never runs at all.
-                    LoadedLayer::Adjustment(_) => continue,
-                    // Text isn't part of this per-layer pipeline dispatch
-                    // at all -- glyphon batches every prepared text area
-                    // into one `render()` call below instead, so it
-                    // always draws on top of everything else regardless
-                    // of its position in the project's own layer list.
-                    LoadedLayer::Text(_) => continue,
-                };
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, bind_group, &[]);
-                pass.draw(0..3, 0..1);
-            }
-
-            let GlyphonState {
-                atlas,
-                viewport,
-                text_renderer,
-                ..
-            } = &*glyphon;
-            text_renderer
-                .render(atlas, viewport, &mut pass)
-                .expect("glyphon text render failed");
-            return;
-        }
-
-        // At least one adjustment layer: everything below draws into a
-        // running "composite so far" texture instead of straight into
-        // `target_view`, because `target_view` might not even be
-        // `OFFSCREEN_FORMAT` (see `EffectChain`'s doc comment on M2's own
-        // format nuance) -- an adjustment layer's effect chain, like
-        // every other, only ever reads `OFFSCREEN_FORMAT` input. Rather
-        // than allocate a whole separate texture just to hold that
-        // running composite, the *first* adjustment layer's own
-        // `accumulator_texture` plays that role for the entire frame:
-        // every ordinary layer below it draws straight into it (instead
-        // of into its own, now-unused chain -- there is none, it's not
-        // processing its own picture), and every ordinary layer between
-        // it and the next adjustment layer keeps doing the same. Each
-        // later adjustment layer gets the running composite handed to it
-        // via one `copy_texture_to_texture` (both textures always
-        // `OFFSCREEN_FORMAT`, always the same canvas size -- see
-        // `load_scene`'s `Layer::Adjustment` arm), then becomes the new
-        // "current" in turn.
-        let first_adjustment_index = layers
-            .iter()
-            .position(|l| matches!(l, LoadedLayer::Adjustment(a) if a.effects.is_some()))
-            .expect("has_adjustment is true");
-        let first_chain = match &layers[first_adjustment_index] {
-            LoadedLayer::Adjustment(a) => a.effects.as_ref().expect("checked by position above"),
-            _ => unreachable!("position() only matches LoadedLayer::Adjustment"),
+        let (canvas_width, canvas_height) = {
+            let glyphon = self.glyphon.lock().unwrap();
+            (glyphon.canvas_width, glyphon.canvas_height)
         };
-        let mut current_accumulator_texture = &first_chain.accumulator_texture;
-        let mut current_accumulator_view = &first_chain.accumulator_view;
-        let mut current_composite_bind_group = &first_chain.composite_bind_group;
+        let accumulator_guard = self.ensure_scene_accumulator(canvas_width, canvas_height);
+        let accumulator = accumulator_guard
+            .as_ref()
+            .expect("ensure_scene_accumulator always leaves Some behind");
 
-        // Establishes the running composite's initial state -- no draws,
-        // just the same clear every layer would otherwise start from at
-        // the top of `target_view`. Every draw after this uses `Load`
-        // unconditionally, whether it's the very first ordinary layer or
-        // the tenth adjustment layer's hand-off.
+        // Establishes the whole frame's starting state -- every draw
+        // after this uses `Load` unconditionally, whether it's the very
+        // first ordinary layer or a Text layer prepared alone.
         encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("adjustment-stack-clear-pass"),
+            label: Some("scene-accumulator-clear-pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: current_accumulator_view,
+                view: &accumulator.view,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
@@ -3338,91 +3562,9 @@ impl SceneRenderer {
             multiview_mask: None,
         });
 
-        for (i, layer) in layers.iter().enumerate() {
-            match layer {
-                // Always on top of everything, including any adjustment
-                // layer -- unchanged pre-existing limitation, see
-                // `project_format::Layer::Adjustment`'s doc comment.
-                LoadedLayer::Text(_) => continue,
-                LoadedLayer::Adjustment(adjustment) => {
-                    let Some(chain) = &adjustment.effects else {
-                        continue;
-                    };
-                    if i != first_adjustment_index {
-                        let extent = chain.accumulator_texture.size();
-                        encoder.copy_texture_to_texture(
-                            wgpu::TexelCopyTextureInfo {
-                                texture: current_accumulator_texture,
-                                mip_level: 0,
-                                origin: wgpu::Origin3d::ZERO,
-                                aspect: wgpu::TextureAspect::All,
-                            },
-                            wgpu::TexelCopyTextureInfo {
-                                texture: &chain.accumulator_texture,
-                                mip_level: 0,
-                                origin: wgpu::Origin3d::ZERO,
-                                aspect: wgpu::TextureAspect::All,
-                            },
-                            extent,
-                        );
-                    }
-                    self.run_effect_chain_passes(encoder, chain);
-                    current_accumulator_texture = &chain.accumulator_texture;
-                    current_accumulator_view = &chain.accumulator_view;
-                    current_composite_bind_group = &chain.composite_bind_group;
-                }
-                _ => {
-                    // Ordinary layer: same pipeline/bind-group selection
-                    // as the `!has_adjustment` branch above, just
-                    // targeting the running composite instead of
-                    // `target_view`, and always `Load` (the clear pass
-                    // above already handled the very first draw). One
-                    // render pass per layer here, not batched into a
-                    // segment the way the simple path above batches
-                    // every layer into one -- an adjustment layer is
-                    // rare enough that the extra pass-per-layer overhead
-                    // isn't worth the bookkeeping to avoid.
-                    let (pipeline, bind_group) = match layer {
-                        LoadedLayer::Image(image) | LoadedLayer::Gif { image, .. } => {
-                            match &image.effects {
-                                Some(chain) => {
-                                    (&self.image_pipeline, &chain.composite_bind_group)
-                                }
-                                None => (&self.image_pipeline, &image.bind_group),
-                            }
-                        }
-                        LoadedLayer::Xray(xray) => match &xray.effects {
-                            Some(chain) => (&self.image_pipeline, &chain.composite_bind_group),
-                            None => (&self.xray_pipeline, &xray.bind_group),
-                        },
-                        LoadedLayer::Parallax(parallax) => match &parallax.effects {
-                            Some(chain) => (&self.image_pipeline, &chain.composite_bind_group),
-                            None => (&self.parallax_pipeline, &parallax.bind_group),
-                        },
-                        LoadedLayer::Adjustment(_) | LoadedLayer::Text(_) => {
-                            unreachable!("handled by the outer match's own arms")
-                        }
-                    };
-                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("adjustment-stack-layer-pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: current_accumulator_view,
-                            depth_slice: None,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Load,
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                        multiview_mask: None,
-                    });
-                    pass.set_pipeline(pipeline);
-                    pass.set_bind_group(0, bind_group, &[]);
-                    pass.draw(0..3, 0..1);
-                }
+        for layer in layers {
+            if let Some(op) = layer.as_render_op() {
+                op.record(encoder, self, accumulator);
             }
         }
 
@@ -3443,18 +3585,8 @@ impl SceneRenderer {
             multiview_mask: None,
         });
         pass.set_pipeline(&self.image_pipeline);
-        pass.set_bind_group(0, current_composite_bind_group, &[]);
+        pass.set_bind_group(0, &accumulator.bind_group, &[]);
         pass.draw(0..3, 0..1);
-
-        let GlyphonState {
-            atlas,
-            viewport,
-            text_renderer,
-            ..
-        } = &*glyphon;
-        text_renderer
-            .render(atlas, viewport, &mut pass)
-            .expect("glyphon text render failed");
     }
 
     /// Runs one layer's (or, since M9, one adjustment layer's) full
