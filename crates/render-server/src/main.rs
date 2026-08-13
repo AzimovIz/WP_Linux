@@ -1378,6 +1378,73 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         assert!(result.is_err(), "a mismatched param count should be an error");
     }
 
+    /// M8's brush-painted mask -- `LoadedLayer::write_mask_paint`'s live,
+    /// no-reload GPU texture update. Loads a `Mask::Texture` that starts
+    /// fully black (mask off everywhere, so a strong Vignette shouldn't
+    /// darken anything), then repaints it fully white in place -- same
+    /// real-pipeline round-trip as every other effect test above, just
+    /// re-rendering the *same already-loaded* `layers` twice instead of
+    /// loading two separate scenes, to prove the update actually reached
+    /// the GPU texture without a reload.
+    #[test]
+    fn write_mask_paint_updates_an_already_loaded_texture_mask_live() {
+        let project_dir = unique_temp_dir();
+        let width = 32u32;
+        let height = 32u32;
+        image::RgbaImage::from_pixel(width, height, image::Rgba([255, 255, 255, 255]))
+            .save(project_dir.join("bg.png"))
+            .expect("failed to write test fixture PNG");
+        let mask_resolution = 8u32;
+        image::GrayImage::from_pixel(mask_resolution, mask_resolution, image::Luma([0]))
+            .save(project_dir.join("mask.png"))
+            .expect("failed to write test fixture mask PNG");
+
+        let project = project_format::Project {
+            name: String::new(),
+            description: String::new(),
+            fps: 30,
+            layers: vec![project_format::Layer::Image {
+                path: "bg.png".to_string(),
+                effects: vec![project_format::Effect {
+                    kind: project_format::EffectKind::Vignette {
+                        strength: 1.0,
+                        softness: 0.0,
+                    },
+                    mask: project_format::Mask::Texture {
+                        path: "mask.png".to_string(),
+                        invert: false,
+                    },
+                    enabled: true,
+                }],
+            }],
+        };
+
+        let scene_renderer =
+            pollster::block_on(super::SceneRenderer::new_headless(renderer::CANVAS_FORMAT));
+        let layers = scene_renderer
+            .load_scene(&project_dir, &project, true)
+            .expect("load_scene failed");
+
+        let canvas = renderer::create_canvas(&scene_renderer, width, height);
+        let pixels_before = renderer::render_frame(&scene_renderer, &canvas, &layers);
+        let corner_before = pixels_before[0];
+
+        let white_rgba = vec![255u8; (mask_resolution * mask_resolution * 4) as usize];
+        layers[0].write_mask_paint(&scene_renderer.queue, 0, &white_rgba, mask_resolution, mask_resolution);
+
+        let pixels_after = renderer::render_frame(&scene_renderer, &canvas, &layers);
+        let corner_after = pixels_after[0];
+
+        assert!(
+            corner_before > 200,
+            "mask starts fully off, corner should look like the original white, got {corner_before}"
+        );
+        assert!(
+            corner_after < corner_before,
+            "after live-repainting the mask fully on, the vignette should now darken the corner -- before={corner_before} after={corner_after}"
+        );
+    }
+
     /// Round-trips a small, non-uniform RGBA buffer through our BMP
     /// encoder and `image`'s own BMP decoder (a completely independent
     /// implementation) to catch any mistake in the header/mask/row-order

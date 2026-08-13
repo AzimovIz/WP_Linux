@@ -272,9 +272,13 @@ struct LoadedMask {
     // buffers above.
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    // Only `Some` for `Mask::Texture` -- kept alive so the bind group's
-    // texture view isn't dangling; never read back on the Rust side.
-    _mask_texture: Option<wgpu::Texture>,
+    // Only `Some` for `Mask::Texture` -- keeps the bind group's texture
+    // view from dangling, and (M8, brush-painted masks) is also written
+    // into directly by `LoadedLayer::write_mask_paint` on every brush
+    // stroke, without a scene reload -- see that method's doc comment.
+    // A picked-file `Mask::Texture` never gets touched this way, only a
+    // painted one, but the field itself doesn't know the difference.
+    mask_texture: Option<wgpu::Texture>,
     // `mask_uniform_bytes`' aspect-correction input -- stashed here so
     // `set_effect_params` can rebuild this mask's uniform bytes on a
     // live update without needing the layer's width/height threaded
@@ -904,6 +908,67 @@ impl LoadedLayer {
                 &mask_uniform_bytes(&effect.mask, loaded.mask.canvas_aspect),
             );
         }
+    }
+
+    /// Writes freshly painted pixels straight into effect `effect_index`'s
+    /// already-loaded `Mask::Texture` GPU texture, without a scene
+    /// reload -- the brush-painting live-preview path (M8, see
+    /// `Ideas.md`, "Кисть для маски"). `rgba` must already be expanded
+    /// to 4 bytes/pixel (the editor's paint buffer itself is single-
+    /// channel -- see `wp_linux_editor`'s `expand_gray_to_rgba`) and
+    /// `width`/`height` must match the texture's own size exactly, the
+    /// same fixed working resolution every painted mask gets normalized
+    /// to the moment painting starts (never the picture's original
+    /// size, if it started from one) -- see `Ideas.md`'s note on why a
+    /// full-picture-resolution mask would be too expensive to repaint
+    /// every stroke.
+    ///
+    /// A no-op if this layer has no effect chain, `effect_index` is out
+    /// of range, or that effect's mask isn't (yet) a `Mask::Texture` --
+    /// same defensive-no-op rationale as `set_effect_params`'s own
+    /// mid-reload shape mismatch handling, since a stroke can arrive in
+    /// the one frame between an edit that needs a reload and
+    /// `ensure_scene` actually landing it.
+    pub fn write_mask_paint(
+        &self,
+        queue: &wgpu::Queue,
+        effect_index: usize,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) {
+        let chain = match self {
+            LoadedLayer::Image(image) | LoadedLayer::Gif { image, .. } => &image.effects,
+            LoadedLayer::Xray(xray) => &xray.effects,
+            LoadedLayer::Parallax(parallax) => &parallax.effects,
+            LoadedLayer::Text(_) => return,
+        };
+        let Some(chain) = chain else { return };
+        let Some(effect) = chain.effects.get(effect_index) else {
+            return;
+        };
+        let Some(texture) = &effect.mask.mask_texture else {
+            return;
+        };
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * width),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
     }
 
     /// Pixel width/height of a Text layer's shaped text, in the same
@@ -2326,7 +2391,7 @@ impl SceneRenderer {
         Ok(LoadedMask {
             uniform_buffer,
             bind_group,
-            _mask_texture: mask_texture,
+            mask_texture,
             canvas_aspect,
         })
     }

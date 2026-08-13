@@ -434,8 +434,54 @@ enum EditorMask {
     Texture {
         path: Option<PathBuf>,
         invert: bool,
+        /// Brush-painted content, editor-only -- M8, see `Ideas.md`,
+        /// "Кисть для маски". `None` for a plain picked-file mask that's
+        /// never been painted on; `Some` from the moment paint mode is
+        /// first entered on this mask onward (see `show_mask_panel`'s
+        /// Texture arm), whether it started blank or was normalized
+        /// down from an existing picture. Once `Some`, this buffer --
+        /// not whatever `path`'s file happens to contain on disk at any
+        /// given moment -- is the live source of truth; `write_texture`-
+        /// per-stroke GPU updates (`LoadedLayer::write_mask_paint`)
+        /// never touch the file, only `stage_effect` (at save) writes
+        /// it back out. Single channel, `PAINT_MASK_RESOLUTION`^2
+        /// bytes, row-major, mask value 0..255 per pixel -- `mask_texture`
+        /// only ever samples the R channel (see `mask_blend.wgsl`), so
+        /// there's no reason to carry three redundant color channels
+        /// through painting.
+        paint: Option<Vec<u8>>,
+        /// Whether the brush-paint interaction is currently capturing
+        /// drags on the preview for this mask -- kept alongside `paint`
+        /// (not a loose `EditorApp` field) so switching to a different
+        /// effect/mask can't leave a stale "still painting" flag pointed
+        /// at the wrong one.
+        painting: bool,
+        /// Brush size/edge softness, same units as everywhere else in
+        /// this file that measures something against canvas size
+        /// (fraction of canvas, 0.0..=1.0) -- see `stamp_paint_buffer`.
+        brush_radius: f32,
+        brush_softness: f32,
+        /// UV position of the last stamp this stroke, so
+        /// `stamp_paint_buffer` can interpolate between it and the
+        /// current position instead of leaving gaps on a fast mouse
+        /// move (same technique as M6's smoke splat trail). `None`
+        /// between strokes (pointer up, or paint mode just turned on)
+        /// so a new stroke's first stamp doesn't interpolate all the
+        /// way from wherever the previous one ended.
+        last_paint_pos: Option<(f32, f32)>,
     },
 }
+
+/// Fixed working resolution every brush-painted mask gets normalized to
+/// the moment paint mode is first entered on it, regardless of the
+/// picture's own resolution it may have started from (or lack of one) --
+/// see `Ideas.md`, "Кисть для маски", on why repainting at a source
+/// picture's full resolution (which could be 4K) every stroke would be
+/// too expensive, and a fixed size with linear filtering at sample time
+/// is plenty for a soft mask.
+const PAINT_MASK_RESOLUTION: u32 = 1024;
+const DEFAULT_BRUSH_RADIUS: f32 = 0.05;
+const DEFAULT_BRUSH_SOFTNESS: f32 = 0.5;
 
 impl EditorMask {
     /// See `build_preview_project`'s doc comment on why an absolute
@@ -462,7 +508,7 @@ impl EditorMask {
                 feather: *feather,
                 invert: *invert,
             },
-            EditorMask::Texture { path, invert } => project_format::Mask::Texture {
+            EditorMask::Texture { path, invert, .. } => project_format::Mask::Texture {
                 path: path
                     .as_ref()
                     .map(|p| p.display().to_string())
@@ -539,6 +585,19 @@ fn editor_effects_from_project(
                 project_format::Mask::Texture { path, invert } => EditorMask::Texture {
                     path: Some(project_dir.join(path)),
                     invert,
+                    // A painted mask is byte-for-byte a normal
+                    // `Mask::Texture` PNG once saved (see `stage_effect`)
+                    // -- reading it back into `paint` for further
+                    // painting only happens lazily, the first time paint
+                    // mode is (re-)entered on it (`show_mask_panel`'s
+                    // Texture arm already does this for any file, picked
+                    // or reopened, so there's nothing special to do
+                    // here).
+                    paint: None,
+                    painting: false,
+                    brush_radius: DEFAULT_BRUSH_RADIUS,
+                    brush_softness: DEFAULT_BRUSH_SOFTNESS,
+                    last_paint_pos: None,
                 },
             },
             enabled: effect.enabled,
@@ -733,6 +792,20 @@ impl Preview {
         // Always trusted -- see `sync_live_params`'s Text arm for the
         // same self-authoring rationale.
         let mut layers = self.renderer.load_scene(Path::new(""), &project, true)?;
+        // A reload always rebuilds every texture from whatever's on
+        // disk right now (see `create_loaded_mask`) -- but a painted
+        // mask's on-disk file only reflects its content as of whenever
+        // paint mode was last (re)entered on it (`EditorMask::Texture::
+        // paint`'s doc comment), since live strokes only ever reach the
+        // GPU directly (`write_mask_paint`), never the file. Without
+        // this, a reload triggered by *anything* structural elsewhere
+        // in the project -- entering paint mode on a *different* mask
+        // for the first time, adding/removing an effect, anything that
+        // changes `LayerSignature` -- would silently roll back every
+        // other mask's in-progress strokes to that stale snapshot. So
+        // every reload re-applies every currently-painted mask's true
+        // live buffer right back on top, immediately.
+        restore_painted_masks(&layers, editor_layers, &self.renderer.queue);
         let (natural_width, natural_height) =
             layers.first().map(LoadedLayer::size).unwrap_or((16, 9));
         let (width, height) = preview_size(natural_width, natural_height);
@@ -851,6 +924,42 @@ fn sync_effect_params(loaded: &mut LoadedLayer, queue: &wgpu::Queue, effects: &[
     let projected: Vec<project_format::Effect> =
         effects.iter().map(EditorEffect::to_project).collect();
     loaded.set_effect_params(queue, &projected);
+}
+
+/// Re-applies every currently-painted mask's live in-memory buffer onto
+/// a freshly (re)loaded scene -- see the call site in `Preview::
+/// ensure_scene` for why a reload otherwise silently discards any
+/// painted mask's in-progress strokes. `layers`/`editor_layers` must
+/// already be the same length and in the same order (true right after
+/// `SceneRenderer::load_scene` builds `layers` from `editor_layers` via
+/// `build_preview_project`).
+fn restore_painted_masks(layers: &[LoadedLayer], editor_layers: &[EditorLayer], queue: &wgpu::Queue) {
+    for (layer, editor_layer) in layers.iter().zip(editor_layers) {
+        let effects = match editor_layer {
+            EditorLayer::Image { effects, .. }
+            | EditorLayer::Xray { effects, .. }
+            | EditorLayer::Gif { effects, .. }
+            | EditorLayer::Parallax { effects, .. } => Some(effects),
+            EditorLayer::Text { .. } => None,
+        };
+        let Some(effects) = effects else { continue };
+        for (effect_index, effect) in effects.iter().enumerate() {
+            if let EditorMask::Texture {
+                paint: Some(buffer),
+                ..
+            } = &effect.mask
+            {
+                let rgba = expand_gray_to_rgba(buffer);
+                layer.write_mask_paint(
+                    queue,
+                    effect_index,
+                    &rgba,
+                    PAINT_MASK_RESOLUTION,
+                    PAINT_MASK_RESOLUTION,
+                );
+            }
+        }
+    }
 }
 
 fn create_preview_texture(
@@ -2160,6 +2269,76 @@ impl EditorApp {
                         EditorMask::Gradient { transform, .. } => {
                             show_gradient_mask_gizmo(ui, &response, transform);
                         }
+                        EditorMask::Texture {
+                            painting: true,
+                            paint: Some(buffer),
+                            brush_radius,
+                            brush_softness,
+                            last_paint_pos,
+                            ..
+                        } => {
+                            // A dedicated interact region over the whole
+                            // preview, same pattern the gizmos above use
+                            // for their own handles -- `response` itself
+                            // only senses hover (see its own
+                            // construction above), not drag.
+                            let paint_interact = ui.interact(
+                                response.rect,
+                                ui.id().with("mask_paint"),
+                                eframe::egui::Sense::drag(),
+                            );
+                            if let Some(pos) = paint_interact.interact_pointer_pos() {
+                                let uv = (
+                                    (pos.x - response.rect.min.x) / response.rect.width().max(1.0),
+                                    (pos.y - response.rect.min.y)
+                                        / response.rect.height().max(1.0),
+                                );
+                                let erase = ui.input(|i| i.modifiers.shift);
+                                stamp_paint_buffer(
+                                    buffer,
+                                    PAINT_MASK_RESOLUTION,
+                                    *last_paint_pos,
+                                    uv,
+                                    *brush_radius,
+                                    *brush_softness,
+                                    erase,
+                                );
+                                *last_paint_pos = Some(uv);
+                                if let Some(loaded) = preview.layers.get(layer_index) {
+                                    let rgba = expand_gray_to_rgba(buffer);
+                                    loaded.write_mask_paint(
+                                        &preview.renderer.queue,
+                                        effect_index,
+                                        &rgba,
+                                        PAINT_MASK_RESOLUTION,
+                                        PAINT_MASK_RESOLUTION,
+                                    );
+                                }
+                            } else {
+                                *last_paint_pos = None;
+                            }
+                            // Brush-size feedback ring at the cursor,
+                            // aspect-corrected the same way
+                            // `show_circle_mask_gizmo` already corrects
+                            // its own radius -- painting is *not*
+                            // aspect-corrected in the buffer itself (see
+                            // `stamp_paint_buffer`'s doc comment), but
+                            // the on-screen cursor still ought to show
+                            // roughly the shape that'll land given the
+                            // canvas's own aspect ratio isn't 1:1.
+                            if let Some(pos) = response.hover_pos() {
+                                let color = if ui.input(|i| i.modifiers.shift) {
+                                    eframe::egui::Color32::LIGHT_RED
+                                } else {
+                                    eframe::egui::Color32::WHITE
+                                };
+                                ui.painter().circle_stroke(
+                                    pos,
+                                    *brush_radius * response.rect.height(),
+                                    eframe::egui::Stroke::new(1.5, color),
+                                );
+                            }
+                        }
                         EditorMask::None | EditorMask::Texture { .. } => {}
                     }
                 }
@@ -2558,7 +2737,7 @@ fn show_effects_panel(
             ui.add_space(2.0);
             show_effect_kind_panel(ui, &mut effect.kind);
             ui.add_space(2.0);
-            show_mask_panel(ui, &mut effect.mask);
+            show_mask_panel(ui, &mut effect.mask, selected_effect, index);
         });
     }
 
@@ -2729,7 +2908,22 @@ fn show_shader_effect_panel(
 /// that type needs. `None` has none; `Circle`/`Gradient` share a
 /// transform/feather/invert; `Texture` is a picked picture instead of a
 /// transform (see `EditorMask`'s doc comment).
-fn show_mask_panel(ui: &mut eframe::egui::Ui, mask: &mut EditorMask) {
+///
+/// `selected_effect`/`effect_index` are only here for the Paint button
+/// below -- entering paint mode has to also select this effect
+/// (`show_preview_content`'s brush interaction, like the Circle/Gradient
+/// gizmos before it, only acts on `self.selected_effect`'s mask), or
+/// clicking "Paint" here without separately clicking this effect's own
+/// row above would silently paint nothing: the button's own label still
+/// flips to "Stop painting" (that only reads this mask's own `painting`
+/// field, not the selection), so there'd be no visible sign anything was
+/// wrong.
+fn show_mask_panel(
+    ui: &mut eframe::egui::Ui,
+    mask: &mut EditorMask,
+    selected_effect: &mut Option<usize>,
+    effect_index: usize,
+) {
     ui.horizontal(|ui| {
         ui.label("Mask:");
         let is_none = matches!(mask, EditorMask::None);
@@ -2757,6 +2951,11 @@ fn show_mask_panel(ui: &mut eframe::egui::Ui, mask: &mut EditorMask) {
             *mask = EditorMask::Texture {
                 path: None,
                 invert: false,
+                paint: None,
+                painting: false,
+                brush_radius: DEFAULT_BRUSH_RADIUS,
+                brush_softness: DEFAULT_BRUSH_SOFTNESS,
+                last_paint_pos: None,
             };
         }
     });
@@ -2779,7 +2978,15 @@ fn show_mask_panel(ui: &mut eframe::egui::Ui, mask: &mut EditorMask) {
             });
             ui.checkbox(invert, "Invert");
         }
-        EditorMask::Texture { path, invert } => {
+        EditorMask::Texture {
+            path,
+            invert,
+            paint,
+            painting,
+            brush_radius,
+            brush_softness,
+            last_paint_pos,
+        } => {
             path_picker(
                 ui,
                 "Mask picture (brightness = mask)",
@@ -2787,6 +2994,199 @@ fn show_mask_panel(ui: &mut eframe::egui::Ui, mask: &mut EditorMask) {
                 &["png", "jpg", "jpeg", "webp"],
             );
             ui.checkbox(invert, "Invert");
+            ui.horizontal(|ui| {
+                let label = if *painting {
+                    "Stop painting"
+                } else {
+                    "Paint"
+                };
+                if ui.button(label).clicked() {
+                    if !*painting && paint.is_none() {
+                        // First time entering paint mode on this mask --
+                        // normalize whatever it currently points at (or
+                        // start blank, if nothing's picked yet) down to
+                        // the fixed paint working resolution. See
+                        // `PAINT_MASK_RESOLUTION`'s doc comment for why
+                        // every painted mask lives at this size
+                        // regardless of its origin picture's own size.
+                        let buffer = path
+                            .as_ref()
+                            .and_then(|p| load_paint_buffer_from_file(p).ok())
+                            .unwrap_or_else(|| {
+                                vec![0u8; (PAINT_MASK_RESOLUTION * PAINT_MASK_RESOLUTION) as usize]
+                            });
+                        let temp_path = temp_paint_mask_path();
+                        match save_paint_buffer_png(&buffer, &temp_path) {
+                            Ok(()) => {
+                                *path = Some(temp_path);
+                                *paint = Some(buffer);
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "editor: failed to write temp paint mask {temp_path:?}: {e}"
+                                );
+                            }
+                        }
+                    }
+                    *painting = !*painting;
+                    *last_paint_pos = None;
+                    if *painting {
+                        // See this function's own doc comment -- without
+                        // this, painting would silently do nothing
+                        // unless the user had *also* separately clicked
+                        // this effect's row to select it.
+                        *selected_effect = Some(effect_index);
+                    }
+                }
+                if paint.is_some() {
+                    ui.label("Drag on the preview to paint, hold Shift to erase.");
+                }
+            });
+            if paint.is_some() {
+                ui.horizontal(|ui| {
+                    ui.label("Brush size:");
+                    scroll_slider(ui, brush_radius, 0.01..=0.3);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Brush softness:");
+                    scroll_slider(ui, brush_softness, 0.0..=1.0);
+                });
+            }
+        }
+    }
+}
+
+/// Loads `path`'s picture, converts it to grayscale, and resamples it to
+/// `PAINT_MASK_RESOLUTION`^2 -- the one-time normalization
+/// `show_mask_panel`'s Texture arm runs the first time paint mode is
+/// entered on a mask that started from a picked file, so painting
+/// afterwards always works at the same fixed resolution regardless of
+/// what the source picture's own size was.
+fn load_paint_buffer_from_file(path: &Path) -> Result<Vec<u8>, String> {
+    let image = image::open(path).map_err(|e| e.to_string())?.to_luma8();
+    let resized = image::imageops::resize(
+        &image,
+        PAINT_MASK_RESOLUTION,
+        PAINT_MASK_RESOLUTION,
+        image::imageops::FilterType::Triangle,
+    );
+    Ok(resized.into_raw())
+}
+
+/// Encodes a single-channel paint buffer as a grayscale PNG -- shared by
+/// `show_mask_panel`'s Texture arm (the temp file written when paint mode
+/// starts) and `stage_effect` (refreshing that file from the live buffer
+/// right before it gets staged into the saved project).
+fn save_paint_buffer_png(buffer: &[u8], path: &Path) -> Result<(), String> {
+    image::GrayImage::from_raw(PAINT_MASK_RESOLUTION, PAINT_MASK_RESOLUTION, buffer.to_vec())
+        .ok_or_else(|| "paint buffer size doesn't match PAINT_MASK_RESOLUTION".to_string())?
+        .save(path)
+        .map_err(|e| e.to_string())
+}
+
+/// A fresh, never-before-used path under the system temp dir for a
+/// from-scratch or just-normalized paint buffer to live at until the
+/// project is saved -- same "absolute path outside the project dir"
+/// convention every other not-yet-saved asset in this file already uses
+/// (`path_picker`'s own picked files), just auto-generated instead of
+/// user-chosen. Not cleaned up on its own -- consistent with this file
+/// not otherwise tracking temp-file lifetimes (e.g. `unique_temp_dir` in
+/// `render-server`'s own tests has the same non-guarantee) and out of
+/// scope for M8.
+fn temp_paint_mask_path() -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("wplinux-paint-mask-{}-{n}.png", std::process::id()))
+}
+
+/// Expands a single-channel paint buffer into 4-bytes/pixel RGBA (gray
+/// replicated into R/G/B, full alpha) for GPU upload -- `write_texture`
+/// (and every other texture upload in this codebase, via `player`'s own
+/// `create_texture`) always deals in RGBA8, even though `mask_blend.wgsl`
+/// only ever reads the R channel of a texture mask.
+fn expand_gray_to_rgba(gray: &[u8]) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity(gray.len() * 4);
+    for &g in gray {
+        rgba.extend_from_slice(&[g, g, g, 255]);
+    }
+    rgba
+}
+
+/// Stamps a soft circular brush along the segment from `last` (or just a
+/// single stamp at `to`, if this is a stroke's first point) to `to`, both
+/// in normalized 0.0..=1.0 UV space -- interpolated at a fixed
+/// screen-space step so a fast mouse movement doesn't leave gaps between
+/// egui frames, the same technique M6's smoke splat trail already uses
+/// for the same reason. Accumulates via `max()` (never additive --
+/// passing the brush over the same spot twice must not push the mask
+/// value past full strength), or subtracts when `erase` is set.
+///
+/// Not aspect-corrected -- a stamp is circular in the buffer's own
+/// (always square, `PAINT_MASK_RESOLUTION`^2) pixel space, which
+/// `mask_blend.wgsl` then samples in raw UV without any aspect
+/// correction (unlike its `Circle` mask mode, which does correct). On a
+/// non-square canvas this reads as a very slightly elliptical brush --
+/// the same accepted simplification M6's smoke splat already makes for
+/// the same reason (see `smoke.wgsl`'s doc comment).
+fn stamp_paint_buffer(
+    buffer: &mut [u8],
+    resolution: u32,
+    last: Option<(f32, f32)>,
+    to: (f32, f32),
+    radius: f32,
+    softness: f32,
+    erase: bool,
+) {
+    let from = last.unwrap_or(to);
+    let dx = (to.0 - from.0) * resolution as f32;
+    let dy = (to.1 - from.1) * resolution as f32;
+    let segment_len = (dx * dx + dy * dy).sqrt();
+    // A stamp roughly every 2 buffer pixels along the segment -- dense
+    // enough that consecutive stamps overlap even for a small brush.
+    let steps = (segment_len / 2.0).ceil().max(1.0) as u32;
+    for i in 0..=steps {
+        let t = i as f32 / steps as f32;
+        let point = (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t);
+        stamp_once(buffer, resolution, point, radius, softness, erase);
+    }
+}
+
+fn stamp_once(
+    buffer: &mut [u8],
+    resolution: u32,
+    center_uv: (f32, f32),
+    radius: f32,
+    softness: f32,
+    erase: bool,
+) {
+    let resolution_f = resolution as f32;
+    let cx = center_uv.0 * resolution_f;
+    let cy = center_uv.1 * resolution_f;
+    let r_px = (radius * resolution_f).max(1.0);
+    let inner = r_px * (1.0 - softness.clamp(0.0, 1.0));
+    let min_x = (cx - r_px).floor().max(0.0) as u32;
+    let max_x = (cx + r_px).ceil().min(resolution_f - 1.0) as u32;
+    let min_y = (cy - r_px).floor().max(0.0) as u32;
+    let max_y = (cy + r_px).ceil().min(resolution_f - 1.0) as u32;
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let px = x as f32 + 0.5 - cx;
+            let py = y as f32 + 0.5 - cy;
+            let dist = (px * px + py * py).sqrt();
+            if dist > r_px {
+                continue;
+            }
+            let strength = if dist <= inner {
+                1.0
+            } else {
+                1.0 - (dist - inner) / (r_px - inner).max(0.0001)
+            };
+            let idx = (y * resolution + x) as usize;
+            buffer[idx] = if erase {
+                (buffer[idx] as f32 - strength * 255.0).max(0.0) as u8
+            } else {
+                buffer[idx].max((strength * 255.0) as u8)
+            };
         }
     }
 }
@@ -3377,8 +3777,24 @@ fn stage_effect(
             feather: *feather,
             invert: *invert,
         },
-        EditorMask::Texture { path, invert } => {
+        EditorMask::Texture {
+            path,
+            invert,
+            paint,
+            ..
+        } => {
             let path = path.as_ref().expect("save is disabled until complete");
+            if let Some(buffer) = paint {
+                // The on-disk file only reflects the buffer's content as
+                // of whenever paint mode was last (re)entered --
+                // `LoadedLayer::write_mask_paint` pushes every stroke
+                // straight to the GPU and never touches disk (see
+                // `EditorMask::Texture::paint`'s doc comment), so it has
+                // to be refreshed from the live buffer right before
+                // staging picks it up, or a save right after painting
+                // would silently persist stale (or blank) content.
+                save_paint_buffer_png(buffer, path)?;
+            }
             let file_name = stage(
                 path,
                 &format!("layer_{layer_index}_effect_{effect_index}_mask"),
@@ -3439,6 +3855,108 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// A single stamp at a buffer's center should max out right at that
+    /// pixel and leave a far corner (well outside the brush radius)
+    /// completely untouched -- the same "does it land where it should,
+    /// and stay contained" shape of check every GPU effect test in
+    /// `render-server` runs, just against the CPU-side buffer directly
+    /// since this logic never touches the GPU.
+    #[test]
+    fn stamp_once_paints_a_solid_circle_and_leaves_the_far_corner_alone() {
+        let resolution = 64u32;
+        let mut buffer = vec![0u8; (resolution * resolution) as usize];
+        stamp_once(&mut buffer, resolution, (0.5, 0.5), 0.1, 0.5, false);
+
+        let center = buffer[(32 * resolution + 32) as usize];
+        let corner = buffer[0];
+
+        assert_eq!(center, 255, "the stamp's own center should be full strength");
+        assert_eq!(corner, 0, "a far corner outside the brush radius should stay untouched");
+    }
+
+    /// Painting twice over the same spot must not push the value past
+    /// full strength (accumulation is `max()`, not additive -- see
+    /// `stamp_paint_buffer`'s doc comment) -- and erasing afterwards
+    /// should bring it back down, not go negative/wrap.
+    #[test]
+    fn repeated_stamps_saturate_instead_of_overflowing_and_erase_reduces_it() {
+        let resolution = 64u32;
+        let mut buffer = vec![0u8; (resolution * resolution) as usize];
+        stamp_once(&mut buffer, resolution, (0.5, 0.5), 0.1, 0.0, false);
+        stamp_once(&mut buffer, resolution, (0.5, 0.5), 0.1, 0.0, false);
+        let center_index = (32 * resolution + 32) as usize;
+        assert_eq!(buffer[center_index], 255);
+
+        stamp_once(&mut buffer, resolution, (0.5, 0.5), 0.1, 0.0, true);
+        assert!(
+            buffer[center_index] < 255,
+            "erasing should reduce a previously fully-painted pixel, got {}",
+            buffer[center_index]
+        );
+    }
+
+    /// `stamp_paint_buffer` interpolates between `last` and `to` rather
+    /// than only stamping the endpoint -- otherwise a fast drag would
+    /// leave gaps instead of a continuous stroke. A long segment should
+    /// paint somewhere in its own middle, not just at its two ends.
+    #[test]
+    fn stamp_paint_buffer_interpolates_along_a_fast_drag() {
+        let resolution = 64u32;
+        let mut buffer = vec![0u8; (resolution * resolution) as usize];
+        stamp_paint_buffer(
+            &mut buffer,
+            resolution,
+            Some((0.1, 0.5)),
+            (0.9, 0.5),
+            0.05,
+            0.0,
+            false,
+        );
+        let midpoint = buffer[(32 * resolution + 32) as usize];
+        assert!(
+            midpoint > 0,
+            "a stroke from one edge to the other should paint through its own midpoint too"
+        );
+    }
+
+    #[test]
+    fn expand_gray_to_rgba_replicates_into_rgb_with_full_alpha() {
+        let gray = [0u8, 128, 255];
+        let rgba = expand_gray_to_rgba(&gray);
+        assert_eq!(
+            rgba,
+            vec![0, 0, 0, 255, 128, 128, 128, 255, 255, 255, 255, 255]
+        );
+    }
+
+    /// Round-trips a painted buffer through `save_paint_buffer_png` and
+    /// `load_paint_buffer_from_file` -- already at `PAINT_MASK_RESOLUTION`,
+    /// so the resample step is an identity and this mainly proves the
+    /// PNG encode/decode + grayscale conversion don't lose or shift data.
+    #[test]
+    fn paint_buffer_png_round_trips() {
+        let mut buffer = vec![0u8; (PAINT_MASK_RESOLUTION * PAINT_MASK_RESOLUTION) as usize];
+        stamp_once(
+            &mut buffer,
+            PAINT_MASK_RESOLUTION,
+            (0.5, 0.5),
+            0.1,
+            0.0,
+            false,
+        );
+
+        let dir = unique_temp_dir();
+        let path = dir.join("mask.png");
+        save_paint_buffer_png(&buffer, &path).expect("save should succeed");
+        let loaded = load_paint_buffer_from_file(&path).expect("load should succeed");
+
+        assert_eq!(loaded.len(), buffer.len());
+        let center_index =
+            ((PAINT_MASK_RESOLUTION / 2) * PAINT_MASK_RESOLUTION + PAINT_MASK_RESOLUTION / 2)
+                as usize;
+        assert_eq!(loaded[center_index], 255);
     }
 
     /// Reproduces the bug report: open a 3-layer project (as `open_project`
