@@ -234,6 +234,7 @@ enum EditorLayer {
         font_size: f32,
         color: [f32; 4],
         source: EditorTextSource,
+        font: EditorTextFont,
     },
     /// No picture/path of its own -- see
     /// `project_format::Layer::Adjustment`'s doc comment.
@@ -288,6 +289,56 @@ impl EditorTextSource {
             } => EditorTextSource::Command {
                 command,
                 interval_secs,
+            },
+        }
+    }
+}
+
+/// Mirrors `project_format::TextFont`'s variants -- kept separate purely
+/// so `Custom`'s path can be an `Option<PathBuf>` fed to `path_picker`,
+/// like every other asset path in this file, rather than
+/// `project_format::TextFont::Custom`'s `String` (a relative,
+/// staged-on-save path that doesn't exist until the project itself is
+/// saved). Converted to/from `project_format::TextFont` at the
+/// `open_project`/`save_project`/`build_preview_project` boundaries,
+/// same as `EditorMask`.
+///
+/// Unlike `EditorLayer::Text`'s x/y/font_size/color/source, this is a
+/// *structural* property, not a live one -- switching fonts needs a real
+/// scene reload (a different file to read, a different glyphon family to
+/// shape against), the same way `EditorMask::Texture`'s own path does.
+/// See `LayerSignature::Text`'s payload; `Preview::sync_live_params`'s
+/// Text arm deliberately never reads this field.
+#[derive(Clone, Default)]
+enum EditorTextFont {
+    #[default]
+    Bundled,
+    Custom {
+        path: Option<PathBuf>,
+    },
+}
+
+impl EditorTextFont {
+    /// Mirrors `EditorMask::Texture`'s own path-must-be-picked
+    /// completeness check.
+    fn is_complete(&self) -> bool {
+        match self {
+            EditorTextFont::Bundled => true,
+            EditorTextFont::Custom { path } => path.is_some(),
+        }
+    }
+
+    /// See `EditorMask::to_project`'s doc comment on why an absolute
+    /// path here (as opposed to `save_project`'s staged relative one) is
+    /// exactly what a preview-only `Project` needs.
+    fn to_project(&self) -> project_format::TextFont {
+        match self {
+            EditorTextFont::Bundled => project_format::TextFont::Bundled,
+            EditorTextFont::Custom { path } => project_format::TextFont::Custom {
+                path: path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
             },
         }
     }
@@ -637,9 +688,9 @@ impl EditorLayer {
             EditorLayer::Parallax { path, effects, .. } => {
                 path.is_some() && effects.iter().all(EditorEffect::is_complete)
             }
-            // No external asset -- always ready to preview/save, even
-            // with an empty string.
-            EditorLayer::Text { .. } => true,
+            // No external asset of its own to preview/save, aside from
+            // its optional custom font.
+            EditorLayer::Text { font, .. } => font.is_complete(),
             // No external asset either -- ready as soon as its own
             // effects are (an empty stack is trivially "all complete").
             EditorLayer::Adjustment { effects } => effects.iter().all(EditorEffect::is_complete),
@@ -755,13 +806,18 @@ enum LayerSignature {
     // own effects list, same structural-signature treatment as any
     // other layer's `effects`.
     Adjustment(Vec<EffectSignature>),
-    // No payload -- unlike every other layer, nothing about a Text
-    // layer ever requires a GPU reload; every property (including the
-    // text itself) is updatable live via `SceneRenderer::set_text_params`
-    // (see `Preview::sync_live_params`), so signature equality alone
-    // (Text always equals Text) is enough to skip `ensure_scene`'s
-    // reload path for it.
-    Text,
+    // Unlike every other Text property (updatable live via
+    // `SceneRenderer::set_text_params` -- see `Preview::
+    // sync_live_params`), the font is structural: switching it needs a
+    // real reload (see `EditorTextFont`'s doc comment), so it's the one
+    // payload this signature carries.
+    Text(TextFontSignature),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum TextFontSignature {
+    Bundled,
+    Custom(PathBuf),
 }
 
 /// Live GPU preview of the current layer stack.
@@ -913,11 +969,15 @@ impl Preview {
                     font_size,
                     color,
                     source,
+                    ..
                 } => {
                     // Always trusted: the editor is the self-authoring
                     // context (the user typed the command themselves),
                     // matching the auto-trust-on-save policy in the Save
-                    // button handler.
+                    // button handler. `font` isn't live-updatable -- see
+                    // `EditorTextFont`'s doc comment -- so it's not read
+                    // here; a font change goes through `ensure_scene`'s
+                    // reload path instead.
                     loaded.set_text_params(&source.to_project(), *x, *y, *font_size, *color, true);
                 }
                 EditorLayer::Image { effects, .. }
@@ -1111,12 +1171,14 @@ fn build_preview_project(layers: &[EditorLayer]) -> Option<project_format::Proje
                 font_size,
                 color,
                 source,
+                font,
             } => project_format::Layer::Text {
                 x: *x,
                 y: *y,
                 font_size: *font_size,
                 color: *color,
                 source: source.to_project(),
+                font: font.to_project(),
             },
             EditorLayer::Adjustment { effects } => project_format::Layer::Adjustment {
                 effects: effects.iter().map(EditorEffect::to_project).collect(),
@@ -1163,7 +1225,12 @@ fn build_signature(layers: &[EditorLayer]) -> Vec<LayerSignature> {
                 path.clone().expect("checked complete by caller"),
                 effects.iter().map(effect_signature).collect(),
             ),
-            EditorLayer::Text { .. } => LayerSignature::Text,
+            EditorLayer::Text { font, .. } => LayerSignature::Text(match font {
+                EditorTextFont::Bundled => TextFontSignature::Bundled,
+                EditorTextFont::Custom { path } => {
+                    TextFontSignature::Custom(path.clone().expect("checked complete by caller"))
+                }
+            }),
             EditorLayer::Adjustment { effects } => {
                 LayerSignature::Adjustment(effects.iter().map(effect_signature).collect())
             }
@@ -1851,6 +1918,7 @@ impl EditorApp {
                     font_size: 0.05,
                     color: [1.0, 1.0, 1.0, 1.0],
                     source: EditorTextSource::Literal(String::new()),
+                    font: EditorTextFont::Bundled,
                 });
                 // Selected immediately, not just appended -- a freshly
                 // added Text layer's drag handle should be visible on
@@ -2597,7 +2665,8 @@ fn show_layer_panel(
             font_size,
             color,
             source,
-        } => show_text_panel(ui, x, y, font_size, color, source),
+            font,
+        } => show_text_panel(ui, x, y, font_size, color, source, font),
         EditorLayer::Adjustment { effects } => show_adjustment_panel(ui, effects, selected_effect),
     }
 }
@@ -3223,6 +3292,7 @@ fn show_text_panel(
     font_size: &mut f32,
     color: &mut [f32; 4],
     source: &mut EditorTextSource,
+    font: &mut EditorTextFont,
 ) {
     ui.horizontal(|ui| {
         ui.label("Source:");
@@ -3285,6 +3355,21 @@ fn show_text_panel(
     });
     labeled_slider(ui, "X:", x, 0.0..=1.0);
     labeled_slider(ui, "Y:", y, 0.0..=1.0);
+
+    ui.horizontal(|ui| {
+        ui.label("Font:");
+        let is_bundled = matches!(font, EditorTextFont::Bundled);
+        if ui.selectable_label(is_bundled, "Bundled").clicked() && !is_bundled {
+            *font = EditorTextFont::Bundled;
+        }
+        let is_custom = matches!(font, EditorTextFont::Custom { .. });
+        if ui.selectable_label(is_custom, "Custom").clicked() && !is_custom {
+            *font = EditorTextFont::Custom { path: None };
+        }
+    });
+    if let EditorTextFont::Custom { path } = font {
+        path_picker(ui, "Font file:", path, &["ttf", "otf"]);
+    }
 }
 
 /// Thumbnails saved into the library -- deliberately smaller than the
@@ -3593,12 +3678,19 @@ fn open_project(project_dir: &Path) -> Result<(Vec<EditorLayer>, u32, String), S
                 font_size,
                 color,
                 source,
+                font,
             } => EditorLayer::Text {
                 x,
                 y,
                 font_size,
                 color,
                 source: EditorTextSource::from_project(source),
+                font: match font {
+                    project_format::TextFont::Bundled => EditorTextFont::Bundled,
+                    project_format::TextFont::Custom { path } => EditorTextFont::Custom {
+                        path: Some(project_dir.join(path)),
+                    },
+                },
             },
             project_format::Layer::Adjustment { effects } => EditorLayer::Adjustment {
                 effects: editor_effects_from_project(effects, &project_dir),
@@ -3722,20 +3814,31 @@ fn save_project(
                         effects,
                     }
                 }
-                // No asset to stage.
                 EditorLayer::Text {
                     x,
                     y,
                     font_size,
                     color,
                     source,
-                } => project_format::Layer::Text {
-                    x: *x,
-                    y: *y,
-                    font_size: *font_size,
-                    color: *color,
-                    source: source.to_project(),
-                },
+                    font,
+                } => {
+                    let font = match font {
+                        EditorTextFont::Bundled => project_format::TextFont::Bundled,
+                        EditorTextFont::Custom { path } => {
+                            let path = path.as_ref().expect("save is disabled until complete");
+                            let file_name = stage(path, &format!("layer_{index}_font"))?;
+                            project_format::TextFont::Custom { path: file_name }
+                        }
+                    };
+                    project_format::Layer::Text {
+                        x: *x,
+                        y: *y,
+                        font_size: *font_size,
+                        color: *color,
+                        source: source.to_project(),
+                        font,
+                    }
+                }
                 // No layer-level asset to stage -- just its own effects,
                 // same as every other layer kind's `effects` field.
                 EditorLayer::Adjustment { effects } => {

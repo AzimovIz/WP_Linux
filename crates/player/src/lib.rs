@@ -35,11 +35,12 @@ pub const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unor
 
 use std::fs::File;
 use std::io::BufReader;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use image::AnimationDecoder;
 use project_format::{
-    Effect, EffectKind, Layer, Mask, Project, TextSource, Transform2D, parse_shader_params,
+    Effect, EffectKind, Layer, Mask, Project, TextFont, TextSource, Transform2D,
+    parse_shader_params,
 };
 
 const IMAGE_SHADER: &str = include_str!("shader.wgsl");
@@ -50,6 +51,20 @@ const COLORADJUST_SHADER: &str = include_str!("coloradjust.wgsl");
 const BLUR_SHADER: &str = include_str!("blur.wgsl");
 const SMOKE_SHADER: &str = include_str!("smoke.wgsl");
 const MASK_BLEND_SHADER: &str = include_str!("mask_blend.wgsl");
+
+/// The engine's own embedded font -- see [`TextFont::Bundled`]'s doc
+/// comment. Noto Sans specifically for its broad script coverage
+/// (Latin + Cyrillic, notably); a static Regular instance (`wght=400,
+/// wdth=100`) pinned from Google Fonts' variable source via `fonttools
+/// varLib.instancer`, not the ~2MB variable font itself -- this crate
+/// only ever wants one weight, and a plain static face is simpler for
+/// fontdb/swash to deal with than carrying unused variation axes. OFL
+/// licensed (see `fonts/OFL.txt`, shipped alongside for attribution).
+const BUNDLED_FONT_BYTES: &[u8] = include_bytes!("fonts/NotoSans-Regular.ttf");
+/// The family name this exact font declares in its own `name` table
+/// (confirmed with `fontTools.ttLib`, not guessed) -- what
+/// `resolve_text_font` hands back for `TextFont::Bundled`.
+const BUNDLED_FONT_FAMILY: &str = "Noto Sans";
 
 pub struct GifFrame {
     rgba: Vec<u8>,
@@ -664,6 +679,18 @@ pub struct TextLayer {
     y: f32,
     font_size: f32,
     color: [f32; 4],
+    // Resolved once at load time by `SceneRenderer::resolve_text_font`
+    // (see `create_text_layer`) and reused on every re-shape after that
+    // -- `glyphon::Attrs` isn't stored on `buffer` itself, so each call
+    // to `buffer.set_text` (the initial one here, and every later one in
+    // `advance_text_sources` when a dynamic source's string changes) has
+    // to hand the family in again; without stashing it here, a re-shape
+    // would silently fall back to `Attrs::new()`'s generic sans-serif
+    // instead of staying on whatever font this layer actually loaded
+    // with. Changing the font itself is a structural property (like
+    // `Mask::Texture`'s path) -- it goes through a scene reload, not a
+    // live update, so this never needs to change after load.
+    family: String,
     // M10: its own `TextRenderer` (just a small vertex buffer, wrapping
     // a `wgpu::RenderPipeline` cached and shared via `glyphon::Cache` --
     // see `create_text_layer`'s doc comment) instead of sharing one on
@@ -720,6 +747,15 @@ struct GlyphonState {
     // size instead of collapsing to font_size 0.
     canvas_width: u32,
     canvas_height: u32,
+    // Absolute path -> family name, for every `TextFont::Custom` font
+    // already loaded into `font_system`'s database -- see
+    // `SceneRenderer::resolve_text_font`. Without this cache, reloading
+    // the same custom font path across many scene reloads over a long
+    // editing session (e.g. tweaking an unrelated slider elsewhere in
+    // the project, which still reloads every layer) would register a
+    // fresh, duplicate `fontdb` entry each time, growing without bound
+    // for the life of the process.
+    loaded_custom_fonts: std::collections::HashMap<PathBuf, String>,
 }
 
 impl LoadedLayer {
@@ -2135,13 +2171,23 @@ impl SceneRenderer {
         // (built against `target_format` below, unchanged).
         let glyphon_atlas =
             glyphon::TextAtlas::new(&device, &queue, &glyphon_cache, OFFSCREEN_FORMAT);
+        let mut font_system = glyphon::FontSystem::new();
+        // Registered once, here, so `TextFont::Bundled` (the default for
+        // every Text layer, and every one that predates this field) is
+        // always available by the fixed `BUNDLED_FONT_FAMILY` name --
+        // `create_text_layer` never has to special-case "is this the
+        // bundled font" beyond just resolving that one family name.
+        font_system
+            .db_mut()
+            .load_font_data(BUNDLED_FONT_BYTES.to_vec());
         let glyphon = std::sync::Mutex::new(GlyphonState {
-            font_system: glyphon::FontSystem::new(),
+            font_system,
             swash_cache: glyphon::SwashCache::new(),
             atlas: glyphon_atlas,
             viewport: glyphon_viewport,
             canvas_width: 1920,
             canvas_height: 1080,
+            loaded_custom_fonts: std::collections::HashMap::new(),
         });
 
         Self {
@@ -2997,15 +3043,58 @@ impl SceneRenderer {
         }
     }
 
+    /// Resolves `font` to the glyphon family name Text layers using it
+    /// should shape against -- `Bundled` is always the fixed embedded
+    /// family (registered once in `build`); `Custom` loads its file into
+    /// the shared font database the first time this exact path is seen
+    /// (cached in `glyphon.loaded_custom_fonts`, keyed by the resolved
+    /// absolute path, so a later reload of the same project doesn't
+    /// register a duplicate entry -- see that field's own doc comment)
+    /// and reads the family name back from the font's own name table,
+    /// rather than asking the caller to already know it.
+    fn resolve_text_font(&self, project_dir: &Path, font: &TextFont) -> Result<String, String> {
+        let TextFont::Custom { path } = font else {
+            return Ok(BUNDLED_FONT_FAMILY.to_string());
+        };
+        let full_path = project_dir.join(path);
+        let mut glyphon = self.glyphon.lock().unwrap();
+        if let Some(family) = glyphon.loaded_custom_fonts.get(&full_path) {
+            return Ok(family.clone());
+        }
+
+        let data = std::fs::read(&full_path)
+            .map_err(|e| format!("failed to read font {path:?}: {e}"))?;
+        let ids = glyphon
+            .font_system
+            .db_mut()
+            .load_font_source(glyphon::fontdb::Source::Binary(std::sync::Arc::new(data)));
+        let Some(&first_id) = ids.first() else {
+            return Err(format!("font {path:?} contains no usable font faces"));
+        };
+        let family = glyphon
+            .font_system
+            .db()
+            .face(first_id)
+            .and_then(|info| info.families.first())
+            .map(|(name, _lang)| name.clone())
+            .ok_or_else(|| format!("font {path:?} has no family name"))?;
+        glyphon.loaded_custom_fonts.insert(full_path, family.clone());
+        Ok(family)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn create_text_layer(
         &self,
+        project_dir: &Path,
         source: &TextSource,
         x: f32,
         y: f32,
         font_size: f32,
         color: [f32; 4],
+        font: &TextFont,
         allow_commands: bool,
-    ) -> TextLayer {
+    ) -> Result<TextLayer, String> {
+        let family = self.resolve_text_font(project_dir, font)?;
         let source = LoadedTextSource::from_project(source, allow_commands);
         // Resolved once up front (e.g. a Clock source's format string
         // applied against "now") so the buffer starts out already
@@ -3029,7 +3118,7 @@ impl SceneRenderer {
         buffer.set_text(
             &mut glyphon.font_system,
             &text,
-            &glyphon::Attrs::new(),
+            &glyphon::Attrs::new().family(glyphon::Family::Name(&family)),
             glyphon::Shaping::Advanced,
             None,
         );
@@ -3042,7 +3131,7 @@ impl SceneRenderer {
             wgpu::MultisampleState::default(),
             None,
         );
-        TextLayer {
+        Ok(TextLayer {
             buffer,
             text,
             source,
@@ -3050,8 +3139,9 @@ impl SceneRenderer {
             y,
             font_size,
             color,
+            family,
             text_renderer: std::sync::Mutex::new(text_renderer),
-        }
+        })
     }
 
     /// Loads every layer of `project` onto the GPU, ready to draw. Asset
@@ -3138,15 +3228,18 @@ impl SceneRenderer {
                     font_size,
                     color,
                     source,
+                    font,
                 } => {
                     layers.push(LoadedLayer::Text(self.create_text_layer(
+                        project_dir,
                         source,
                         *x,
                         *y,
                         *font_size,
                         *color,
+                        font,
                         allow_commands,
-                    )));
+                    )?));
                 }
                 Layer::Adjustment { effects } => {
                     // No native asset of its own, so no natural
@@ -3484,7 +3577,7 @@ impl SceneRenderer {
                     text.buffer.set_text(
                         &mut glyphon.font_system,
                         &new_text,
-                        &glyphon::Attrs::new(),
+                        &glyphon::Attrs::new().family(glyphon::Family::Name(&text.family)),
                         glyphon::Shaping::Advanced,
                         None,
                     );

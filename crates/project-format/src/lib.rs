@@ -85,9 +85,10 @@ pub enum Layer {
         effects: Vec<Effect>,
     },
     /// A string of text drawn at an arbitrary position on the canvas --
-    /// unlike every other layer, not a full-canvas effect. Always drawn
-    /// on top of every other layer regardless of its own position in
-    /// this project's layer list (see player's `record_draw`).
+    /// unlike every other layer, not a full-canvas effect. Stacks in list
+    /// order same as any other layer (M10 -- see player's `record_draw`);
+    /// before that, text always drew on top of everything regardless of
+    /// its position in the list.
     Text {
         /// Position as a fraction of canvas width/height (0.0..=1.0),
         /// not pixels -- deliberately resolution-independent, so the
@@ -102,20 +103,42 @@ pub enum Layer {
         /// convention, already used elsewhere in this codebase.
         color: [f32; 4],
         source: TextSource,
+        /// Which font to shape this text with. Empty for any
+        /// project.json that predates this field -- `TextFont::Bundled`,
+        /// same look as before this field existed.
+        #[serde(default)]
+        font: TextFont,
     },
     /// Not a picture of its own -- takes whatever every layer *below* it
     /// in this project's layer list has already composited into and
     /// runs its own post-processing stack on that, same generic
     /// `Effect`/`Mask` machinery as any other layer. See `Ideas.md`,
-    /// "Adjustment-слой". Like `Text`, it has an exception to the usual
-    /// "layers stack in list order" rule: a `Text` layer always draws
-    /// on top of *everything*, including any `Adjustment` layer above
-    /// it in the list, so an `Adjustment` layer can never affect text
-    /// (see player's `record_draw`).
+    /// "Adjustment-слой".
     Adjustment {
         #[serde(default)]
         effects: Vec<Effect>,
     },
+}
+
+/// Which font a [`Layer::Text`] shapes its string with.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TextFont {
+    /// The engine's own embedded font (Noto Sans -- broad language/script
+    /// coverage, including Cyrillic) -- needs no project asset and looks
+    /// the same on every machine, unlike a system-installed font. The
+    /// safe default, and what every project made before this field
+    /// existed already effectively used (see player's `record_draw`,
+    /// which shaped text with no family specified prior to this).
+    #[default]
+    Bundled,
+    /// A hand-picked `.ttf`/`.otf`, relative path within the project dir
+    /// -- same asset convention as `Mask::Texture`'s `path` and
+    /// `EffectKind::Shader`'s `wgsl_path`. The family name itself isn't
+    /// stored here: the engine reads it back from the font file's own
+    /// name table once loaded, rather than trusting a hand-typed name to
+    /// match (see player's `SceneRenderer::resolve_text_font`).
+    Custom { path: String },
 }
 
 /// Where a `Layer::Text`'s displayed string comes from.
@@ -491,6 +514,7 @@ mod tests {
             source: TextSource::Literal {
                 text: "hello".to_string(),
             },
+            font: TextFont::Bundled,
         };
         let json = serde_json::to_string(&layer).unwrap();
         let round_tripped: Layer = serde_json::from_str(&json).unwrap();
@@ -502,6 +526,7 @@ mod tests {
                 font_size,
                 color,
                 source: TextSource::Literal { text },
+                font: _,
             } => {
                 assert_eq!(
                     (x, y, font_size, color, text.as_str()),
@@ -522,6 +547,7 @@ mod tests {
             source: TextSource::Clock {
                 format: "%H:%M".to_string(),
             },
+            font: TextFont::Bundled,
         };
         let json = serde_json::to_string(&layer).unwrap();
         let round_tripped: Layer = serde_json::from_str(&json).unwrap();
@@ -548,6 +574,7 @@ mod tests {
                 command: "date".to_string(),
                 interval_secs: 60,
             },
+            font: TextFont::Bundled,
         };
         let json = serde_json::to_string(&layer).unwrap();
         let round_tripped: Layer = serde_json::from_str(&json).unwrap();
@@ -742,6 +769,43 @@ struct ShaderEffectParams {
         match layer {
             Layer::Image { effects, .. } => assert!(effects.is_empty()),
             _ => panic!("expected Layer::Image"),
+        }
+    }
+
+    #[test]
+    fn text_layer_without_font_field_defaults_to_bundled() {
+        let layer: Layer = serde_json::from_str(
+            r#"{"type":"text","x":0.1,"y":0.1,"font_size":0.05,"color":[1.0,1.0,1.0,1.0],"source":{"kind":"literal","text":"hi"}}"#,
+        )
+        .expect("should still parse");
+        match layer {
+            Layer::Text { font, .. } => assert!(matches!(font, TextFont::Bundled)),
+            _ => panic!("expected Layer::Text"),
+        }
+    }
+
+    #[test]
+    fn text_layer_with_custom_font_round_trips() {
+        let layer = Layer::Text {
+            x: 0.5,
+            y: 0.5,
+            font_size: 0.05,
+            color: [1.0, 1.0, 1.0, 1.0],
+            source: TextSource::Literal {
+                text: "hi".to_string(),
+            },
+            font: TextFont::Custom {
+                path: "my_font.ttf".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&layer).unwrap();
+        let round_tripped: Layer = serde_json::from_str(&json).unwrap();
+        match round_tripped {
+            Layer::Text {
+                font: TextFont::Custom { path },
+                ..
+            } => assert_eq!(path, "my_font.ttf"),
+            _ => panic!("expected Layer::Text with TextFont::Custom"),
         }
     }
 
