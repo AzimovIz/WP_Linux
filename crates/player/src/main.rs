@@ -259,6 +259,7 @@ impl App {
         renderer.advance_gifs(&mut self.layers, elapsed_ms);
         renderer.update_xray_cursors(&self.layers, self.cursor);
         renderer.update_smoke_cursors(&self.layers, self.cursor);
+        renderer.update_shader_effects(&self.layers, self.cursor, elapsed_ms as f32 / 1000.0);
         let parallax_dt_ms = elapsed_ms.saturating_sub(self.last_parallax_update_ms);
         self.last_parallax_update_ms = elapsed_ms;
         renderer.update_parallax(&mut self.layers, self.cursor, parallax_dt_ms);

@@ -291,34 +291,122 @@ impl EditorTextSource {
 }
 
 /// One entry in a layer's effect stack, editor-side -- mirrors
-/// `project_format::Effect`. `kind` reuses `project_format::EffectKind`
-/// directly (plain numeric params, nothing an editing session needs to
-/// buffer, same as `EditorLayer::Text`'s `x`/`y`/`font_size`/`color`
-/// already reusing `project_format` types as-is); only the mask's
-/// `Texture` path deviates from `project_format::Mask`, via
-/// `EditorMask` below.
+/// `project_format::Effect`. `kind` used to reuse `project_format::
+/// EffectKind` directly (plain numeric params, nothing an editing
+/// session needs to buffer) until `Shader` was added -- its `wgsl_path`
+/// needs the same `Option<PathBuf>`-for-`path_picker` treatment as every
+/// other asset path in this file, so `kind` now goes through
+/// `EditorEffectKind` below, same rationale as the mask's own `Texture`
+/// path already going through `EditorMask` instead of
+/// `project_format::Mask` directly.
 struct EditorEffect {
-    kind: project_format::EffectKind,
+    kind: EditorEffectKind,
     mask: EditorMask,
     enabled: bool,
 }
 
 impl EditorEffect {
-    /// Mirrors `EditorLayer::is_complete` -- an effect with a
-    /// `Texture` mask isn't saveable/previewable until a file's been
-    /// picked for it, same as any other asset path in this file.
+    /// Mirrors `EditorLayer::is_complete` -- an effect with a `Texture`
+    /// mask, or a `Shader` kind, isn't saveable/previewable until a file's
+    /// been picked for it, same as any other asset path in this file.
     fn is_complete(&self) -> bool {
-        match &self.mask {
+        let mask_complete = match &self.mask {
             EditorMask::Texture { path, .. } => path.is_some(),
             EditorMask::None | EditorMask::Circle { .. } | EditorMask::Gradient { .. } => true,
-        }
+        };
+        let kind_complete = match &self.kind {
+            EditorEffectKind::Shader { wgsl_path, .. } => wgsl_path.is_some(),
+            EditorEffectKind::Vignette { .. }
+            | EditorEffectKind::ColorAdjust { .. }
+            | EditorEffectKind::Blur { .. }
+            | EditorEffectKind::Smoke { .. } => true,
+        };
+        mask_complete && kind_complete
     }
 
     fn to_project(&self) -> project_format::Effect {
         project_format::Effect {
-            kind: self.kind.clone(),
+            kind: self.kind.to_project(),
             mask: self.mask.to_project(),
             enabled: self.enabled,
+        }
+    }
+}
+
+/// Mirrors `project_format::EffectKind`'s variants -- kept separate
+/// purely so `Shader`'s `wgsl_path` can be an `Option<PathBuf>` fed to
+/// `path_picker`, like every other asset path in this file, rather than
+/// `project_format::EffectKind`'s `String` (a relative, staged-on-save
+/// path that doesn't exist until the project itself is saved). Every
+/// other variant is a plain field-for-field mirror -- converted to/from
+/// `project_format::EffectKind` at the `open_project`/`save_project`/
+/// `build_preview_project` boundaries, same as `EditorMask`.
+enum EditorEffectKind {
+    Vignette {
+        strength: f32,
+        softness: f32,
+    },
+    ColorAdjust {
+        brightness: f32,
+        contrast: f32,
+        saturation: f32,
+    },
+    Blur {
+        radius: f32,
+    },
+    Smoke {
+        color: [f32; 4],
+        decay: f32,
+        radius: f32,
+    },
+    Shader {
+        wgsl_path: Option<PathBuf>,
+        /// Same order/meaning as `project_format::EffectKind::Shader::
+        /// params` -- kept in sync with whatever `wgsl_path`'s file
+        /// currently declares by `show_effect_kind_panel`'s Shader arm,
+        /// which re-parses it every frame (see its own doc comment).
+        params: Vec<f32>,
+    },
+}
+
+impl EditorEffectKind {
+    /// See `EditorMask::to_project`'s doc comment on why an absolute
+    /// path here (as opposed to `save_project`'s staged relative one) is
+    /// exactly what a preview-only `Project` needs.
+    fn to_project(&self) -> project_format::EffectKind {
+        match self {
+            EditorEffectKind::Vignette { strength, softness } => {
+                project_format::EffectKind::Vignette {
+                    strength: *strength,
+                    softness: *softness,
+                }
+            }
+            EditorEffectKind::ColorAdjust {
+                brightness,
+                contrast,
+                saturation,
+            } => project_format::EffectKind::ColorAdjust {
+                brightness: *brightness,
+                contrast: *contrast,
+                saturation: *saturation,
+            },
+            EditorEffectKind::Blur { radius } => project_format::EffectKind::Blur { radius: *radius },
+            EditorEffectKind::Smoke {
+                color,
+                decay,
+                radius,
+            } => project_format::EffectKind::Smoke {
+                color: *color,
+                decay: *decay,
+                radius: *radius,
+            },
+            EditorEffectKind::Shader { wgsl_path, params } => project_format::EffectKind::Shader {
+                wgsl_path: wgsl_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                params: params.clone(),
+            },
         }
     }
 }
@@ -396,7 +484,38 @@ fn editor_effects_from_project(
     effects
         .into_iter()
         .map(|effect| EditorEffect {
-            kind: effect.kind,
+            kind: match effect.kind {
+                project_format::EffectKind::Vignette { strength, softness } => {
+                    EditorEffectKind::Vignette { strength, softness }
+                }
+                project_format::EffectKind::ColorAdjust {
+                    brightness,
+                    contrast,
+                    saturation,
+                } => EditorEffectKind::ColorAdjust {
+                    brightness,
+                    contrast,
+                    saturation,
+                },
+                project_format::EffectKind::Blur { radius } => {
+                    EditorEffectKind::Blur { radius }
+                }
+                project_format::EffectKind::Smoke {
+                    color,
+                    decay,
+                    radius,
+                } => EditorEffectKind::Smoke {
+                    color,
+                    decay,
+                    radius,
+                },
+                project_format::EffectKind::Shader { wgsl_path, params } => {
+                    EditorEffectKind::Shader {
+                        wgsl_path: Some(project_dir.join(wgsl_path)),
+                        params,
+                    }
+                }
+            },
             mask: match effect.mask {
                 project_format::Mask::None => EditorMask::None,
                 project_format::Mask::Circle {
@@ -483,6 +602,13 @@ enum EffectKindSignature {
     ColorAdjust,
     Blur,
     Smoke,
+    // Both the file and the param *count* are structural -- a different
+    // count means a different uniform buffer size and (once the file
+    // changed) quite possibly a different pipeline too, neither of which
+    // `set_effect_params`' plain `write_buffer` can accommodate in
+    // place. The param *values* stay excluded, same as every other
+    // kind's numeric fields.
+    Shader(PathBuf, usize),
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -495,11 +621,14 @@ enum MaskSignature {
 
 fn effect_signature(effect: &EditorEffect) -> EffectSignature {
     EffectSignature {
-        kind: match effect.kind {
-            project_format::EffectKind::Vignette { .. } => EffectKindSignature::Vignette,
-            project_format::EffectKind::ColorAdjust { .. } => EffectKindSignature::ColorAdjust,
-            project_format::EffectKind::Blur { .. } => EffectKindSignature::Blur,
-            project_format::EffectKind::Smoke { .. } => EffectKindSignature::Smoke,
+        kind: match &effect.kind {
+            EditorEffectKind::Vignette { .. } => EffectKindSignature::Vignette,
+            EditorEffectKind::ColorAdjust { .. } => EffectKindSignature::ColorAdjust,
+            EditorEffectKind::Blur { .. } => EffectKindSignature::Blur,
+            EditorEffectKind::Smoke { .. } => EffectKindSignature::Smoke,
+            EditorEffectKind::Shader { wgsl_path, params } => {
+                EffectKindSignature::Shader(wgsl_path.clone().unwrap_or_default(), params.len())
+            }
         },
         mask: match &effect.mask {
             EditorMask::None => MaskSignature::None,
@@ -695,6 +824,8 @@ impl Preview {
         let cursor_px = cursor_local.unwrap_or((-1.0e6, -1.0e6));
         self.renderer.update_xray_cursors(&self.layers, cursor_px);
         self.renderer.update_smoke_cursors(&self.layers, cursor_px);
+        self.renderer
+            .update_shader_effects(&self.layers, cursor_px, elapsed_ms as f32 / 1000.0);
         let parallax_dt_ms = elapsed_ms.saturating_sub(self.last_parallax_update_ms);
         self.last_parallax_update_ms = elapsed_ms;
         self.renderer
@@ -2338,7 +2469,7 @@ fn show_effects_panel(
     ui.horizontal_wrapped(|ui| {
         if ui.button("+ Vignette").clicked() {
             effects.push(EditorEffect {
-                kind: project_format::EffectKind::Vignette {
+                kind: EditorEffectKind::Vignette {
                     strength: 0.5,
                     softness: 0.5,
                 },
@@ -2348,7 +2479,7 @@ fn show_effects_panel(
         }
         if ui.button("+ Color adjust").clicked() {
             effects.push(EditorEffect {
-                kind: project_format::EffectKind::ColorAdjust {
+                kind: EditorEffectKind::ColorAdjust {
                     brightness: 0.0,
                     contrast: 0.0,
                     saturation: 0.0,
@@ -2359,17 +2490,27 @@ fn show_effects_panel(
         }
         if ui.button("+ Blur").clicked() {
             effects.push(EditorEffect {
-                kind: project_format::EffectKind::Blur { radius: 0.02 },
+                kind: EditorEffectKind::Blur { radius: 0.02 },
                 mask: EditorMask::None,
                 enabled: true,
             });
         }
         if ui.button("+ Smoke").clicked() {
             effects.push(EditorEffect {
-                kind: project_format::EffectKind::Smoke {
+                kind: EditorEffectKind::Smoke {
                     color: [0.6, 0.3, 0.9, 1.0],
                     decay: 0.97,
                     radius: 0.05,
+                },
+                mask: EditorMask::None,
+                enabled: true,
+            });
+        }
+        if ui.button("+ Shader").clicked() {
+            effects.push(EditorEffect {
+                kind: EditorEffectKind::Shader {
+                    wgsl_path: None,
+                    params: Vec::new(),
                 },
                 mask: EditorMask::None,
                 enabled: true,
@@ -2453,18 +2594,19 @@ fn show_effects_panel(
     }
 }
 
-fn effect_kind_label(kind: &project_format::EffectKind) -> &'static str {
+fn effect_kind_label(kind: &EditorEffectKind) -> &'static str {
     match kind {
-        project_format::EffectKind::Vignette { .. } => "Vignette",
-        project_format::EffectKind::ColorAdjust { .. } => "Color adjust",
-        project_format::EffectKind::Blur { .. } => "Blur",
-        project_format::EffectKind::Smoke { .. } => "Smoke",
+        EditorEffectKind::Vignette { .. } => "Vignette",
+        EditorEffectKind::ColorAdjust { .. } => "Color adjust",
+        EditorEffectKind::Blur { .. } => "Blur",
+        EditorEffectKind::Smoke { .. } => "Smoke",
+        EditorEffectKind::Shader { .. } => "Shader",
     }
 }
 
-fn show_effect_kind_panel(ui: &mut eframe::egui::Ui, kind: &mut project_format::EffectKind) {
+fn show_effect_kind_panel(ui: &mut eframe::egui::Ui, kind: &mut EditorEffectKind) {
     match kind {
-        project_format::EffectKind::Vignette { strength, softness } => {
+        EditorEffectKind::Vignette { strength, softness } => {
             ui.horizontal(|ui| {
                 ui.label("Strength:");
                 scroll_slider(ui, strength, 0.0..=1.0);
@@ -2474,7 +2616,7 @@ fn show_effect_kind_panel(ui: &mut eframe::egui::Ui, kind: &mut project_format::
                 scroll_slider(ui, softness, 0.0..=1.0);
             });
         }
-        project_format::EffectKind::ColorAdjust {
+        EditorEffectKind::ColorAdjust {
             brightness,
             contrast,
             saturation,
@@ -2492,13 +2634,13 @@ fn show_effect_kind_panel(ui: &mut eframe::egui::Ui, kind: &mut project_format::
                 scroll_slider(ui, saturation, -1.0..=1.0);
             });
         }
-        project_format::EffectKind::Blur { radius } => {
+        EditorEffectKind::Blur { radius } => {
             ui.horizontal(|ui| {
                 ui.label("Radius:");
                 scroll_slider(ui, radius, 0.0..=0.1);
             });
         }
-        project_format::EffectKind::Smoke {
+        EditorEffectKind::Smoke {
             color,
             decay,
             radius,
@@ -2518,6 +2660,67 @@ fn show_effect_kind_panel(ui: &mut eframe::egui::Ui, kind: &mut project_format::
                 scroll_slider(ui, radius, 0.0..=0.3);
             });
         }
+        EditorEffectKind::Shader { wgsl_path, params } => {
+            show_shader_effect_panel(ui, wgsl_path, params);
+        }
+    }
+}
+
+/// `Shader` effect's own panel -- a `path_picker` for its `.wgsl` asset,
+/// plus one widget per parameter it declares. Re-reads and re-parses
+/// `wgsl_path`'s file (via `project_format::parse_shader_params`) every
+/// single frame this panel is shown, rather than caching the parsed
+/// param list anywhere on `EditorEffectKind` -- the same "recompute, don't
+/// cache" choice this file already makes for e.g. `cursor_local`, and it
+/// buys two things here specifically: browsing to a new file needs no
+/// separate change-detection hook (the newly parsed param count is just
+/// compared against `params.len()` below, every frame, whichever path is
+/// current), and hand-editing the `.wgsl` file in an external editor
+/// while this panel is open is picked up live instead of needing a
+/// reopen. A `.wgsl` file is at most a few KB of text, so re-parsing it
+/// at UI framerate is not a real cost.
+fn show_shader_effect_panel(
+    ui: &mut eframe::egui::Ui,
+    wgsl_path: &mut Option<PathBuf>,
+    params: &mut Vec<f32>,
+) {
+    path_picker(ui, "WGSL file:", wgsl_path, &["wgsl"]);
+
+    let Some(path) = wgsl_path.as_ref() else {
+        ui.colored_label(
+            eframe::egui::Color32::YELLOW,
+            "Pick a .wgsl file to configure this effect.",
+        );
+        return;
+    };
+    let source = match std::fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(e) => {
+            ui.colored_label(eframe::egui::Color32::RED, format!("Failed to read: {e}"));
+            return;
+        }
+    };
+    let specs = match project_format::parse_shader_params(&source) {
+        Ok(specs) => specs,
+        Err(e) => {
+            ui.colored_label(eframe::egui::Color32::RED, e);
+            return;
+        }
+    };
+
+    // The file's own param list is the source of truth -- any mismatch
+    // (a freshly picked file, or one edited since) resets to its
+    // defaults rather than trying to carry old values over positionally,
+    // which could silently attach the wrong value to the wrong param.
+    if specs.len() != params.len() {
+        *params = specs.iter().map(|spec| spec.default).collect();
+    }
+
+    for (spec, value) in specs.iter().zip(params.iter_mut()) {
+        ui.horizontal(|ui| {
+            ui.label(format!("{}:", spec.label));
+            scroll_slider(ui, value, spec.range.0..=spec.range.1);
+        });
     }
 }
 
@@ -3186,8 +3389,22 @@ fn stage_effect(
             }
         }
     };
+    let kind = match &effect.kind {
+        EditorEffectKind::Shader { wgsl_path, params } => {
+            let wgsl_path = wgsl_path.as_ref().expect("save is disabled until complete");
+            let file_name = stage(
+                wgsl_path,
+                &format!("layer_{layer_index}_effect_{effect_index}_shader"),
+            )?;
+            project_format::EffectKind::Shader {
+                wgsl_path: file_name,
+                params: params.clone(),
+            }
+        }
+        other => other.to_project(),
+    };
     Ok(project_format::Effect {
-        kind: effect.kind.clone(),
+        kind,
         mask,
         enabled: effect.enabled,
     })

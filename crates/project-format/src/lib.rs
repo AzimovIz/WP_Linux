@@ -155,10 +155,14 @@ impl Layer {
     /// Whether this layer needs continuous re-rendering (as opposed to
     /// being renderable once and left alone): anything that reacts to
     /// the cursor or animates on its own. An otherwise-static `Image`
-    /// becomes dynamic too once it carries an enabled `Smoke` effect --
-    /// unlike every other effect kind (which only reshapes whatever the
-    /// layer already draws), Smoke has its own persistent GPU state that
-    /// evolves every frame regardless of what's underneath it.
+    /// becomes dynamic too once it carries an enabled `Smoke` or `Shader`
+    /// effect -- unlike every effect kind above them (which only
+    /// reshapes whatever the layer already draws, as a pure function of
+    /// its current content), `Smoke` has its own persistent GPU state
+    /// that evolves every frame regardless of what's underneath it, and
+    /// `Shader` gets a live cursor/time uniform every frame whether or
+    /// not its particular WGSL happens to read them -- there's no way to
+    /// know from here which it is, so it's always treated as animated.
     pub fn is_dynamic(&self) -> bool {
         let dynamic_regardless_of_effects = match self {
             Layer::Xray { .. } | Layer::Gif { .. } | Layer::Parallax { .. } => true,
@@ -166,10 +170,13 @@ impl Layer {
             Layer::Image { .. } => false,
         };
         dynamic_regardless_of_effects
-            || self
-                .effects()
-                .iter()
-                .any(|effect| effect.enabled && matches!(effect.kind, EffectKind::Smoke { .. }))
+            || self.effects().iter().any(|effect| {
+                effect.enabled
+                    && matches!(
+                        effect.kind,
+                        EffectKind::Smoke { .. } | EffectKind::Shader { .. }
+                    )
+            })
     }
 }
 
@@ -266,6 +273,129 @@ pub enum EffectKind {
         /// that's an acceptable simplification for a first version).
         radius: f32,
     },
+    /// A user-authored `.wgsl` effect, loaded as a project asset and
+    /// compiled at runtime -- Фаза 3 of the library in `Ideas.md`,
+    /// "Кастомные шейдерные слои": the point where a new visual effect no
+    /// longer requires a new engine release. Reuses the exact same
+    /// single-input-texture pipeline shape every other single-pass
+    /// effect kind already uses (see `build_effect_bind_group_layout` in
+    /// `player`) -- only the shader module and the tail of its uniform
+    /// buffer are shader-specific.
+    Shader {
+        /// Relative path (project-dir-relative once saved, same
+        /// convention as every other asset path in this schema) to the
+        /// `.wgsl` source. See [`parse_shader_params`] for the parameter
+        /// annotation format this file's own uniform struct carries.
+        wgsl_path: String,
+        /// Current value of each user-declared param, flattened, in the
+        /// same order [`parse_shader_params`] returns them in when it
+        /// scans `wgsl_path`'s source -- *not* keyed by name, since the
+        /// order is exactly what the shader author's own struct layout
+        /// (and therefore the uniform buffer's byte layout) already
+        /// depends on. The engine's own fields (cursor, time, canvas
+        /// aspect) are never stored here -- they're computed fresh every
+        /// frame by whichever caller has the live cursor position on
+        /// hand (`player::SceneRenderer::update_shader_effects`, the
+        /// same pattern `Smoke`'s cursor already uses) and always
+        /// written *before* this array's bytes.
+        params: Vec<f32>,
+    },
+}
+
+/// One user-declared parameter of a [`EffectKind::Shader`] effect, parsed
+/// out of its `.wgsl` source by [`parse_shader_params`] -- purely a
+/// description of what widget the editor should draw and what its
+/// current value means; the live value itself lives in
+/// `EffectKind::Shader::params`, not here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShaderParamSpec {
+    /// The WGSL struct field's own name (e.g. `u_hue_shift`) -- not
+    /// otherwise used by the engine (params are matched up by position,
+    /// see `EffectKind::Shader::params`'s doc comment), but useful for
+    /// error messages and as a widget label fallback.
+    pub name: String,
+    /// Human-readable label from the annotation's `"label"` key, or
+    /// `name` itself if that key is omitted.
+    pub label: String,
+    pub default: f32,
+    /// Inclusive slider bounds, from the annotation's `"range"` key --
+    /// required (unlike `label`), since there's no sane default range
+    /// for an arbitrary shader param.
+    pub range: (f32, f32),
+}
+
+/// Scans `source` (a `.wgsl` file's full text) for every uniform-struct
+/// field carrying a trailing `// {"label": ..., "default": ..., "range":
+/// [...]}` JSON annotation, in the order they appear in the file -- see
+/// `Ideas.md`, "Параметры шейдера: как редактор узнаёт, что и как
+/// показывать". Only `f32` fields are recognized in this version (not
+/// yet `vec4<f32>`/color or texture/sampler params -- see the plan file's
+/// M7 section for why: an annotated non-`f32` field is a hard error
+/// rather than silently ignored, since a silently-skipped field would
+/// desync every later param's position from what the engine actually
+/// writes into the uniform buffer).
+///
+/// A line is only treated as an annotation attempt if its trailing
+/// comment, once trimmed, starts with `{` -- an ordinary `// explanation`
+/// comment elsewhere in the file is left alone. Once a line does look
+/// like an annotation attempt, any failure (bad JSON, missing key, wrong
+/// field type) is a hard `Err` -- never silently skipped -- for the same
+/// position-desync reason above.
+pub fn parse_shader_params(source: &str) -> Result<Vec<ShaderParamSpec>, String> {
+    let mut specs = Vec::new();
+    for (line_number, line) in source.lines().enumerate() {
+        let Some(comment_start) = line.find("//") else {
+            continue;
+        };
+        let (code, comment) = line.split_at(comment_start);
+        let comment = comment[2..].trim();
+        if !comment.starts_with('{') {
+            continue;
+        }
+        let line_number = line_number + 1;
+
+        let field = code.trim().trim_end_matches(',').trim();
+        let (name, ty) = field.split_once(':').ok_or_else(|| {
+            format!("shader param annotation on line {line_number} isn't attached to a `name: type` field declaration")
+        })?;
+        let name = name.trim().to_string();
+        let ty = ty.trim();
+        if ty != "f32" {
+            return Err(format!(
+                "shader param '{name}' on line {line_number} has type '{ty}' -- only f32 params are supported for now"
+            ));
+        }
+
+        let json: serde_json::Value = serde_json::from_str(comment).map_err(|e| {
+            format!("shader param '{name}' on line {line_number} has an invalid annotation: {e}")
+        })?;
+        let label = json
+            .get("label")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| name.clone());
+        let default = json.get("default").and_then(|v| v.as_f64()).ok_or_else(|| {
+            format!("shader param '{name}' on line {line_number} is missing a numeric \"default\"")
+        })? as f32;
+        let range = json
+            .get("range")
+            .and_then(|v| v.as_array())
+            .filter(|a| a.len() == 2)
+            .and_then(|a| Some((a[0].as_f64()?, a[1].as_f64()?)))
+            .ok_or_else(|| {
+                format!(
+                    "shader param '{name}' on line {line_number} is missing a two-number \"range\""
+                )
+            })?;
+
+        specs.push(ShaderParamSpec {
+            name,
+            label,
+            default,
+            range: (range.0 as f32, range.1 as f32),
+        });
+    }
+    Ok(specs)
 }
 
 /// One entry in a layer's post-processing stack -- see `Ideas.md`,
@@ -503,6 +633,92 @@ mod tests {
             }],
         };
         assert!(!layer.is_dynamic());
+    }
+
+    #[test]
+    fn shader_effect_round_trips_and_makes_its_layer_dynamic() {
+        let layer = Layer::Image {
+            path: "bg.png".to_string(),
+            effects: vec![Effect {
+                kind: EffectKind::Shader {
+                    wgsl_path: "hue_shift.wgsl".to_string(),
+                    params: vec![0.3],
+                },
+                mask: Mask::None,
+                enabled: true,
+            }],
+        };
+        assert!(layer.is_dynamic());
+
+        let json = serde_json::to_string(&layer).unwrap();
+        let round_tripped: Layer = serde_json::from_str(&json).unwrap();
+        match round_tripped {
+            Layer::Image { effects, .. } => match &effects[0].kind {
+                EffectKind::Shader { wgsl_path, params } => {
+                    assert_eq!(wgsl_path, "hue_shift.wgsl");
+                    assert_eq!(params, &[0.3]);
+                }
+                _ => panic!("expected EffectKind::Shader"),
+            },
+            _ => panic!("expected Layer::Image"),
+        }
+    }
+
+    #[test]
+    fn parse_shader_params_reads_annotated_f32_fields_in_order() {
+        let source = r#"
+struct ShaderEffectParams {
+    cursor: vec2<f32>,
+    time: f32,
+    canvas_aspect: f32,
+    u_hue_shift: f32, // {"label": "Hue shift", "default": 0.25, "range": [-1.0, 1.0]}
+    u_strength: f32, // {"default": 1.0, "range": [0.0, 2.0]}
+};
+"#;
+        let specs = parse_shader_params(source).expect("should parse");
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].name, "u_hue_shift");
+        assert_eq!(specs[0].label, "Hue shift");
+        assert_eq!(specs[0].default, 0.25);
+        assert_eq!(specs[0].range, (-1.0, 1.0));
+        // No "label" key -- falls back to the field's own name.
+        assert_eq!(specs[1].name, "u_strength");
+        assert_eq!(specs[1].label, "u_strength");
+    }
+
+    #[test]
+    fn parse_shader_params_ignores_ordinary_comments() {
+        let source = r#"
+struct ShaderEffectParams {
+    cursor: vec2<f32>, // just the cursor, nothing to see here
+    time: f32,
+};
+"#;
+        assert_eq!(parse_shader_params(source).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn parse_shader_params_rejects_a_non_f32_annotated_field() {
+        let source = r#"u_tint: vec4<f32>, // {"label": "Tint", "default": 0.0, "range": [0.0, 1.0]}"#;
+        let err = parse_shader_params(source).unwrap_err();
+        assert!(err.contains("u_tint"), "error should name the field: {err}");
+        assert!(
+            err.contains("vec4"),
+            "error should mention the unsupported type: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_shader_params_rejects_malformed_json_annotation() {
+        let source = r#"u_amount: f32, // {"label": "Amount", "default": }"#;
+        assert!(parse_shader_params(source).is_err());
+    }
+
+    #[test]
+    fn parse_shader_params_rejects_annotation_missing_range() {
+        let source = r#"u_amount: f32, // {"label": "Amount", "default": 0.5}"#;
+        let err = parse_shader_params(source).unwrap_err();
+        assert!(err.contains("range"), "error should mention range: {err}");
     }
 
     #[test]

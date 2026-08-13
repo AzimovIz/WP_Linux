@@ -707,6 +707,11 @@ fn compose_and_encode(
 
     renderer.update_xray_cursors(&project.layers, cursor_px);
     renderer.update_smoke_cursors(&project.layers, cursor_px);
+    renderer.update_shader_effects(
+        &project.layers,
+        cursor_px,
+        project.loaded_at.elapsed().as_secs_f32(),
+    );
     let rgba = renderer::render_frame(renderer, &project.canvas, &project.layers);
 
     if project.dynamic {
@@ -747,14 +752,22 @@ fn load_project(renderer: &SceneRenderer, project_dir: &Path) -> Result<LoadedPr
     renderer.set_text_viewport(&mut loaded_layers, canvas_width, canvas_height);
 
     let dynamic = project.layers.iter().any(Layer::is_dynamic);
-    // Smoke needs the cursor same as Xray/Parallax do -- unlike them,
-    // it's not its own layer variant, so this also has to look inside
-    // every layer's own effects list (see `Layer::effects`).
+    // Smoke and Shader need the cursor same as Xray/Parallax do -- unlike
+    // them, neither is its own layer variant, so this also has to look
+    // inside every layer's own effects list (see `Layer::effects`). A
+    // Shader effect gets this unconditionally, same rationale as
+    // `Layer::is_dynamic` treating it as always-animated -- there's no
+    // way to tell from here whether its particular WGSL actually reads
+    // the cursor.
     let needs_cursor = project.layers.iter().any(|l| {
         matches!(l, Layer::Xray { .. } | Layer::Parallax { .. })
-            || l.effects()
-                .iter()
-                .any(|effect| effect.enabled && matches!(effect.kind, EffectKind::Smoke { .. }))
+            || l.effects().iter().any(|effect| {
+                effect.enabled
+                    && matches!(
+                        effect.kind,
+                        EffectKind::Smoke { .. } | EffectKind::Shader { .. }
+                    )
+            })
     });
     let canvas = renderer::create_canvas(renderer, canvas_width, canvas_height);
     let fps = project.fps.clamp(1, 60);
@@ -1131,9 +1144,19 @@ mod tests {
 
         let scene_renderer =
             pollster::block_on(super::SceneRenderer::new_headless(renderer::CANVAS_FORMAT));
-        let layers = scene_renderer
+        let mut layers = scene_renderer
             .load_scene(&project_dir, &project, true)
             .expect("load_scene failed");
+        // `update_smoke_cursors` normalizes the cursor against
+        // `glyphon`'s `canvas_width`/`canvas_height` (see its own doc
+        // comment), which only ever get set to this render's actual
+        // canvas size via `set_text_viewport` -- exactly what every real
+        // caller (render-server's `load_project`, the editor's
+        // `ensure_scene`, `player`'s main loop) already does right after
+        // `load_scene`. Skipping it here would leave the default 1920x1080
+        // in place against a 64x64 test canvas, putting the cursor's UV
+        // nowhere near the splat this test asserts on.
+        scene_renderer.set_text_viewport(&mut layers, width, height);
 
         scene_renderer.update_smoke_cursors(&layers, (width as f32 / 2.0, height as f32 / 2.0));
 
@@ -1155,6 +1178,204 @@ mod tests {
             far_corner[0] < 10,
             "a far corner outside the splat radius should stay close to the original black, got {far_corner:?}"
         );
+    }
+
+    /// A minimal `Shader` effect fixture -- deliberately trivial (paints
+    /// flat gray at its one declared param's own value, ignoring the
+    /// layer's actual content) so the test below can assert on "did the
+    /// param arrive at the right byte offset in the uniform buffer"
+    /// without needing believable color math. Exercises the exact same
+    /// bind group shape (one input texture, one sampler, one uniform
+    /// buffer) `build_effect_bind_group_layout` already requires of
+    /// every other single-pass effect kind, plus the engine's own
+    /// cursor/time/canvas_aspect header fields every `Shader` effect's
+    /// struct has to declare first (see `project_format::EffectKind::
+    /// Shader`'s doc comment) even though this particular fixture never
+    /// reads them.
+    const TEST_SHADER_EFFECT_WGSL: &str = r#"
+struct ShaderEffectParams {
+    cursor: vec2<f32>,
+    time: f32,
+    canvas_aspect: f32,
+    u_amount: f32, // {"label": "Amount", "default": 0.5, "range": [0.0, 1.0]}
+};
+
+@group(0) @binding(0) var input_texture: texture_2d<f32>;
+@group(0) @binding(1) var input_sampler: sampler;
+@group(0) @binding(2) var<uniform> params: ShaderEffectParams;
+
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(3.0, -1.0),
+        vec2<f32>(-1.0, 3.0),
+    );
+    let pos = positions[vertex_index];
+    var out: VertexOutput;
+    out.clip_position = vec4<f32>(pos, 0.0, 1.0);
+    out.uv = vec2<f32>(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let base = textureSample(input_texture, input_sampler, in.uv);
+    return vec4<f32>(params.u_amount, params.u_amount, params.u_amount, base.a);
+}
+"#;
+
+    /// M7's generic `Shader` effect -- same real-pipeline round-trip as
+    /// every other effect test above, proving the whole path actually
+    /// works end to end: reading the `.wgsl` asset off disk, parsing its
+    /// one annotated param, compiling it at runtime, and writing that
+    /// param into the right spot in its uniform buffer (right after the
+    /// engine's own cursor/time/canvas_aspect header -- see
+    /// `player::shader_uniform_bytes`'s doc comment). Two renders with
+    /// different `params` values prove the param genuinely drives the
+    /// output, not just that the shader compiles.
+    #[test]
+    fn shader_effect_paints_using_its_declared_param() {
+        let project_dir = unique_temp_dir();
+        let width = 16u32;
+        let height = 16u32;
+        image::RgbaImage::from_pixel(width, height, image::Rgba([0, 0, 0, 255]))
+            .save(project_dir.join("bg.png"))
+            .expect("failed to write test fixture PNG");
+        std::fs::write(project_dir.join("test_effect.wgsl"), TEST_SHADER_EFFECT_WGSL)
+            .expect("failed to write test fixture wgsl");
+
+        let render_with_amount = |amount: f32| -> u8 {
+            let project = project_format::Project {
+                name: String::new(),
+                description: String::new(),
+                fps: 30,
+                layers: vec![project_format::Layer::Image {
+                    path: "bg.png".to_string(),
+                    effects: vec![project_format::Effect {
+                        kind: project_format::EffectKind::Shader {
+                            wgsl_path: "test_effect.wgsl".to_string(),
+                            params: vec![amount],
+                        },
+                        mask: project_format::Mask::None,
+                        enabled: true,
+                    }],
+                }],
+            };
+
+            let scene_renderer = pollster::block_on(super::SceneRenderer::new_headless(
+                renderer::CANVAS_FORMAT,
+            ));
+            let layers = scene_renderer
+                .load_scene(&project_dir, &project, true)
+                .expect("load_scene failed");
+
+            let canvas = renderer::create_canvas(&scene_renderer, width, height);
+            let pixels = renderer::render_frame(&scene_renderer, &canvas, &layers);
+            pixels[0]
+        };
+
+        let dim = render_with_amount(0.1);
+        let bright = render_with_amount(0.9);
+
+        assert!(
+            dim < 60,
+            "amount=0.1 should paint a dark gray, got {dim}"
+        );
+        assert!(
+            bright > 200,
+            "amount=0.9 should paint a near-white gray, got {bright}"
+        );
+    }
+
+    /// The other half of M7's non-panicking requirement (see
+    /// `project_format::EffectKind::Shader`'s doc comment and the plan
+    /// file's M7 section): a `.wgsl` asset that fails to compile has to
+    /// surface as a plain `Err` from `load_scene`, the same way a
+    /// missing/corrupt image file already does elsewhere in this file --
+    /// never a panic or an uncaptured device-lost error.
+    #[test]
+    fn shader_effect_with_broken_wgsl_returns_an_error_not_a_panic() {
+        let project_dir = unique_temp_dir();
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([0, 0, 0, 255]))
+            .save(project_dir.join("bg.png"))
+            .expect("failed to write test fixture PNG");
+        std::fs::write(
+            project_dir.join("broken.wgsl"),
+            "this is not valid wgsl at all {{{",
+        )
+        .expect("failed to write test fixture wgsl");
+
+        let project = project_format::Project {
+            name: String::new(),
+            description: String::new(),
+            fps: 30,
+            layers: vec![project_format::Layer::Image {
+                path: "bg.png".to_string(),
+                effects: vec![project_format::Effect {
+                    kind: project_format::EffectKind::Shader {
+                        wgsl_path: "broken.wgsl".to_string(),
+                        params: Vec::new(),
+                    },
+                    mask: project_format::Mask::None,
+                    enabled: true,
+                }],
+            }],
+        };
+
+        let scene_renderer =
+            pollster::block_on(super::SceneRenderer::new_headless(renderer::CANVAS_FORMAT));
+        let result = scene_renderer.load_scene(&project_dir, &project, true);
+
+        assert!(
+            result.is_err(),
+            "a broken .wgsl asset should fail to load, not panic or silently succeed"
+        );
+    }
+
+    /// A saved effect's param count has to match what the `.wgsl` file
+    /// currently declares -- editing the file after the effect was added
+    /// (removing/adding a param) desyncs the two, and that has to be
+    /// caught as an `Err` too (see `EffectKind::Shader::params`'s doc
+    /// comment), not silently misinterpreted as some other param's
+    /// value.
+    #[test]
+    fn shader_effect_with_mismatched_param_count_returns_an_error() {
+        let project_dir = unique_temp_dir();
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([0, 0, 0, 255]))
+            .save(project_dir.join("bg.png"))
+            .expect("failed to write test fixture PNG");
+        std::fs::write(project_dir.join("test_effect.wgsl"), TEST_SHADER_EFFECT_WGSL)
+            .expect("failed to write test fixture wgsl");
+
+        let project = project_format::Project {
+            name: String::new(),
+            description: String::new(),
+            fps: 30,
+            layers: vec![project_format::Layer::Image {
+                path: "bg.png".to_string(),
+                effects: vec![project_format::Effect {
+                    kind: project_format::EffectKind::Shader {
+                        wgsl_path: "test_effect.wgsl".to_string(),
+                        // The fixture declares exactly one param.
+                        params: vec![0.1, 0.2],
+                    },
+                    mask: project_format::Mask::None,
+                    enabled: true,
+                }],
+            }],
+        };
+
+        let scene_renderer =
+            pollster::block_on(super::SceneRenderer::new_headless(renderer::CANVAS_FORMAT));
+        let result = scene_renderer.load_scene(&project_dir, &project, true);
+
+        assert!(result.is_err(), "a mismatched param count should be an error");
     }
 
     /// Round-trips a small, non-uniform RGBA buffer through our BMP

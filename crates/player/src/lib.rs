@@ -38,7 +38,9 @@ use std::io::BufReader;
 use std::path::Path;
 
 use image::AnimationDecoder;
-use project_format::{Effect, EffectKind, Layer, Mask, Project, TextSource, Transform2D};
+use project_format::{
+    Effect, EffectKind, Layer, Mask, Project, TextSource, Transform2D, parse_shader_params,
+};
 
 const IMAGE_SHADER: &str = include_str!("shader.wgsl");
 const XRAY_SHADER: &str = include_str!("xray.wgsl");
@@ -188,6 +190,30 @@ enum LoadedEffectKind {
     /// doc comment) so this variant's extra state doesn't inflate every
     /// other, much smaller variant's footprint too.
     Smoke(Box<SmokeEffect>),
+    /// A user-authored `.wgsl` effect -- see `project_format::EffectKind::
+    /// Shader`'s doc comment. Boxed for the same `large_enum_variant`
+    /// reason as `Smoke` (owns its own render pipeline, on top of the
+    /// buffer/bind-group every other variant already has).
+    Shader(Box<ShaderEffect>),
+}
+
+/// Payload of `LoadedEffectKind::Shader`. Unlike every builtin effect
+/// kind, this one doesn't share a pipeline built once on `SceneRenderer`
+/// -- its shader module is compiled from a project asset at load time, so
+/// each loaded instance owns its own `wgpu::RenderPipeline` (built
+/// against `SceneRenderer::shader_effect_pipeline_layout`, the one part
+/// that *is* shared -- same bind group shape as Vignette/ColorAdjust/
+/// Blur/Smoke: one input texture, one sampler, one uniform buffer).
+struct ShaderEffect {
+    // CPU-cached current value of each user-declared param, same
+    // deferred-GPU-write rationale as `SmokeEffect`'s cached fields --
+    // `update_shader_effects` (called every redraw tick, not just when a
+    // slider moves) is what actually rewrites the uniform buffer, since
+    // it alone also has the live cursor/time to combine them with.
+    params: Vec<f32>,
+    pipeline: wgpu::RenderPipeline,
+    uniform_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
 }
 
 /// Payload of `LoadedEffectKind::Smoke`, boxed out of the enum itself --
@@ -853,6 +879,19 @@ impl LoadedLayer {
                     loaded_smoke.decay = *decay;
                     loaded_smoke.radius = *radius;
                 }
+                (
+                    LoadedEffectKind::Shader(loaded_shader),
+                    EffectKind::Shader { params, .. },
+                ) => {
+                    // No GPU write here either, same rationale as Smoke
+                    // just above -- `update_shader_effects` combines
+                    // this with the live cursor/time every redraw tick.
+                    // `EffectSignature`'s `wgsl_path`+param-count check
+                    // (editor-side) guarantees `params.len()` already
+                    // matches what this instance's uniform buffer was
+                    // sized for by the time this runs.
+                    loaded_shader.params.clone_from(params);
+                }
                 // Mismatched shape (mid-reload) -- this effect's kind
                 // params are skipped for this frame, but its mask
                 // below is independent of `kind` and still applies.
@@ -977,6 +1016,29 @@ fn smoke_uniform_bytes(color: [f32; 4], cursor_uv: (f32, f32), decay: f32, radiu
     bytes
 }
 
+/// Packs a `Shader` effect's uniform buffer bytes -- the engine's own
+/// fields first (`cursor: vec2<f32>, time: f32, canvas_aspect: f32`, 16
+/// bytes, matching `vec4`'s own alignment so whatever the shader author
+/// declares right after it never needs to straddle a padding gap), then
+/// every user param verbatim, in the same order
+/// `project_format::parse_shader_params` returned them in -- see
+/// `EffectKind::Shader::params`'s doc comment for why this works without
+/// the engine ever needing to know each param's own type. Shared by
+/// `create_effect_chain`'s initial load and `SceneRenderer::
+/// update_shader_effects`'s per-frame write, same load/live-update
+/// sharing rationale as every other `*_uniform_bytes` helper here.
+fn shader_uniform_bytes(cursor_uv: (f32, f32), time: f32, canvas_aspect: f32, params: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(16 + params.len() * 4);
+    bytes.extend_from_slice(&cursor_uv.0.to_le_bytes());
+    bytes.extend_from_slice(&cursor_uv.1.to_le_bytes());
+    bytes.extend_from_slice(&time.to_le_bytes());
+    bytes.extend_from_slice(&canvas_aspect.to_le_bytes());
+    for param in params {
+        bytes.extend_from_slice(&param.to_le_bytes());
+    }
+    bytes
+}
+
 /// Packs `MaskParams`' bytes (`mask_blend.wgsl`) -- shared by
 /// `create_loaded_mask`'s initial load and
 /// `LoadedLayer::set_effect_params`'s live update. `canvas_aspect`
@@ -1076,6 +1138,15 @@ pub struct SceneRenderer {
     blur_bind_group_layout: wgpu::BindGroupLayout,
     smoke_pipeline: wgpu::RenderPipeline,
     smoke_bind_group_layout: wgpu::BindGroupLayout,
+    // Not a single shared pipeline like every field above -- a `Shader`
+    // effect's pipeline is built per-instance in `create_effect_chain`,
+    // from a project asset compiled at load time. Only the *layout* (bind
+    // group shape + pipeline layout) is shared, same shape as
+    // `build_effect_bind_group_layout`'s other single-input-texture
+    // effects, so every user shader's fragment entry point is validated
+    // against exactly this on pipeline creation.
+    shader_effect_bind_group_layout: wgpu::BindGroupLayout,
+    shader_effect_pipeline_layout: wgpu::PipelineLayout,
     mask_pipeline: wgpu::RenderPipeline,
     mask_bind_group_layout: wgpu::BindGroupLayout,
     dummy_mask_view: wgpu::TextureView,
@@ -1459,6 +1530,20 @@ impl SceneRenderer {
             None,
         );
 
+        // Same bind group layout shape as every other single-input-
+        // texture effect above -- shared across every `Shader` effect
+        // instance project-wide, unlike their pipelines (one per
+        // instance, built from that instance's own compiled shader
+        // module in `create_effect_chain`) and shader modules.
+        let shader_effect_bind_group_layout =
+            build_effect_bind_group_layout(&device, "shader-effect-bind-group-layout");
+        let shader_effect_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("shader-effect-pipeline-layout"),
+                bind_group_layouts: &[Some(&shader_effect_bind_group_layout)],
+                immediate_size: 0,
+            });
+
         let mask_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("mask-bind-group-layout"),
@@ -1610,6 +1695,8 @@ impl SceneRenderer {
             blur_bind_group_layout,
             smoke_pipeline,
             smoke_bind_group_layout,
+            shader_effect_bind_group_layout,
+            shader_effect_pipeline_layout,
             mask_pipeline,
             mask_bind_group_layout,
             dummy_mask_view,
@@ -2025,6 +2112,114 @@ impl SceneRenderer {
                         state_texture,
                         state_view,
                         temp_texture,
+                        uniform_buffer,
+                        bind_group,
+                    }))
+                }
+                EffectKind::Shader { wgsl_path, params } => {
+                    let source = std::fs::read_to_string(project_dir.join(wgsl_path))
+                        .map_err(|e| format!("failed to read shader {wgsl_path:?}: {e}"))?;
+                    let specs = parse_shader_params(&source)
+                        .map_err(|e| format!("invalid shader {wgsl_path:?}: {e}"))?;
+                    if specs.len() != params.len() {
+                        return Err(format!(
+                            "shader {wgsl_path:?} declares {} param(s) but this effect has {} saved value(s) -- \
+                             the .wgsl file was edited after this effect was added; re-add it in the editor \
+                             to pick up the new param list",
+                            specs.len(),
+                            params.len()
+                        ));
+                    }
+
+                    // One error scope around every fallible GPU call
+                    // below (shader compile, pipeline creation against
+                    // `shader_effect_pipeline_layout`, and the bind group
+                    // that validates the shader's own bindings match it)
+                    // -- catches all of it as a plain `Err`, not a panic
+                    // or an opaque device-lost, and reports it as one
+                    // message rather than needing a scope per call. See
+                    // `project_format::EffectKind::Shader`'s doc comment
+                    // and the plan file's M7 section for why this has to
+                    // be non-panicking: this WGSL is a project asset, not
+                    // engine code, and a malformed one is exactly as
+                    // likely as a malformed image path.
+                    let error_scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+
+                    let shader_module = self.device.create_shader_module(
+                        wgpu::ShaderModuleDescriptor {
+                            label: Some(&format!("shader-effect-shader-{wgsl_path}")),
+                            source: wgpu::ShaderSource::Wgsl(source.into()),
+                        },
+                    );
+                    let pipeline = build_fullscreen_pipeline(
+                        &self.device,
+                        &format!("shader-effect-pipeline-{wgsl_path}"),
+                        &self.shader_effect_pipeline_layout,
+                        &shader_module,
+                        OFFSCREEN_FORMAT,
+                        None,
+                    );
+
+                    // Rounded up to a multiple of 16, not just
+                    // `16 + params.len() * 4` -- WGSL rounds a struct's
+                    // own reported size up to its alignment (the
+                    // largest of any member's own, here 8 from
+                    // `cursor: vec2<f32>`), so an odd param count can
+                    // leave the shader's real struct size a few bytes
+                    // larger than this tight sum (e.g. one param: fields
+                    // end at byte 20, but alignment 8 rounds that up to
+                    // 24). Undersizing here wouldn't be caught by this
+                    // function's own error scope below -- that only
+                    // covers *this* call, not the validation wgpu runs
+                    // against the *bound* buffer size on every future
+                    // draw call in `record_draw`, well outside any scope
+                    // -- so it has to be right the first time.
+                    let uniform_buffer_size = (16 + params.len() * 4).next_multiple_of(16) as u64;
+                    let uniform_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("shader-effect-params"),
+                        size: uniform_buffer_size,
+                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    // Off-canvas cursor sentinel, same convention as
+                    // Smoke's own initial write above -- overwritten by
+                    // `update_shader_effects` on the next redraw tick.
+                    self.queue.write_buffer(
+                        &uniform_buffer,
+                        0,
+                        &shader_uniform_bytes((-1.0e6, -1.0e6), 0.0, canvas_aspect, params),
+                    );
+
+                    let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("shader-effect-bind-group"),
+                        layout: &self.shader_effect_bind_group_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(&accumulator_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(&self.sampler),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: uniform_buffer.as_entire_binding(),
+                            },
+                        ],
+                    });
+
+                    if let Some(error) = pollster::block_on(error_scope.pop()) {
+                        return Err(format!(
+                            "shader {wgsl_path:?} failed to compile or doesn't match the required \
+                             bind group layout (one texture, one sampler, one uniform buffer, in \
+                             that order): {error}"
+                        ));
+                    }
+
+                    LoadedEffectKind::Shader(Box::new(ShaderEffect {
+                        params: params.clone(),
+                        pipeline,
                         uniform_buffer,
                         bind_group,
                     }))
@@ -2540,6 +2735,59 @@ impl SceneRenderer {
         }
     }
 
+    /// Writes every `Shader` effect's uniform buffer with the live
+    /// cursor/time (plus whatever `set_effect_params` last cached into
+    /// `params`) -- same per-redraw-tick pattern and same three call
+    /// sites as `update_smoke_cursors` just above, and the same
+    /// canvas-pixel-space cursor convention (see that method's doc
+    /// comment for the bug that convention exists to avoid). Every
+    /// enabled `Shader` effect gets this every frame regardless of
+    /// whether its own WGSL actually reads cursor/time -- see
+    /// `project_format::Layer::is_dynamic`'s doc comment for why a
+    /// `Shader` effect can't be assumed static from here.
+    pub fn update_shader_effects(
+        &self,
+        layers: &[LoadedLayer],
+        cursor_px: (f32, f32),
+        time_seconds: f32,
+    ) {
+        let (canvas_width, canvas_height) = {
+            let glyphon = self.glyphon.lock().unwrap();
+            (glyphon.canvas_width, glyphon.canvas_height)
+        };
+        let cursor_uv = (
+            cursor_px.0 / canvas_width.max(1) as f32,
+            cursor_px.1 / canvas_height.max(1) as f32,
+        );
+        for layer in layers {
+            let chain = match layer {
+                LoadedLayer::Image(image) | LoadedLayer::Gif { image, .. } => &image.effects,
+                LoadedLayer::Xray(xray) => &xray.effects,
+                LoadedLayer::Parallax(parallax) => &parallax.effects,
+                LoadedLayer::Text(_) => continue,
+            };
+            let Some(chain) = chain else { continue };
+            let canvas_aspect = {
+                let (width, height) = layer.size();
+                width as f32 / (height.max(1) as f32)
+            };
+            for effect in &chain.effects {
+                if let LoadedEffectKind::Shader(shader) = &effect.kind {
+                    self.queue.write_buffer(
+                        &shader.uniform_buffer,
+                        0,
+                        &shader_uniform_bytes(
+                            cursor_uv,
+                            time_seconds,
+                            canvas_aspect,
+                            &shader.params,
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
     /// Eases every parallax layer's pan towards a cursor-driven target
     /// and writes the result into its uniform buffer. `cursor_px` mirrors
     /// `update_xray_cursors` -- one shared cursor position, in the
@@ -2977,6 +3225,38 @@ impl SceneRenderer {
                         });
                         pass.set_pipeline(&self.smoke_pipeline);
                         pass.set_bind_group(0, &smoke.bind_group, &[]);
+                        pass.draw(0..3, 0..1);
+                    }
+                    LoadedEffectKind::Shader(shader) => {
+                        // Single pass into `scratch`, same shape as
+                        // Vignette/ColorAdjust above -- unlike Smoke, a
+                        // `Shader` effect is a pure function of the
+                        // layer's current content (plus cursor/time),
+                        // not its own persistent state, so it uses the
+                        // same `scratch`-then-mask-blend path as every
+                        // other non-stateful effect kind. Only the
+                        // pipeline differs per instance (its own
+                        // compiled shader module, not one shared on
+                        // `SceneRenderer` -- see `ShaderEffect`'s doc
+                        // comment).
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("shader-effect-pass"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &chain.scratch_view,
+                                depth_slice: None,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                            multiview_mask: None,
+                        });
+                        pass.set_pipeline(&shader.pipeline);
+                        pass.set_bind_group(0, &shader.bind_group, &[]);
                         pass.draw(0..3, 0..1);
                     }
                 }
