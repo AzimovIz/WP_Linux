@@ -4,17 +4,11 @@
 # wp_linux_editor, player) in ~/.local/bin, registers render-server to
 # autostart via an XDG Desktop Application Autostart .desktop file
 # (~/.config/autostart/) -- no systemd dependency, works the same
-# regardless of init system -- and then hands off to whichever adapter
-# install step matches your session, which installs whatever's needed to
-# actually show the render as your wallpaper. Picked primarily by session
-# *type*, not desktop identity: an X11 session always gets
-# adapters/x11/install.sh regardless of which window manager/desktop
-# you're running (Cinnamon, MATE, XFCE, KDE-on-X11, GNOME-on-X11, ... --
-# see adapters/x11), since that adapter only depends on core X11
-# protocol, not on any particular desktop; a Wayland session instead
-# picks between adapters/kde and adapters/gnome by desktop identity, the
-# two of which currently only support Wayland. No root required --
-# everything lands under $HOME.
+# regardless of init system -- and then hands off to whichever
+# adapters/<desktop>/install.sh matches the desktop you're running, which
+# installs whatever that desktop needs to actually show the render as
+# your wallpaper (see adapters/kde and adapters/gnome). No root required
+# -- everything lands under $HOME.
 
 set -euo pipefail
 
@@ -44,13 +38,11 @@ need() {
 need curl
 need tar
 
-# Best-effort desktop detection, used only to pick which of
-# adapters/kde or adapters/gnome to hand off to below when the session
-# turns out to be Wayland (see detect_session_type below) -- nothing
-# above this point (archive download, core binaries) depends on it.
-# $XDG_CURRENT_DESKTOP can list several colon-separated values (e.g.
-# "ubuntu:GNOME"); a substring match is enough since these values are
-# short, well-known identifiers.
+# Best-effort desktop detection, used only to pick which adapters/<de>
+# script to hand off to below -- nothing above this point (archive
+# download, core binaries) depends on it. $XDG_CURRENT_DESKTOP can list
+# several colon-separated values (e.g. "ubuntu:GNOME"); a substring match
+# is enough since these values are short, well-known identifiers.
 detect_de() {
     local id="${XDG_CURRENT_DESKTOP:-}${DESKTOP_SESSION:-}"
     case "$id" in
@@ -58,27 +50,6 @@ detect_de() {
         *GNOME*)        echo "gnome" ;;
         *)              echo "unknown" ;;
     esac
-}
-
-# Session *type* (x11/wayland), checked first and separately from which
-# desktop is running -- see this script's own top comment for why: the
-# X11 adapter only cares about this, not desktop identity.
-# $XDG_SESSION_TYPE is set by essentially every modern login-manager-
-# started session; the display-socket fallback below only matters for
-# sessions started a more manual way (e.g. a bare `startx`) where it can
-# end up unset.
-detect_session_type() {
-    case "${XDG_SESSION_TYPE:-}" in
-        x11)     echo "x11"; return ;;
-        wayland) echo "wayland"; return ;;
-    esac
-    if [ -n "${WAYLAND_DISPLAY:-}" ]; then
-        echo "wayland"
-    elif [ -n "${DISPLAY:-}" ]; then
-        echo "x11"
-    else
-        echo "unknown"
-    fi
 }
 
 tmpdir="$(mktemp -d)"
@@ -112,27 +83,19 @@ if command -v gtk-update-icon-cache >/dev/null 2>&1; then
     gtk-update-icon-cache -q -t -f "$ICON_THEME_DIR" >/dev/null 2>&1 || true
 fi
 
-session_type="$(detect_session_type)"
-
-if [ "$session_type" = "x11" ]; then
-    log "detected an X11 session -- running the X11 adapter install step"
-    bash "$pkgroot/adapters/x11/install.sh" "$pkgroot"
+de="$(detect_de)"
+# Falls back to "does kpackagetool6 exist" when detection is inconclusive
+# (some KDE session managers don't set $XDG_CURRENT_DESKTOP the same way)
+# -- matches this script's old behavior of always assuming KDE.
+if [ "$de" = "kde" ] || { [ "$de" = "unknown" ] && command -v kpackagetool6 >/dev/null 2>&1; }; then
+    log "detected KDE Plasma -- running its adapter install step"
+    bash "$pkgroot/adapters/kde/install.sh" "$pkgroot"
+elif [ "$de" = "gnome" ] || { [ "$de" = "unknown" ] && command -v gnome-extensions >/dev/null 2>&1; }; then
+    log "detected GNOME -- running its adapter install step"
+    bash "$pkgroot/adapters/gnome/install.sh" "$pkgroot"
 else
-    de="$(detect_de)"
-    # Falls back to "does kpackagetool6 exist" when detection is
-    # inconclusive (some KDE session managers don't set
-    # $XDG_CURRENT_DESKTOP the same way) -- matches this script's old
-    # behavior of always assuming KDE.
-    if [ "$de" = "kde" ] || { [ "$de" = "unknown" ] && command -v kpackagetool6 >/dev/null 2>&1; }; then
-        log "detected KDE Plasma -- running its adapter install step"
-        bash "$pkgroot/adapters/kde/install.sh" "$pkgroot"
-    elif [ "$de" = "gnome" ] || { [ "$de" = "unknown" ] && command -v gnome-extensions >/dev/null 2>&1; }; then
-        log "detected GNOME -- running its adapter install step"
-        bash "$pkgroot/adapters/gnome/install.sh" "$pkgroot"
-    else
-        warn "no supported desktop adapter for \$XDG_CURRENT_DESKTOP=${XDG_CURRENT_DESKTOP:-<unset>} (session type: ${session_type})."
-        warn "render-server and the editor are installed below regardless; see adapters/ for what's supported."
-    fi
+    warn "no supported desktop adapter for \$XDG_CURRENT_DESKTOP=${XDG_CURRENT_DESKTOP:-<unset>}."
+    warn "render-server and the editor are installed below regardless; see adapters/ for what's supported."
 fi
 
 log "installing autostart entry (${AUTOSTART_DIR})"
