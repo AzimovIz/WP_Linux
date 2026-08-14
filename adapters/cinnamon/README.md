@@ -10,9 +10,11 @@ lineage:
 1. **Display** (`MonitorLayer` in `extension.js`): polls render-server's
    local HTTP API (`GET /meta`, `GET /frame`, `POST /geometry` -- see
    `crates/render-server/src/main.rs`'s module doc comment for the exact
-   contract) and shows the frames behind desktop windows, one `St.Widget`
-   per monitor, inserted into the same Clutter scene-graph container
-   Muffin's own desktop background actors already live in.
+   contract) and shows the frames behind desktop windows, one real
+   `Meta.BackgroundActor` per monitor -- the same native background type
+   Muffin's own compositor creates and manages, not a generic widget
+   placed nearby (see below for why that distinction turned out to
+   matter a great deal).
 2. **Cursor** (`startCursorForwarder`/`_cursorTick` in `extension.js`):
    polls `global.get_pointer()` and forwards it to render-server's
    `dev.wplinux.CursorBridge` D-Bus method -- the Cinnamon equivalent of
@@ -32,18 +34,22 @@ directly into an override-redirect X11 window pinned to the bottom of the
 stack (the classic `xwinwrap` technique) -- desktop-agnostic in principle,
 but it risked fighting Muffin's own compositor for stacking on Cinnamon
 specifically: Muffin renders the desktop background as part of its *own*
-Clutter scene graph (confirmed by reading Mutter's `meta-background.c` --
-background is driven by GSettings/textures, never by the classic X11
-root-pixmap convention `feh`/`hsetroot` rely on), and Mutter has separate,
-special-cased handling for a *fullscreen* override-redirect window
-(originally for Wine/Proton games) that could plausibly out-prioritize a
-plain wallpaper-sized one. This extension sidesteps that question entirely
-by living directly on `global.stage`, explicitly positioned below
-`global.window_group` -- see `extension.js`'s own top doc comment and
-`createWallpaperGroup` for the full reasoning and why this doesn't rely
-on finding Cinnamon's own background container (Cinnamon, unlike GNOME
-Shell, has no `Main.layoutManager._backgroundGroup` to insert into
-directly).
+Clutter scene graph, not via the classic X11 root-pixmap convention
+`feh`/`hsetroot` rely on. This extension sidesteps that question by living
+inside that same scene graph instead of fighting it from outside via X11
+-- and, after two failed attempts at placing a generic widget somewhere
+in it by hand (see `extension.js`'s own top doc comment for the full
+story), by becoming a real `Meta.BackgroundActor` rather than trying to
+imitate one. Muffin's compositor (`src/compositor/compositor.c`,
+`sync_actor_stacking`) classifies every child of `global.window_group` by
+**GObject type** and re-lowers backgrounds, the desktop-icon layer, and
+regular windows into the correct relative order on every single stacking
+change; anything of a type it doesn't recognize is never touched by that
+re-lowering and drifts to the top over time regardless of where it was
+first placed or how carefully. A real `Meta.BackgroundActor` is
+recognized and correctly managed automatically, the same as Cinnamon's
+own native background -- confirmed live via Looking Glass before
+rewriting `extension.js` around it.
 
 Everything lives in one `extension.js` rather than adapters/gnome's
 three-file split: Cinnamon extensions still use the classic
@@ -66,28 +72,38 @@ nothing in this adapter has run on an actual Cinnamon session yet -- it was
 written against Cinnamon's own source and documentation, not against a
 running instance. Concretely unverified:
 
-- **Fixed, twice, then redesigned:** the original `backgroundContainerFor`
-  tried to reverse-engineer Cinnamon's own background container by
-  reading `global.get_background_actors()` (confirmed absent on the
-  actual `6.6.4` release tag -- `TypeError: ... is not a function`,
-  found by diffing `cinnamon-global.c` against a newer checkout) and,
-  after working around that, by falling back to
-  `global.background_actor`'s parent -- which still left the wallpaper
-  covering desktop icons (a separate `nemo-desktop` window) and regular
-  application windows on real hardware, because that parent's position
-  relative to `global.window_group` was never actually guaranteed, only
-  assumed by analogy with GNOME Shell's `_backgroundGroup` (which
-  Cinnamon has no equivalent of at all -- confirmed by reading
-  `js/ui/layout.js`). `createWallpaperGroup` in `extension.js` now
-  sidesteps this entirely: instead of finding and joining *Cinnamon's*
-  background container, it creates *its own* `Clutter.Actor`, added
-  directly to `global.stage` and explicitly pinned with
-  `set_child_below_sibling` relative to `global.window_group` itself --
-  both stable, always-present `CinnamonGlobal` properties, unlike the
-  background-actor accessors this replaced. Only this one group's own
-  position is ever touched; nothing that already existed on the stage is
-  reparented, removed, or reordered, and it's fully destroyed in
-  `disable()` so the stage ends up exactly as it was before `enable()`.
+- **Fixed, after three attempts, by matching Cinnamon's own approach
+  instead of working around it.** The original `backgroundContainerFor`
+  tried to reverse-engineer Cinnamon's own background container via
+  `global.get_background_actors()` (confirmed absent on the actual
+  `6.6.4` release tag -- `TypeError: ... is not a function`, found by
+  diffing `cinnamon-global.c` against a newer checkout), then via
+  `global.background_actor`'s parent -- both still left the wallpaper
+  covering desktop icons and real windows on real hardware. A second
+  redesign created a dedicated `Clutter.Actor` pinned below
+  `global.window_group` on `global.stage` -- also still broken, because
+  (confirmed by reading Muffin's `src/compositor/compositor.c`,
+  `sync_actor_stacking`) `window_group` isn't just "real windows": real
+  backgrounds, the desktop-icon layer (`bottom_window_group`, where
+  `nemo-desktop` lives), and normal windows are all *children* of
+  `window_group`, continuously reclassified and re-lowered into the
+  correct relative order **by GObject type** on every stacking change.
+  Any actor of a type Muffin doesn't recognize is never touched by that
+  re-lowering and drifts to the top over time, regardless of where it was
+  first placed.
+
+  `MonitorLayer` now creates a real `Meta.BackgroundActor`
+  (`src/meta/meta-background-actor.h` -- confirmed public, GI-exported
+  API, not private) and adds it straight to `global.window_group`.
+  Because it's an actual recognized type, Muffin's own compositor keeps
+  it correctly stacked automatically, the same as its native background
+  -- no manual `set_child_below_sibling`, no dedicated group, nothing to
+  keep re-asserting. Confirmed live via Looking Glass before rewriting
+  `extension.js` around it: a `Meta.BackgroundActor` filled with a solid
+  color stayed correctly behind both a newly opened window and the
+  desktop icons, with zero stacking code of any kind. Frame content goes
+  through `Meta.Background.set_file()` (double-buffered, same as the CSS
+  approach this replaced) instead of `St`'s CSS `background-image`.
 - The raw `Gio.SocketClient` HTTP client (`httpRequest` in
   `extension.js`) has no test coverage of any kind -- no headless GJS test
   harness exists in this project for extension code.
