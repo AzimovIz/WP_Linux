@@ -38,11 +38,11 @@ root-pixmap convention `feh`/`hsetroot` rely on), and Mutter has separate,
 special-cased handling for a *fullscreen* override-redirect window
 (originally for Wine/Proton games) that could plausibly out-prioritize a
 plain wallpaper-sized one. This extension sidesteps that question entirely
-by living inside the same trusted scene graph Cinnamon already uses to
-paint its own background -- see `extension.js`'s own top doc comment for
-the full reasoning and how `backgroundContainerFor` finds the right
-insertion point (`global.get_background_actors()`, since Cinnamon -- unlike
-GNOME Shell -- has no `Main.layoutManager._backgroundGroup` to insert into
+by living directly on `global.stage`, explicitly positioned below
+`global.window_group` -- see `extension.js`'s own top doc comment and
+`createWallpaperGroup` for the full reasoning and why this doesn't rely
+on finding Cinnamon's own background container (Cinnamon, unlike GNOME
+Shell, has no `Main.layoutManager._backgroundGroup` to insert into
 directly).
 
 Everything lives in one `extension.js` rather than adapters/gnome's
@@ -66,33 +66,28 @@ nothing in this adapter has run on an actual Cinnamon session yet -- it was
 written against Cinnamon's own source and documentation, not against a
 running instance. Concretely unverified:
 
-- **Fixed:** `backgroundContainerFor` originally called
-  `global.get_background_actors()` unconditionally. Confirmed (by diffing
-  the actual `6.6.4` release tag's `cinnamon-global.c` against a newer
-  checkout, not by guessing) that this method does not exist at all on
-  6.6.4 -- `TypeError: global.get_background_actors is not a function`
-  aborted `enable()` immediately every time, so no `MonitorLayer` was ever
-  created. 6.6.4 only has the older, singular `global.background_actor`
-  (one actor for the whole X11 background, not per-monitor). Now feature-
-  detects: uses the plural per-monitor form when present, falls back to
-  the singular one otherwise, and to `global.window_group` if neither
-  exists -- still below every real window in that last case, just without
-  the same guaranteed adjacency to Cinnamon's own background. Whether
-  matching the plural form's actors by `get_position()` actually finds
-  the right one per monitor is still unverified -- no Cinnamon version
-  with that method has been tested against yet.
-- **Fixed:** originally assumed, by analogy with `adapters/gnome`'s own
-  `backgroundContainer().add_child(...)`, that a newly-`add_child`-ed
-  actor paints on top of its siblings by default with no explicit lower
-  needed. Confirmed wrong on real hardware: the wallpaper covered both
-  desktop icons (a separate `nemo-desktop` window) and regular
-  application windows, meaning whatever container `backgroundContainerFor`
-  resolves to isn't reliably isolated from `global.window_group` on every
-  Muffin version/session. `MonitorLayer.updateGeometry` now explicitly
-  calls `parent.set_child_below_sibling(this._actor, null)` after
-  (re)parenting, forcing the layer to the very bottom of whatever
-  container it's in regardless of what else lives there or in what order
-  it was added.
+- **Fixed, twice, then redesigned:** the original `backgroundContainerFor`
+  tried to reverse-engineer Cinnamon's own background container by
+  reading `global.get_background_actors()` (confirmed absent on the
+  actual `6.6.4` release tag -- `TypeError: ... is not a function`,
+  found by diffing `cinnamon-global.c` against a newer checkout) and,
+  after working around that, by falling back to
+  `global.background_actor`'s parent -- which still left the wallpaper
+  covering desktop icons (a separate `nemo-desktop` window) and regular
+  application windows on real hardware, because that parent's position
+  relative to `global.window_group` was never actually guaranteed, only
+  assumed by analogy with GNOME Shell's `_backgroundGroup` (which
+  Cinnamon has no equivalent of at all -- confirmed by reading
+  `js/ui/layout.js`). `createWallpaperGroup` in `extension.js` now
+  sidesteps this entirely: instead of finding and joining *Cinnamon's*
+  background container, it creates *its own* `Clutter.Actor`, added
+  directly to `global.stage` and explicitly pinned with
+  `set_child_below_sibling` relative to `global.window_group` itself --
+  both stable, always-present `CinnamonGlobal` properties, unlike the
+  background-actor accessors this replaced. Only this one group's own
+  position is ever touched; nothing that already existed on the stage is
+  reparented, removed, or reordered, and it's fully destroyed in
+  `disable()` so the stage ends up exactly as it was before `enable()`.
 - The raw `Gio.SocketClient` HTTP client (`httpRequest` in
   `extension.js`) has no test coverage of any kind -- no headless GJS test
   harness exists in this project for extension code.

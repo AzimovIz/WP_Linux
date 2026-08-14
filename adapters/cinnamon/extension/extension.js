@@ -38,27 +38,34 @@
 //
 // Cinnamon has no direct equivalent of GNOME Shell's
 // `Main.layoutManager._backgroundGroup` (confirmed by reading
-// js/ui/layout.js -- no such field exists there). What Cinnamon does
-// expose, on versions that have it (see `backgroundContainerFor`'s own
-// doc comment -- not present on 6.6.4), is `global.get_background_actors()`,
-// a read accessor onto the actors Muffin's own native (C) background code
-// already created and positioned per-monitor -- see `backgroundManager.js`
-// in Cinnamon's own source, which only ever calls `.show()`/`.hide()` on
-// them, never creates or reparents them itself. `backgroundContainerFor`
-// below finds the real background actor whose position matches the
-// monitor we're placing a layer on, and returns *its parent* -- our own
-// actor is inserted into that same parent and then explicitly lowered to
-// the bottom of it (`MonitorLayer.updateGeometry`'s own
-// `set_child_below_sibling(this._actor, null)` call). An earlier version
-// of this file assumed the default "last-added child paints on top"
-// ordering alone was enough and skipped that explicit lower -- confirmed
-// wrong on real hardware, where it left the wallpaper covering both
-// desktop icons (a separate nemo-desktop window) and regular application
-// windows, meaning whatever container we land in isn't reliably isolated
-// from `global.window_group` on every Muffin version/session. If no
-// matching background actor is found (unexpected, but not fatal), this
-// falls back to `global.window_group` directly -- the explicit lower
-// keeps it below every real window either way.
+// js/ui/layout.js -- no such field exists there): no stable, named
+// JS-level container that's guaranteed to sit below `global.window_group`
+// the way GNOME Shell's does. Two earlier versions of this file tried to
+// reverse-engineer one anyway, by reading `global.get_background_actors()`
+// or the older `global.background_actor` and reparenting into *its*
+// parent -- confirmed broken twice on real hardware (the plural accessor
+// doesn't exist on Cinnamon 6.6.4 at all, and even patched around, the
+// wallpaper still covered desktop icons and real windows, meaning that
+// parent's own position relative to `window_group` was never actually
+// guaranteed in the first place, only assumed).
+//
+// `createWallpaperGroup()` below sidesteps the whole question: instead of
+// finding and joining *Cinnamon's* background container, it creates *our
+// own* -- a plain `Clutter.Actor` added directly to `global.stage` -- and
+// positions it the only way that's actually guaranteed to be correct:
+// explicitly, relative to `global.window_group` itself
+// (`set_child_below_sibling`), not relative to some other actor assumed
+// to already be in the right place. `global.stage` and
+// `global.window_group` are both stable, always-present `CinnamonGlobal`
+// properties (confirmed against `src/cinnamon-global.c`), unlike the
+// background-actor accessors this replaced. Every `MonitorLayer`'s widget
+// lives inside this one group, added once at construction; the group's
+// own position is re-asserted on every `_syncMonitors()` pass rather than
+// each widget being repositioned individually. This only ever touches
+// this one group's own position -- it never reparents, removes, or
+// reorders anything that already existed on the stage, so Cinnamon's own
+// top-level groups are left exactly as they were before `enable()` and
+// exactly as they were again after `disable()` destroys the group.
 //
 // Frames are written to a temp file and shown via St's CSS
 // `background-image`, not `Clutter.Image` -- same reasoning
@@ -68,6 +75,7 @@
 // reuses the proven-working approach rather than re-testing the
 // low-level path blind.
 
+const Clutter = imports.gi.Clutter;
 const Gio = imports.gi.Gio;
 const GLib = imports.gi.GLib;
 const St = imports.gi.St;
@@ -358,36 +366,43 @@ function connectorForMonitor(monitor, outputs) {
     return null;
 }
 
-/** Finds the real background actor's parent container, the insertion point our own actor should join as a sibling. See this file's top doc comment for why there's no dedicated `_backgroundGroup` to use directly.
+/** Creates the single shared container every `MonitorLayer` adds its
+ * widget to, and pins it directly below `global.window_group` on
+ * `global.stage` -- `global.window_group` and `global.stage` are both
+ * stable, always-present `CinnamonGlobal` properties (confirmed against
+ * `src/cinnamon-global.c`), unlike the background-actor accessors this
+ * function replaces.
  *
- * `global.get_background_actors()` (plural, one actor per monitor,
- * matched below by position) does not exist on every Cinnamon version --
- * confirmed absent by diffing the actual 6.6.4 release tag's
- * cinnamon-global.c against a newer checkout: 6.6.4 only has the older,
- * singular `global.background_actor` (one actor for the whole X11
- * background, not per-monitor -- `meta_get_x11_background_actor_for_display`).
- * `master` keeps `background_actor` around too (with a runtime deprecation
- * warning pointing at the plural form), so preferring the plural form
- * when present and falling back to the singular one covers both without
- * needing to know which version is actually running.
+ * Earlier versions of this file tried to reverse-engineer "the real
+ * background actor's parent" (via `global.get_background_actors()` or
+ * the older singular `global.background_actor`) and reparent into that.
+ * Confirmed broken twice on real hardware: the plural accessor doesn't
+ * exist on Cinnamon 6.6.4 at all, and even once that was worked around,
+ * the wallpaper still covered both desktop icons and real windows --
+ * meaning that container's own position relative to `global.window_group`
+ * was never actually guaranteed, only assumed by analogy with GNOME
+ * Shell's `_backgroundGroup` (which Cinnamon has no equivalent of at the
+ * JS level at all -- confirmed by reading `js/ui/layout.js`).
  *
- * Falls back to `global.window_group` if neither exists -- still below
- * every real window, just without the same guaranteed adjacency to
- * Cinnamon's own background. */
-function backgroundContainerFor(monitor) {
-    if (typeof global.get_background_actors === 'function') {
-        let actors = global.get_background_actors();
-        for (let actor of actors) {
-            let [x, y] = actor.get_position();
-            if (Math.round(x) === monitor.x && Math.round(y) === monitor.y)
-                return actor.get_parent();
-        }
-        if (actors.length > 0)
-            return actors[0].get_parent();
-    }
-    if (global.background_actor)
-        return global.background_actor.get_parent();
-    return global.window_group;
+ * This sidesteps that whole question: rather than trying to find and
+ * join *Cinnamon's* background container, this creates *our own*, and
+ * gets its position right the only way that's actually guaranteed --
+ * explicit placement relative to `window_group` itself, not relative to
+ * some other actor assumed to already be in the right place. Only ever
+ * touches this one actor's own position; never reparents, removes, or
+ * reorders anything that already existed on the stage, so Cinnamon's own
+ * top-level groups (window_group, whatever renders the real background,
+ * any others) are left exactly as they were. `reactive = false` since
+ * this sits as a stage-level sibling of window_group now rather than
+ * buried inside a background-only container -- higher-stakes territory
+ * for accidentally intercepting clicks meant for real windows/icons
+ * underneath, even though it's positioned below them either way. */
+function createWallpaperGroup() {
+    let group = new Clutter.Actor();
+    group.reactive = false;
+    global.stage.add_child(group);
+    global.stage.set_child_below_sibling(group, global.window_group);
+    return group;
 }
 
 /** Filesystem-safe version of a connector name for use in a temp filename. */
@@ -396,12 +411,15 @@ function sanitizeForFilename(name) {
 }
 
 class MonitorLayer {
-    constructor(connector, monitorIndex) {
+    /** `group` is the single shared `createWallpaperGroup()` actor every monitor's widget lives in -- added once here and never reparented again, since the group's own position (not this widget's) is what's kept correct relative to `window_group`. */
+    constructor(connector, monitorIndex, group) {
         this._connector = connector;
         this._monitorIndex = monitorIndex;
 
         this._actor = new St.Widget();
         this._actor.visible = false;
+        this._actor.reactive = false;
+        group.add_child(this._actor);
 
         this._rect = null;
         this._hasGeometry = false;
@@ -445,31 +463,6 @@ class MonitorLayer {
     /** Called on construction and whenever monitors-changed fires. `monitor` is one of `Main.layoutManager.monitors`'s entries: `{x, y, width, height, ...}`. */
     updateGeometry(monitor) {
         let rect = { x: monitor.x, y: monitor.y, width: monitor.width, height: monitor.height };
-
-        // Re-parent every time -- a monitor hot-plug/reconfigure can
-        // change which background actor (and therefore which parent) is
-        // the right one to sit above, and Clutter actors can only ever
-        // have one parent at a time.
-        let parent = backgroundContainerFor(rect);
-        if (this._actor.get_parent() !== parent) {
-            if (this._actor.get_parent())
-                this._actor.get_parent().remove_child(this._actor);
-            parent.add_child(this._actor);
-        }
-        // Explicitly forced to the bottom of whatever container we're
-        // in, every call -- relying on "the last-added child paints on
-        // top" (this file's original assumption, by analogy with
-        // adapters/gnome) was confirmed wrong on real hardware: the
-        // wallpaper covered both desktop icons (a separate nemo-desktop
-        // window) and regular application windows, meaning the container
-        // `backgroundContainerFor` resolves to isn't reliably isolated
-        // from `global.window_group` on every Muffin version/session --
-        // either the same container legitimately holds both, or the
-        // `global.window_group` fallback was actually the one taken.
-        // Forcing to the bottom is correct either way and removes the
-        // dependency on insertion order entirely; harmless/idempotent
-        // when called again with nothing else having been added since.
-        parent.set_child_below_sibling(this._actor, null);
 
         this._actor.set_position(rect.x, rect.y);
         this._actor.set_size(rect.width, rect.height);
@@ -580,9 +573,18 @@ class MonitorLayer {
 
 let _layers = null; // connector -> MonitorLayer
 let _monitorsChangedId = null;
+let _wallpaperGroup = null;
 
 function _syncMonitors() {
     let seenConnectors = new Set();
+    // Re-asserted every pass (not just once in enable()) -- cheap
+    // (single Clutter call, no-op if already in place) and guards
+    // against Cinnamon ever repositioning global.window_group itself
+    // relative to its other top-level groups after we've started;
+    // set_child_below_sibling only ever touches _wallpaperGroup's own
+    // position, never window_group's or anything else's.
+    global.stage.set_child_below_sibling(_wallpaperGroup, global.window_group);
+
     // Queried once per pass, not once per monitor -- monitors-changed
     // fires rarely (startup, hotplug), so one extra `xrandr` process per
     // event is negligible either way, but there's no reason to run it
@@ -599,7 +601,7 @@ function _syncMonitors() {
         seenConnectors.add(connector);
         let layer = _layers.get(connector);
         if (!layer) {
-            layer = new MonitorLayer(connector, monitor.index);
+            layer = new MonitorLayer(connector, monitor.index, _wallpaperGroup);
             _layers.set(connector, layer);
         }
         layer.updateGeometry(monitor);
@@ -619,6 +621,7 @@ function init(extensionMeta) {
 
 function enable() {
     _layers = new Map();
+    _wallpaperGroup = createWallpaperGroup();
     startCursorForwarder();
 
     _monitorsChangedId = Main.layoutManager.connect('monitors-changed', () => _syncMonitors());
@@ -635,6 +638,14 @@ function disable() {
         for (let layer of _layers.values())
             layer.destroy();
         _layers = null;
+    }
+
+    // Destroying detaches it from global.stage automatically -- the
+    // stage's remaining children end up exactly as they were before
+    // enable(), nothing left behind.
+    if (_wallpaperGroup) {
+        _wallpaperGroup.destroy();
+        _wallpaperGroup = null;
     }
 
     stopCursorForwarder();
