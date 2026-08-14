@@ -81,10 +81,18 @@ running instance. Concretely unverified:
   matching the plural form's actors by `get_position()` actually finds
   the right one per monitor is still unverified -- no Cinnamon version
   with that method has been tested against yet.
-- Whether newly-`add_child`-ed actors really do paint on top of their
-  siblings with no explicit `set_child_above_sibling` call needed --
-  assumed by analogy with `adapters/gnome`'s own `backgroundContainer().
-  add_child(...)`, which relies on the same default.
+- **Fixed:** originally assumed, by analogy with `adapters/gnome`'s own
+  `backgroundContainer().add_child(...)`, that a newly-`add_child`-ed
+  actor paints on top of its siblings by default with no explicit lower
+  needed. Confirmed wrong on real hardware: the wallpaper covered both
+  desktop icons (a separate `nemo-desktop` window) and regular
+  application windows, meaning whatever container `backgroundContainerFor`
+  resolves to isn't reliably isolated from `global.window_group` on every
+  Muffin version/session. `MonitorLayer.updateGeometry` now explicitly
+  calls `parent.set_child_below_sibling(this._actor, null)` after
+  (re)parenting, forcing the layer to the very bottom of whatever
+  container it's in regardless of what else lives there or in what order
+  it was added.
 - The raw `Gio.SocketClient` HTTP client (`httpRequest` in
   `extension.js`) has no test coverage of any kind -- no headless GJS test
   harness exists in this project for extension code.

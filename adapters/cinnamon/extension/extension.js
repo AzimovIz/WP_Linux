@@ -39,21 +39,26 @@
 // Cinnamon has no direct equivalent of GNOME Shell's
 // `Main.layoutManager._backgroundGroup` (confirmed by reading
 // js/ui/layout.js -- no such field exists there). What Cinnamon does
-// expose is `global.get_background_actors()`, a read accessor onto the
-// actors Muffin's own native (C) background code already created and
-// positioned per-monitor -- see `backgroundManager.js` in Cinnamon's own
-// source, which only ever calls `.show()`/`.hide()` on them, never
-// creates or reparents them itself. `backgroundContainerFor` below
-// finds the real background actor whose position matches the monitor
-// we're placing a layer on, and returns *its parent* -- inserting our
-// own actor into that same parent, added last (Clutter/Cinnamon's
-// default stacking already paints later-added children on top, the same
-// implicit ordering adapters/gnome's own `backgroundContainer().
-// add_child(...)` already relies on, no explicit raise/lower needed).
-// If no matching actor is found (unexpected, but not fatal), this falls
-// back to `global.window_group` -- still below every real window, just
-// without the guarantee of sitting immediately above Cinnamon's own
-// background.
+// expose, on versions that have it (see `backgroundContainerFor`'s own
+// doc comment -- not present on 6.6.4), is `global.get_background_actors()`,
+// a read accessor onto the actors Muffin's own native (C) background code
+// already created and positioned per-monitor -- see `backgroundManager.js`
+// in Cinnamon's own source, which only ever calls `.show()`/`.hide()` on
+// them, never creates or reparents them itself. `backgroundContainerFor`
+// below finds the real background actor whose position matches the
+// monitor we're placing a layer on, and returns *its parent* -- our own
+// actor is inserted into that same parent and then explicitly lowered to
+// the bottom of it (`MonitorLayer.updateGeometry`'s own
+// `set_child_below_sibling(this._actor, null)` call). An earlier version
+// of this file assumed the default "last-added child paints on top"
+// ordering alone was enough and skipped that explicit lower -- confirmed
+// wrong on real hardware, where it left the wallpaper covering both
+// desktop icons (a separate nemo-desktop window) and regular application
+// windows, meaning whatever container we land in isn't reliably isolated
+// from `global.window_group` on every Muffin version/session. If no
+// matching background actor is found (unexpected, but not fatal), this
+// falls back to `global.window_group` directly -- the explicit lower
+// keeps it below every real window either way.
 //
 // Frames are written to a temp file and shown via St's CSS
 // `background-image`, not `Clutter.Image` -- same reasoning
@@ -451,6 +456,20 @@ class MonitorLayer {
                 this._actor.get_parent().remove_child(this._actor);
             parent.add_child(this._actor);
         }
+        // Explicitly forced to the bottom of whatever container we're
+        // in, every call -- relying on "the last-added child paints on
+        // top" (this file's original assumption, by analogy with
+        // adapters/gnome) was confirmed wrong on real hardware: the
+        // wallpaper covered both desktop icons (a separate nemo-desktop
+        // window) and regular application windows, meaning the container
+        // `backgroundContainerFor` resolves to isn't reliably isolated
+        // from `global.window_group` on every Muffin version/session --
+        // either the same container legitimately holds both, or the
+        // `global.window_group` fallback was actually the one taken.
+        // Forcing to the bottom is correct either way and removes the
+        // dependency on insertion order entirely; harmless/idempotent
+        // when called again with nothing else having been added since.
+        parent.set_child_below_sibling(this._actor, null);
 
         this._actor.set_position(rect.x, rect.y);
         this._actor.set_size(rect.width, rect.height);
