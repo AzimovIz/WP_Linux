@@ -66,13 +66,21 @@ nothing in this adapter has run on an actual Cinnamon session yet -- it was
 written against Cinnamon's own source and documentation, not against a
 running instance. Concretely unverified:
 
-- Whether `global.get_background_actors()` returns one actor per monitor
-  (assumed) or something else, and whether matching by `get_position()`
-  actually finds the right one -- see `backgroundContainerFor` in
-  `extension.js`. If this assumption is wrong, the fallback
-  (`global.window_group`, or the first background actor's parent) should
-  still keep the wallpaper below every real window, just without the same
-  guaranteed adjacency to Cinnamon's own background.
+- **Fixed:** `backgroundContainerFor` originally called
+  `global.get_background_actors()` unconditionally. Confirmed (by diffing
+  the actual `6.6.4` release tag's `cinnamon-global.c` against a newer
+  checkout, not by guessing) that this method does not exist at all on
+  6.6.4 -- `TypeError: global.get_background_actors is not a function`
+  aborted `enable()` immediately every time, so no `MonitorLayer` was ever
+  created. 6.6.4 only has the older, singular `global.background_actor`
+  (one actor for the whole X11 background, not per-monitor). Now feature-
+  detects: uses the plural per-monitor form when present, falls back to
+  the singular one otherwise, and to `global.window_group` if neither
+  exists -- still below every real window in that last case, just without
+  the same guaranteed adjacency to Cinnamon's own background. Whether
+  matching the plural form's actors by `get_position()` actually finds
+  the right one per monitor is still unverified -- no Cinnamon version
+  with that method has been tested against yet.
 - Whether newly-`add_child`-ed actors really do paint on top of their
   siblings with no explicit `set_child_above_sibling` call needed --
   assumed by analogy with `adapters/gnome`'s own `backgroundContainer().

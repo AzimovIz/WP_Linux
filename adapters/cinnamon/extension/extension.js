@@ -302,16 +302,35 @@ function connectorForMonitorIndex(index) {
     return global.display.get_monitor_name(index);
 }
 
-/** Finds the real background actor Muffin created for `monitor` (matched by position -- each monitor's own background actor is positioned at that monitor's origin) and returns its parent container, the insertion point our own actor should join as a sibling. See this file's top doc comment for why there's no dedicated `_backgroundGroup` to use directly. Falls back to the first background actor's parent if no exact position match is found, and to `global.window_group` if there are no background actors at all -- both fallbacks still land below every real window, just without the same guaranteed adjacency to Cinnamon's own background. */
+/** Finds the real background actor's parent container, the insertion point our own actor should join as a sibling. See this file's top doc comment for why there's no dedicated `_backgroundGroup` to use directly.
+ *
+ * `global.get_background_actors()` (plural, one actor per monitor,
+ * matched below by position) does not exist on every Cinnamon version --
+ * confirmed absent by diffing the actual 6.6.4 release tag's
+ * cinnamon-global.c against a newer checkout: 6.6.4 only has the older,
+ * singular `global.background_actor` (one actor for the whole X11
+ * background, not per-monitor -- `meta_get_x11_background_actor_for_display`).
+ * `master` keeps `background_actor` around too (with a runtime deprecation
+ * warning pointing at the plural form), so preferring the plural form
+ * when present and falling back to the singular one covers both without
+ * needing to know which version is actually running.
+ *
+ * Falls back to `global.window_group` if neither exists -- still below
+ * every real window, just without the same guaranteed adjacency to
+ * Cinnamon's own background. */
 function backgroundContainerFor(monitor) {
-    let actors = global.get_background_actors();
-    for (let actor of actors) {
-        let [x, y] = actor.get_position();
-        if (Math.round(x) === monitor.x && Math.round(y) === monitor.y)
-            return actor.get_parent();
+    if (typeof global.get_background_actors === 'function') {
+        let actors = global.get_background_actors();
+        for (let actor of actors) {
+            let [x, y] = actor.get_position();
+            if (Math.round(x) === monitor.x && Math.round(y) === monitor.y)
+                return actor.get_parent();
+        }
+        if (actors.length > 0)
+            return actors[0].get_parent();
     }
-    if (actors.length > 0)
-        return actors[0].get_parent();
+    if (global.background_actor)
+        return global.background_actor.get_parent();
     return global.window_group;
 }
 
