@@ -458,10 +458,24 @@ class MonitorLayer {
             `${x},${y},${width},${height}`);
     }
 
-    /** Loads `path` into the same, reused `Meta.Background` this actor already displays -- native texture pipeline, no CSS/St theming involved. `STRETCHED`: fill the monitor exactly, ignoring aspect ratio -- same tradeoff the old CSS `background-size` (plain pixel dimensions, not `cover`/`contain`) already made, kept for parity now that render-server's frame is always exactly the pushed geometry's size anyway. */
+    /** Loads `path` into the same, reused `Meta.Background` this actor already displays -- native texture pipeline, no CSS/St theming involved. `STRETCHED`: fill the monitor exactly, ignoring aspect ratio -- same tradeoff the old CSS `background-size` (plain pixel dimensions, not `cover`/`contain`) already made, kept for parity now that render-server's frame is always exactly the pushed geometry's size anyway.
+     *
+     * `Meta.BackgroundImageCache` (`src/compositor/meta-background-image.c`)
+     * caches decoded textures keyed by `GFile` path equality, not content
+     * or mtime -- confirmed on real hardware: the first frame displayed
+     * correctly, then neither animation nor switching to a different
+     * wallpaper project ever changed anything, because both slots'
+     * *paths* had already been seen once each and kept getting served
+     * their original cached texture. `purge()` (public API, confirmed via
+     * `src/meta/meta-background-image.h`) evicts this exact path from
+     * that cache immediately before `set_file()`, forcing a real re-decode
+     * every time -- needed on every call, not just the first, since these
+     * two paths get reused for every subsequent frame by design (the
+     * double-buffer in the constructor). */
     _applyFrame(path) {
-        this._background.set_file(
-            Gio.File.new_for_path(path), CDesktopEnums.BackgroundStyle.STRETCHED);
+        let file = Gio.File.new_for_path(path);
+        Meta.BackgroundImageCache.get_default().purge(file);
+        this._background.set_file(file, CDesktopEnums.BackgroundStyle.STRETCHED);
     }
 
     _schedulePoll() {
