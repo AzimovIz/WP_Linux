@@ -7,8 +7,8 @@
 # regardless of init system -- and then hands off to whichever
 # adapters/<desktop>/install.sh matches the desktop you're running, which
 # installs whatever that desktop needs to actually show the render as
-# your wallpaper (see adapters/kde and adapters/gnome). No root required
-# -- everything lands under $HOME.
+# your wallpaper (see adapters/kde, adapters/gnome, and
+# adapters/cinnamon). No root required -- everything lands under $HOME.
 
 set -euo pipefail
 
@@ -47,6 +47,7 @@ detect_de() {
     local id="${XDG_CURRENT_DESKTOP:-}${DESKTOP_SESSION:-}"
     case "$id" in
         *KDE*|*Plasma*) echo "kde" ;;
+        *Cinnamon*)     echo "cinnamon" ;;
         *GNOME*)        echo "gnome" ;;
         *)              echo "unknown" ;;
     esac
@@ -90,6 +91,9 @@ de="$(detect_de)"
 if [ "$de" = "kde" ] || { [ "$de" = "unknown" ] && command -v kpackagetool6 >/dev/null 2>&1; }; then
     log "detected KDE Plasma -- running its adapter install step"
     bash "$pkgroot/adapters/kde/install.sh" "$pkgroot"
+elif [ "$de" = "cinnamon" ] || { [ "$de" = "unknown" ] && command -v cinnamon-extension-tool >/dev/null 2>&1; }; then
+    log "detected Cinnamon -- running its adapter install step"
+    bash "$pkgroot/adapters/cinnamon/install.sh" "$pkgroot"
 elif [ "$de" = "gnome" ] || { [ "$de" = "unknown" ] && command -v gnome-extensions >/dev/null 2>&1; }; then
     log "detected GNOME -- running its adapter install step"
     bash "$pkgroot/adapters/gnome/install.sh" "$pkgroot"

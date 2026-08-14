@@ -2,14 +2,15 @@
 # Reverses install.sh: stops render-server, removes its autostart entry,
 # the desktop-agnostic core binaries from ~/.local/bin, and whatever
 # desktop adapter install.sh installed -- the two KDE packages (see
-# adapters/kde) and/or the GNOME Shell extension (see adapters/gnome),
-# removed below via the same `command -v kpackagetool6`/`kwriteconfig6`/
-# `gnome-extensions` guards install.sh's own adapter steps use, which is
-# why this is safe to run unconditionally regardless of which desktop
-# you're on -- each block below is a no-op on any desktop it doesn't
-# apply to. This script is distributed standalone (curl | bash, no
-# release archive download), so unlike install.sh it can't hand off to an
-# adapters/<de>/uninstall.sh file -- if a future adapter needs its own
+# adapters/kde), the GNOME Shell extension (see adapters/gnome), and/or
+# the Cinnamon extension (see adapters/cinnamon), removed below via the
+# same `command -v kpackagetool6`/`kwriteconfig6`/`gnome-extensions`/
+# `cinnamon-extension-tool` guards install.sh's own adapter steps use,
+# which is why this is safe to run unconditionally regardless of which
+# desktop you're on -- each block below is a no-op on any desktop it
+# doesn't apply to. This script is distributed standalone (curl | bash,
+# no release archive download), so unlike install.sh it can't hand off to
+# an adapters/<de>/uninstall.sh file -- if a future adapter needs its own
 # cleanup, inline it here the same way, guarded the same way. Does NOT
 # touch any wallpaper projects you saved -- those are your data, wherever
 # you put them, and are left alone. This also includes the wallpaper
@@ -29,6 +30,8 @@ PLASMA_PLUGIN_ID="dev.wplinux.wallpaper"
 KWIN_SCRIPT_ID="dev.wplinux.cursorbridge"
 GNOME_EXT_UUID="wp-linux@wplinux.dev"
 GNOME_EXT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/${GNOME_EXT_UUID}"
+CINNAMON_EXT_UUID="wp-linux@wplinux.dev"
+CINNAMON_EXT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/cinnamon/extensions/${CINNAMON_EXT_UUID}"
 DESKTOP_FILE_ID="dev.wplinux.editor"
 
 log()  { echo "uninstall.sh: $*"; }
@@ -70,6 +73,18 @@ fi
 if [ -d "$GNOME_EXT_DIR" ]; then
     log "removing GNOME Shell extension from ${GNOME_EXT_DIR}"
     rm -rf "$GNOME_EXT_DIR"
+fi
+
+# Cinnamon adapter cleanup (see adapters/cinnamon) -- no-op on any other
+# desktop since neither cinnamon-extension-tool nor CINNAMON_EXT_DIR will
+# exist there.
+if command -v cinnamon-extension-tool >/dev/null 2>&1; then
+    log "disabling WP Linux Cinnamon extension"
+    cinnamon-extension-tool --disable "$CINNAMON_EXT_UUID" >/dev/null 2>&1 || true
+fi
+if [ -d "$CINNAMON_EXT_DIR" ]; then
+    log "removing Cinnamon extension from ${CINNAMON_EXT_DIR}"
+    rm -rf "$CINNAMON_EXT_DIR"
 fi
 
 log "removing binaries from ${BIN_DIR}"
