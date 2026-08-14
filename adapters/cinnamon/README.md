@@ -80,13 +80,22 @@ running instance. Concretely unverified:
 - The raw `Gio.SocketClient` HTTP client (`httpRequest` in
   `extension.js`) has no test coverage of any kind -- no headless GJS test
   harness exists in this project for extension code.
-- `cinnamon-version` in `metadata.json` is set to `["6.0"]`, matching a
-  real actively-maintained Spices extension's own declaration (works
-  across the whole 6.x line in practice, apparently) -- not independently
-  verified against Cinnamon's own compatibility-check logic.
+- `cinnamon-version` in `metadata.json` is set to `["6.0", "6.2", "6.4", "6.6"]`
+  -- not independently verified against Cinnamon's own compatibility-check
+  logic, which is why `install.sh` also enables with a leading `!` on the
+  uuid (see below), telling Cinnamon to skip that check entirely rather
+  than trust this list.
+- **`cinnamon-extension-tool` is not guaranteed to be installed.** Found
+  missing on a real Cinnamon 6.6.4 machine this was tested against (likely
+  a Linux-Mint-specific convenience script, not part of every distro's
+  `cinnamon` package) -- `install.sh` now talks to the underlying
+  `org.cinnamon` GSettings schema directly instead of assuming the tool
+  exists, see below.
 
-If something doesn't work: check `journalctl --user -b 0 | grep cinnamon`
-or run `cinnamon --replace` from a terminal (safe -- unlike killing an X11
+If something doesn't work: check `journalctl --user -b 0 | grep wp-linux`,
+the Extensions page in System Settings (a broken extension shows an error
+icon there you can click for the actual JS exception), or run
+`cinnamon --replace` from a terminal (safe -- unlike killing an X11
 client, a Cinnamon extension throwing during `enable()` gets caught and
 disabled by Cinnamon itself, not something that can black-screen or lock
 out the session the way this project's earlier X11 adapter attempt did).
@@ -95,21 +104,30 @@ out the session the way this project's earlier X11 adapter attempt did).
 
 The top-level `install.sh` calls `adapters/cinnamon/install.sh`, which
 copies `adapters/cinnamon/extension` to
-`~/.local/share/cinnamon/extensions/wp-linux@wplinux.dev/` and runs
-`cinnamon-extension-tool --enable wp-linux@wplinux.dev`.
+`~/.local/share/cinnamon/extensions/wp-linux@wplinux.dev/`, then enables
+it via `cinnamon-extension-tool --enable` if that's present, falling back
+to writing the `org.cinnamon enabled-extensions` GSettings key directly
+(`!wp-linux@wplinux.dev`, the leading `!` skipping Cinnamon's own
+`cinnamon-version` compatibility check -- see the status section above for
+why) if it isn't.
 
-To turn the wallpaper back off: disable the whole extension --
-`cinnamon-extension-tool --disable wp-linux@wplinux.dev`, or the
-Extensions page in System Settings.
+To turn the wallpaper back off: disable the whole extension via the
+Extensions page in System Settings, `cinnamon-extension-tool --disable
+wp-linux@wplinux.dev` if you have it, or directly:
+
+```sh
+gsettings get org.cinnamon enabled-extensions   # find/confirm the exact entry first
+gsettings set org.cinnamon enabled-extensions "[...]"   # same list, with our uuid removed
+```
 
 ## Development
 
 Iterate by copying `adapters/cinnamon/extension/*` straight into
-`~/.local/share/cinnamon/extensions/wp-linux@wplinux.dev/`, then:
+`~/.local/share/cinnamon/extensions/wp-linux@wplinux.dev/`, then either
+`cinnamon-extension-tool --disable`/`--enable` if you have it, or:
 
 ```sh
-cinnamon-extension-tool --disable wp-linux@wplinux.dev
-cinnamon-extension-tool --enable wp-linux@wplinux.dev
+gsettings set org.cinnamon enabled-extensions "['!wp-linux@wplinux.dev']"
 ```
 
 If that doesn't pick up a change, `Alt+F2 r Enter` restarts Cinnamon

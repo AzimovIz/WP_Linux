@@ -91,7 +91,7 @@ de="$(detect_de)"
 if [ "$de" = "kde" ] || { [ "$de" = "unknown" ] && command -v kpackagetool6 >/dev/null 2>&1; }; then
     log "detected KDE Plasma -- running its adapter install step"
     bash "$pkgroot/adapters/kde/install.sh" "$pkgroot"
-elif [ "$de" = "cinnamon" ] || { [ "$de" = "unknown" ] && command -v cinnamon-extension-tool >/dev/null 2>&1; }; then
+elif [ "$de" = "cinnamon" ] || { [ "$de" = "unknown" ] && command -v cinnamon >/dev/null 2>&1; }; then
     log "detected Cinnamon -- running its adapter install step"
     bash "$pkgroot/adapters/cinnamon/install.sh" "$pkgroot"
 elif [ "$de" = "gnome" ] || { [ "$de" = "unknown" ] && command -v gnome-extensions >/dev/null 2>&1; }; then
