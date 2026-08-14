@@ -285,21 +285,72 @@ function stopCursorForwarder() {
 // adapters/gnome/extension/monitorLayer.js's MonitorLayer.
 // -----------------------------------------------------------------
 
-/** Resolves the connector name (e.g. "DP-1", "eDP-1") for a `Main.layoutManager.monitors` index -- the same `wl_output`/RandR output name `wp_linux_editor` already uses as a monitor id (see its own `MonitorInfo` doc comment), so it can be used as render-server's `?monitor=` value with no translation.
+/** Runs `xrandr --query` and parses out every connected output's connector
+ * name and geometry -- e.g. `{ connector: "Virtual-1", x: 0, y: 0, width:
+ * 1280, height: 800 }`. Used by `connectorForMonitor` below to resolve
+ * the real RandR connector name for a `Main.layoutManager.monitors`
+ * entry, matched by position.
  *
- * Unlike adapters/gnome, this does NOT go through `global.backend` --
- * `CinnamonGlobal` (src/cinnamon-global.c) never installs a `backend`
- * property at all, so `global.backend` is `undefined` on every Cinnamon
- * version and that call always threw here, silently, inside
- * `_syncMonitors`'s own try/catch -- meaning no MonitorLayer was ever
- * created and nothing displayed, with no visible error (Cinnamon's
- * extension `log()` goes to ~/.cinnamon/glass.log, not necessarily the
- * systemd journal). `global.display` (a real `MetaDisplay`, confirmed via
- * cinnamon-global.c's property table) is the Cinnamon-native equivalent
- * -- `get_monitor_name` is the same call `js/ui/layout.js` itself uses to
- * label monitors, declared in muffin's src/meta/display.h. */
-function connectorForMonitorIndex(index) {
-    return global.display.get_monitor_name(index);
+ * Why this exists at all: neither `global` nor `Meta.MonitorManager`
+ * exposes a connector name anywhere on this Cinnamon/Muffin generation.
+ * `global.display.get_monitor_name(index)` (tried first, see this file's
+ * git history) turns out to return an EDID vendor/model string like
+ * `"Red Hat, Inc. 15\""`, not a connector -- confirmed against real
+ * render-server logs, which showed geometry pushed under that EDID
+ * string while `wp_linux_editor` (via winit's own XRandR query) had
+ * separately registered the wallpaper project under the real connector
+ * name `"Virtual-1"`, so the two never matched. And unlike modern
+ * GNOME Shell's Mutter, this Muffin fork's `meta-monitor-manager.h` (a
+ * frozen, older-generation API -- checked against the muffin release
+ * tag closest to this Cinnamon version) has no per-monitor object with a
+ * `get_connector()`-style accessor at all -- only the reverse
+ * `meta_monitor_manager_get_monitor_for_connector(connector)`, which
+ * needs the name as input, not output. `xrandr` is the same source
+ * winit's own X11 backend already resolves connector names from, so
+ * this reaches the same ground truth `wp_linux_editor` used, just via
+ * the CLI instead of a GI binding -- X11-only, matching this Cinnamon
+ * session (`xrandr` doesn't exist under Wayland), and it's ubiquitous on
+ * any X11 desktop, unlike a new GI typelib dependency would be. */
+function _queryXrandrOutputs() {
+    let outputs = [];
+
+    let ok, stdout, stderr, status;
+    try {
+        [ok, stdout, stderr, status] = GLib.spawn_sync(
+            null, ['xrandr', '--query'], null, GLib.SpawnFlags.SEARCH_PATH, null);
+    } catch (e) {
+        log(`wp-linux: couldn't run xrandr -- is it installed? (${e})`);
+        return outputs;
+    }
+    if (!ok || status !== 0) {
+        log(`wp-linux: xrandr --query exited with status ${status}: ${new TextDecoder().decode(stderr)}`);
+        return outputs;
+    }
+
+    // e.g. "Virtual-1 connected primary 1280x800+0+0 (normal left ...) 508mm x 317mm"
+    let re = /^(\S+)\s+connected\s+(?:primary\s+)?(\d+)x(\d+)\+(-?\d+)\+(-?\d+)/;
+    for (let line of new TextDecoder().decode(stdout).split('\n')) {
+        let m = re.exec(line);
+        if (m) {
+            outputs.push({
+                connector: m[1],
+                width: parseInt(m[2], 10),
+                height: parseInt(m[3], 10),
+                x: parseInt(m[4], 10),
+                y: parseInt(m[5], 10),
+            });
+        }
+    }
+    return outputs;
+}
+
+/** Matches a `Main.layoutManager.monitors` entry against `xrandr --query` output by position, returning its real connector name (e.g. "Virtual-1", "eDP-1") -- the same id `wp_linux_editor` already uses (see its own `MonitorInfo` doc comment), so it can be used as render-server's `?monitor=` value with no translation. `outputs` is `_queryXrandrOutputs()`'s result, queried once per `_syncMonitors()` pass rather than once per monitor. */
+function connectorForMonitor(monitor, outputs) {
+    for (let output of outputs) {
+        if (output.x === monitor.x && output.y === monitor.y)
+            return output.connector;
+    }
+    return null;
 }
 
 /** Finds the real background actor's parent container, the insertion point our own actor should join as a sibling. See this file's top doc comment for why there's no dedicated `_backgroundGroup` to use directly.
@@ -513,17 +564,16 @@ let _monitorsChangedId = null;
 
 function _syncMonitors() {
     let seenConnectors = new Set();
+    // Queried once per pass, not once per monitor -- monitors-changed
+    // fires rarely (startup, hotplug), so one extra `xrandr` process per
+    // event is negligible either way, but there's no reason to run it
+    // once per connected monitor when one query already lists all of them.
+    let xrandrOutputs = _queryXrandrOutputs();
 
     for (let monitor of Main.layoutManager.monitors) {
-        let connector;
-        try {
-            connector = connectorForMonitorIndex(monitor.index);
-        } catch (e) {
-            log(`wp-linux: couldn't resolve connector for monitor ${monitor.index}: ${e}`);
-            connector = null;
-        }
+        let connector = connectorForMonitor(monitor, xrandrOutputs);
         if (!connector) {
-            log(`wp-linux: no connector found for monitor ${monitor.index} -- skipping it`);
+            log(`wp-linux: no xrandr output found for monitor ${monitor.index} at (${monitor.x},${monitor.y}) -- skipping it`);
             continue;
         }
 

@@ -108,15 +108,33 @@ running instance. Concretely unverified:
   displayed -- with no visible error, since Cinnamon extension `log()`
   goes to `~/.cinnamon/glass.log`, not necessarily the systemd journal.
   Found this way on the same real 6.6.4 machine above (wallpaper never
-  appeared, `journalctl | grep wp-linux` empty). Now uses
-  `global.display.get_monitor_name(index)` instead -- the same call
-  Cinnamon's own `js/ui/layout.js` uses internally to label monitors.
-  Still unverified: whether the string it returns matches
-  `wp_linux_editor`'s winit-derived monitor id byte-for-byte on every
-  driver/session combination the way the GNOME/KDE adapters' equivalents
-  do -- both are old-style Mutter/X11 RandR output names in principle, but
-  this hasn't been cross-checked against a live `wp_linux_editor` run on
-  the same machine yet.
+  appeared, `journalctl | grep wp-linux` empty).
+
+  The first replacement, `global.display.get_monitor_name(index)`, turned
+  out to be wrong too -- confirmed against real render-server logs on the
+  same machine, which showed geometry arriving under
+  `"Red Hat, Inc. 15\""` (an EDID vendor/model string, what
+  `get_monitor_name` actually returns) while `wp_linux_editor` had
+  separately registered the wallpaper project under `"Virtual-1"` (the
+  real RandR connector name, resolved via winit's own XRandR query) --
+  two different monitor ids for the same screen, so render-server never
+  matched them up. Checking the muffin release tag closest to this
+  Cinnamon version's `meta-monitor-manager.h` confirmed there's no
+  per-monitor object with a `get_connector()`-style accessor anywhere in
+  this Muffin generation -- only the reverse
+  `meta_monitor_manager_get_monitor_for_connector(connector)`, which
+  needs the connector name as input.
+
+  `connectorForMonitor` (renamed from `connectorForMonitorIndex`) now
+  shells out to `xrandr --query` and matches its per-output geometry
+  against `Main.layoutManager.monitors` by position -- the same source
+  winit's own X11 backend already resolves connector names from, so this
+  reaches the same ground truth `wp_linux_editor` used, just via the CLI.
+  X11-only (this Cinnamon session is X11; `xrandr` doesn't exist under
+  Wayland) and depends on the `xrandr` binary being present -- both true
+  for any X11 desktop Cinnamon realistically runs on today, but a
+  Wayland-session fallback would need a different approach if Cinnamon's
+  Wayland support matures enough to matter here.
 
 If something doesn't work: check `journalctl --user -b 0 | grep wp-linux`,
 the Extensions page in System Settings (a broken extension shows an error
