@@ -112,17 +112,50 @@ const MIN_POLL_INTERVAL_MS = 8;
 // Content-Length or risking a hang on an unexpected keep-alive.
 // -----------------------------------------------------------------
 
-/** Resolves with a Uint8Array of the response body on any 2xx status, or `null` on any failure (connection refused, timeout, non-2xx) -- every caller treats that uniformly as "try again next poll." */
+const HTTP_TIMEOUT_MS = 3000;
+
+/** Resolves with a Uint8Array of the response body on any 2xx status, or `null` on any failure (connection refused, timeout, non-2xx) -- every caller treats that uniformly as "try again next poll."
+ *
+ * Guarded by a hard `HTTP_TIMEOUT_MS` timeout via `Gio.Cancellable` --
+ * confirmed missing on real hardware caused a real hang: none of
+ * `connect_to_host_async`/`write_all_async`/`read_bytes_async` below had
+ * a cancellable or any other time bound, so a single stalled connection
+ * (render-server accepting but never responding/closing, a dropped
+ * packet, anything) left this Promise permanently unresolved --
+ * `MonitorLayer._pollInFlight`/`_frameInFlight` stayed `true` forever
+ * once that happened, permanently freezing that monitor's frame updates
+ * (and, since new frames stopped being fetched at all, cursor-reactive
+ * shaders too) while the rest of the desktop kept working normally, since
+ * nothing about this blocks the main loop itself. */
 function httpRequest(method, path, body) {
     return new Promise(resolve => {
+        let settled = false;
+        let cancellable = new Gio.Cancellable();
+        let timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, HTTP_TIMEOUT_MS, () => {
+            timeoutId = null;
+            cancellable.cancel();
+            return GLib.SOURCE_REMOVE;
+        });
+
+        function finish(result) {
+            if (settled)
+                return;
+            settled = true;
+            if (timeoutId) {
+                GLib.source_remove(timeoutId);
+                timeoutId = null;
+            }
+            resolve(result);
+        }
+
         let client = new Gio.SocketClient();
-        client.connect_to_host_async(RENDER_SERVER_HOST, RENDER_SERVER_PORT, null,
+        client.connect_to_host_async(RENDER_SERVER_HOST, RENDER_SERVER_PORT, cancellable,
             (source, result) => {
                 let connection;
                 try {
                     connection = client.connect_to_host_finish(result);
                 } catch (e) {
-                    resolve(null);
+                    finish(null);
                     return;
                 }
 
@@ -134,31 +167,31 @@ function httpRequest(method, path, body) {
                 requestBytes.set(bodyBytes, headBytes.length);
 
                 connection.get_output_stream().write_all_async(
-                    requestBytes, GLib.PRIORITY_DEFAULT, null,
+                    requestBytes, GLib.PRIORITY_DEFAULT, cancellable,
                     (stream, writeResult) => {
                         try {
                             stream.write_all_finish(writeResult);
                         } catch (e) {
                             connection.close(null);
-                            resolve(null);
+                            finish(null);
                             return;
                         }
-                        _readAll(connection.get_input_stream(), raw => {
+                        _readAll(connection.get_input_stream(), cancellable, raw => {
                             connection.close(null);
-                            resolve(_parseHttpResponse(raw));
+                            finish(_parseHttpResponse(raw));
                         });
                     });
             });
     });
 }
 
-/** Reads `inputStream` to EOF, calling `callback` with the accumulated bytes (a plain Uint8Array, concatenated once at the end since we don't know the total size up front). */
-function _readAll(inputStream, callback) {
+/** Reads `inputStream` to EOF, calling `callback` with the accumulated bytes (a plain Uint8Array, concatenated once at the end since we don't know the total size up front). `cancellable` is `httpRequest`'s per-call timeout guard -- a cancellation mid-read lands in the same `catch` as a real error and returns whatever was read so far, same as any other dropped connection; `_parseHttpResponse`'s status-code check and each caller's own validation (`JSON.parse`, frame decoding) already treat a malformed/truncated body as a failed attempt. */
+function _readAll(inputStream, cancellable, callback) {
     const CHUNK_SIZE = 65536;
     let chunks = [];
 
     function readNext() {
-        inputStream.read_bytes_async(CHUNK_SIZE, GLib.PRIORITY_DEFAULT, null,
+        inputStream.read_bytes_async(CHUNK_SIZE, GLib.PRIORITY_DEFAULT, cancellable,
             (stream, result) => {
                 let bytes;
                 try {
