@@ -285,15 +285,21 @@ function stopCursorForwarder() {
 // adapters/gnome/extension/monitorLayer.js's MonitorLayer.
 // -----------------------------------------------------------------
 
-/** Resolves the connector name (e.g. "DP-1", "eDP-1") for a `Main.layoutManager.monitors` index -- the same `wl_output`/RandR output name `wp_linux_editor` already uses as a monitor id (see its own `MonitorInfo` doc comment), so it can be used as render-server's `?monitor=` value with no translation. Identical in spirit to adapters/gnome/extension/extension.js's own `connectorForMonitorIndex` -- Muffin retains the same `MetaBackend`/`MetaMonitorManager` Mutter API GNOME Shell uses. */
+/** Resolves the connector name (e.g. "DP-1", "eDP-1") for a `Main.layoutManager.monitors` index -- the same `wl_output`/RandR output name `wp_linux_editor` already uses as a monitor id (see its own `MonitorInfo` doc comment), so it can be used as render-server's `?monitor=` value with no translation.
+ *
+ * Unlike adapters/gnome, this does NOT go through `global.backend` --
+ * `CinnamonGlobal` (src/cinnamon-global.c) never installs a `backend`
+ * property at all, so `global.backend` is `undefined` on every Cinnamon
+ * version and that call always threw here, silently, inside
+ * `_syncMonitors`'s own try/catch -- meaning no MonitorLayer was ever
+ * created and nothing displayed, with no visible error (Cinnamon's
+ * extension `log()` goes to ~/.cinnamon/glass.log, not necessarily the
+ * systemd journal). `global.display` (a real `MetaDisplay`, confirmed via
+ * cinnamon-global.c's property table) is the Cinnamon-native equivalent
+ * -- `get_monitor_name` is the same call `js/ui/layout.js` itself uses to
+ * label monitors, declared in muffin's src/meta/display.h. */
 function connectorForMonitorIndex(index) {
-    let monitorManager = global.backend.get_monitor_manager();
-    for (let monitor of monitorManager.get_monitors()) {
-        let connector = monitor.get_connector();
-        if (connector && monitorManager.get_monitor_for_connector(connector) === index)
-            return connector;
-    }
-    return null;
+    return global.display.get_monitor_name(index);
 }
 
 /** Finds the real background actor Muffin created for `monitor` (matched by position -- each monitor's own background actor is positioned at that monitor's origin) and returns its parent container, the insertion point our own actor should join as a sibling. See this file's top doc comment for why there's no dedicated `_backgroundGroup` to use directly. Falls back to the first background actor's parent if no exact position match is found, and to `global.window_group` if there are no background actors at all -- both fallbacks still land below every real window, just without the same guaranteed adjacency to Cinnamon's own background. */

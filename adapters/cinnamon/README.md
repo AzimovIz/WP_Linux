@@ -91,6 +91,24 @@ running instance. Concretely unverified:
   `cinnamon` package) -- `install.sh` now talks to the underlying
   `org.cinnamon` GSettings schema directly instead of assuming the tool
   exists, see below.
+- **Fixed:** `connectorForMonitorIndex` originally went through
+  `global.backend.get_monitor_manager()`, copying adapters/gnome's own
+  GNOME-Shell-specific call -- `CinnamonGlobal` never installs a `backend`
+  property (confirmed against `src/cinnamon-global.c`) so this threw on
+  every monitor, every time, caught silently by `_syncMonitors`'s own
+  try/catch, meaning no `MonitorLayer` was ever created and nothing
+  displayed -- with no visible error, since Cinnamon extension `log()`
+  goes to `~/.cinnamon/glass.log`, not necessarily the systemd journal.
+  Found this way on the same real 6.6.4 machine above (wallpaper never
+  appeared, `journalctl | grep wp-linux` empty). Now uses
+  `global.display.get_monitor_name(index)` instead -- the same call
+  Cinnamon's own `js/ui/layout.js` uses internally to label monitors.
+  Still unverified: whether the string it returns matches
+  `wp_linux_editor`'s winit-derived monitor id byte-for-byte on every
+  driver/session combination the way the GNOME/KDE adapters' equivalents
+  do -- both are old-style Mutter/X11 RandR output names in principle, but
+  this hasn't been cross-checked against a live `wp_linux_editor` run on
+  the same machine yet.
 
 If something doesn't work: check `journalctl --user -b 0 | grep wp-linux`,
 the Extensions page in System Settings (a broken extension shows an error
