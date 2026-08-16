@@ -13,6 +13,7 @@
 
 mod autostart;
 mod library;
+mod shaders_library;
 mod monitors_config;
 mod push;
 mod trust_store;
@@ -2939,8 +2940,71 @@ fn show_effect_kind_panel(ui: &mut eframe::egui::Ui, kind: &mut EditorEffectKind
     }
 }
 
-/// `Shader` effect's own panel -- a `path_picker` for its `.wgsl` asset,
-/// plus one widget per parameter it declares. Re-reads and re-parses
+/// "Select" (bundled-library dropdown) + "Browse..." (arbitrary file) row
+/// for a `Shader` effect's `wgsl_path`. Both just assign into `wgsl_path`
+/// -- `show_shader_effect_panel` below can't tell, and doesn't need to,
+/// which one a given path came from.
+fn show_shader_path_picker(ui: &mut eframe::egui::Ui, wgsl_path: &mut Option<PathBuf>) {
+    ui.horizontal(|ui| {
+        ui.label("Shader:");
+
+        // Scanned fresh every frame this row is shown -- a handful of
+        // files, same "recompute, don't cache" call `library::scan` and
+        // this panel's own param re-parse below already make.
+        let entries = shaders_library::scan();
+        let selected_entry = entries.iter().find(|e| Some(&e.path) == wgsl_path.as_ref());
+        let selected_text = selected_entry
+            .map(|e| e.name.clone())
+            .or_else(|| {
+                wgsl_path
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| "Select...".to_string());
+        eframe::egui::ComboBox::from_id_salt("shader-library-select")
+            .selected_text(selected_text)
+            .show_ui(ui, |ui| {
+                if entries.is_empty() {
+                    ui.weak("No bundled shaders installed");
+                }
+                for entry in &entries {
+                    let is_selected = Some(entry) == selected_entry;
+                    if ui.selectable_label(is_selected, &entry.name).clicked() {
+                        *wgsl_path = Some(entry.path.clone());
+                    }
+                }
+            });
+        ui.label("or");
+        if ui.button("Browse...").clicked()
+            && let Some(chosen) = rfd::FileDialog::new()
+                .add_filter("Files", &["wgsl"])
+                .pick_file()
+        {
+            *wgsl_path = Some(chosen);
+        }
+    });
+
+    let name = wgsl_path
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "not set".to_string());
+    let response = ui.add(eframe::egui::Label::new(name).truncate());
+    if let Some(p) = wgsl_path {
+        response.on_hover_text(p.display().to_string());
+    }
+}
+
+/// `Shader` effect's own panel -- a picker for its `.wgsl` asset, plus one
+/// widget per parameter it declares. The picker is two ways to reach the
+/// same `wgsl_path`, not two different things: "Select" lists whatever is
+/// installed under `shaders_library::shaders_root()` (the bundled
+/// library), "Browse..." is the same `rfd` file dialog every other asset
+/// picker in this file uses -- see `path_picker`, not reused directly
+/// here since it always renders its own "Browse..." button and this panel
+/// needs a second widget in front of it. Re-reads and re-parses
 /// `wgsl_path`'s file (via `project_format::parse_shader_params`) every
 /// single frame this panel is shown, rather than caching the parsed
 /// param list anywhere on `EditorEffectKind` -- the same "recompute, don't
@@ -2957,7 +3021,7 @@ fn show_shader_effect_panel(
     wgsl_path: &mut Option<PathBuf>,
     params: &mut Vec<f32>,
 ) {
-    path_picker(ui, "WGSL file:", wgsl_path, &["wgsl"]);
+    show_shader_path_picker(ui, wgsl_path);
 
     let Some(path) = wgsl_path.as_ref() else {
         ui.colored_label(
