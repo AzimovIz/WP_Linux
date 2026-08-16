@@ -13,9 +13,9 @@
 
 mod autostart;
 mod library;
-mod shaders_library;
 mod monitors_config;
 mod push;
+mod shaders_library;
 mod trust_store;
 
 use std::collections::HashMap;
@@ -445,7 +445,9 @@ impl EditorEffectKind {
                 contrast: *contrast,
                 saturation: *saturation,
             },
-            EditorEffectKind::Blur { radius } => project_format::EffectKind::Blur { radius: *radius },
+            EditorEffectKind::Blur { radius } => {
+                project_format::EffectKind::Blur { radius: *radius }
+            }
             EditorEffectKind::Smoke {
                 color,
                 decay,
@@ -598,9 +600,7 @@ fn editor_effects_from_project(
                     contrast,
                     saturation,
                 },
-                project_format::EffectKind::Blur { radius } => {
-                    EditorEffectKind::Blur { radius }
-                }
+                project_format::EffectKind::Blur { radius } => EditorEffectKind::Blur { radius },
                 project_format::EffectKind::Smoke {
                     color,
                     decay,
@@ -682,7 +682,9 @@ impl EditorLayer {
                 overlay,
                 effects,
                 ..
-            } => base.is_some() && overlay.is_some() && effects.iter().all(EditorEffect::is_complete),
+            } => {
+                base.is_some() && overlay.is_some() && effects.iter().all(EditorEffect::is_complete)
+            }
             EditorLayer::Gif { path, effects } => {
                 path.is_some() && effects.iter().all(EditorEffect::is_complete)
             }
@@ -951,7 +953,9 @@ impl Preview {
         let scale = self.width as f32 / natural_width.max(1) as f32;
         for (loaded, editor_layer) in self.layers.iter_mut().zip(editor_layers) {
             match editor_layer {
-                EditorLayer::Xray { radius, effects, .. } => {
+                EditorLayer::Xray {
+                    radius, effects, ..
+                } => {
                     loaded.set_xray_radius(*radius * scale);
                     sync_effect_params(loaded, &self.renderer.queue, effects);
                 }
@@ -1037,7 +1041,11 @@ fn sync_effect_params(loaded: &mut LoadedLayer, queue: &wgpu::Queue, effects: &[
 /// already be the same length and in the same order (true right after
 /// `SceneRenderer::load_scene` builds `layers` from `editor_layers` via
 /// `build_preview_project`).
-fn restore_painted_masks(layers: &[LoadedLayer], editor_layers: &[EditorLayer], queue: &wgpu::Queue) {
+fn restore_painted_masks(
+    layers: &[LoadedLayer],
+    editor_layers: &[EditorLayer],
+    queue: &wgpu::Queue,
+) {
     for (layer, editor_layer) in layers.iter().zip(editor_layers) {
         let Some(effects) = editor_layer.effects() else {
             continue;
@@ -1268,6 +1276,20 @@ struct EditorApp {
     library: Vec<library::LibraryEntry>,
     /// Lazily-loaded preview textures, keyed by each entry's `preview_path`.
     thumbnails: HashMap<PathBuf, eframe::egui::TextureHandle>,
+    /// Lazily-decoded Shift+hover previews for the shader library picker
+    /// (`show_shader_path_picker`), keyed by each shader's `.gif` path --
+    /// same lazy-cache shape as `thumbnails` just above, except a lookup
+    /// can genuinely have no answer (`None`: tried, no `.gif` next to
+    /// that `.wgsl` yet) rather than always falling back to a
+    /// placeholder texture like `thumbnails` does. Threaded down through
+    /// `show_layer_panel` -> the five per-kind panels with an effects
+    /// stack -> `show_effects_panel` -> `show_effect_kind_panel` ->
+    /// `show_shader_effect_panel` -> `show_shader_path_picker`, the same
+    /// way `selected_effect` already is -- kept on `EditorApp` rather
+    /// than in egui's own per-`Id` temp storage so this cache follows the
+    /// same one established pattern (`thumbnails`) instead of adding a
+    /// second, different way of caching UI-adjacent state.
+    shader_previews: HashMap<PathBuf, Option<ShaderPreviewAnimation>>,
     /// Mirrors whether `autostart::desktop_file_path()` currently exists --
     /// read once at startup, then only ever changed by the checkbox itself
     /// (see `show_wallpapers_tab`), never re-polled from disk every frame.
@@ -1323,6 +1345,7 @@ impl Default for EditorApp {
             assignments: monitors_config::load(),
             library: library::scan(),
             thumbnails: HashMap::new(),
+            shader_previews: HashMap::new(),
             autostart_enabled: autostart::is_enabled(),
             pusher: Box::new(TcpPusher),
             apply_overlay: None,
@@ -1445,9 +1468,7 @@ impl EditorApp {
     /// close button and F1 both just flip `show_about` and this picks it
     /// up next frame either way.
     fn show_about_window(&mut self, ctx: &eframe::egui::Context) {
-        let icon = self
-            .about_icon
-            .get_or_insert_with(|| load_about_icon(ctx));
+        let icon = self.about_icon.get_or_insert_with(|| load_about_icon(ctx));
         let icon_id = icon.id();
 
         let mut open = self.show_about;
@@ -1600,8 +1621,7 @@ impl EditorApp {
 
         ui.vertical(|ui| {
             ui.set_width(tile_size.x);
-            let (rect, response) =
-                ui.allocate_exact_size(tile_size, eframe::egui::Sense::hover());
+            let (rect, response) = ui.allocate_exact_size(tile_size, eframe::egui::Sense::hover());
 
             if let Some(preview_path) = &entry.preview_path {
                 let texture = self
@@ -2090,7 +2110,11 @@ impl EditorApp {
         // the layer list above already shows which one's selected, so
         // repeating it on its own line was just extra vertical space
         // for no new information.
-        ui.heading(format!("Layer settings \u{2014} #{} {}", index + 1, layer.label()));
+        ui.heading(format!(
+            "Layer settings \u{2014} #{} {}",
+            index + 1,
+            layer.label()
+        ));
         ui.add_space(2.0);
         ui.separator();
         ui.add_space(2.0);
@@ -2103,7 +2127,12 @@ impl EditorApp {
             .id_salt("layer_settings_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                show_layer_panel(ui, layer, &mut self.selected_effect);
+                show_layer_panel(
+                    ui,
+                    layer,
+                    &mut self.selected_effect,
+                    &mut self.shader_previews,
+                );
             });
     }
 
@@ -2266,8 +2295,9 @@ impl EditorApp {
             // font_size sliders: drag anywhere inside it to move, drag
             // the small handle at its top-right corner to resize.
             if let Some(index) = self.selected
-                && let Some(EditorLayer::Text { x, y, font_size, .. }) =
-                    self.layers.get_mut(index)
+                && let Some(EditorLayer::Text {
+                    x, y, font_size, ..
+                }) = self.layers.get_mut(index)
             {
                 // Screen-space top-left corner -- `response.rect` rescaled
                 // by (x, y), both already the same normalized 0.0..=1.0
@@ -2337,8 +2367,8 @@ impl EditorApp {
                     .on_hover_text("Drag to change font size");
                 if handle_response.dragged() {
                     let delta = handle_response.drag_delta();
-                    *font_size = (*font_size + delta.y / response.rect.height().max(1.0))
-                        .clamp(0.01, 0.5);
+                    *font_size =
+                        (*font_size + delta.y / response.rect.height().max(1.0)).clamp(0.01, 0.5);
                 }
 
                 let color = if body_response.dragged() || handle_response.dragged() {
@@ -2403,8 +2433,7 @@ impl EditorApp {
                         if let Some(pos) = paint_interact.interact_pointer_pos() {
                             let uv = (
                                 (pos.x - response.rect.min.x) / response.rect.width().max(1.0),
-                                (pos.y - response.rect.min.y)
-                                    / response.rect.height().max(1.0),
+                                (pos.y - response.rect.min.y) / response.rect.height().max(1.0),
                             );
                             let erase = ui.input(|i| i.modifiers.shift);
                             stamp_paint_buffer(
@@ -2534,8 +2563,8 @@ fn show_circle_mask_gizmo(
     if edge_response.dragged() {
         let delta = edge_response.drag_delta();
         let new_screen_radius = (screen_radius + delta.x).max(1.0);
-        transform.scale = ((new_screen_radius / response.rect.height().max(1.0)) * 2.0)
-            .clamp(0.05, 3.0);
+        transform.scale =
+            ((new_screen_radius / response.rect.height().max(1.0)) * 2.0).clamp(0.05, 3.0);
     }
 
     let color = if center_response.dragged() || edge_response.dragged() {
@@ -2583,7 +2612,8 @@ fn show_gradient_mask_gizmo(
     };
     let position_uv = eframe::egui::vec2(transform.x, transform.y);
     let angle_rad = transform.rotation.to_radians();
-    let end_uv = position_uv + eframe::egui::vec2(angle_rad.cos(), angle_rad.sin()) * transform.scale;
+    let end_uv =
+        position_uv + eframe::egui::vec2(angle_rad.cos(), angle_rad.sin()) * transform.scale;
 
     let center = to_screen(position_uv);
     let end_pos = to_screen(end_uv);
@@ -2627,10 +2657,8 @@ fn show_gradient_mask_gizmo(
     } else {
         eframe::egui::Color32::WHITE
     };
-    ui.painter().line_segment(
-        [center, end_pos],
-        eframe::egui::Stroke::new(1.5, color),
-    );
+    ui.painter()
+        .line_segment([center, end_pos], eframe::egui::Stroke::new(1.5, color));
     ui.painter().circle_filled(center, 4.0, color);
     ui.painter().circle_filled(end_pos, 4.0, color);
 }
@@ -2642,24 +2670,43 @@ fn show_layer_panel(
     ui: &mut eframe::egui::Ui,
     layer: &mut EditorLayer,
     selected_effect: &mut Option<usize>,
+    shader_previews: &mut HashMap<PathBuf, Option<ShaderPreviewAnimation>>,
 ) {
     match layer {
         EditorLayer::Image { path, effects } => {
-            show_image_panel(ui, path, effects, selected_effect)
+            show_image_panel(ui, path, effects, selected_effect, shader_previews)
         }
         EditorLayer::Xray {
             base,
             overlay,
             radius,
             effects,
-        } => show_xray_panel(ui, base, overlay, radius, effects, selected_effect),
-        EditorLayer::Gif { path, effects } => show_gif_panel(ui, path, effects, selected_effect),
+        } => show_xray_panel(
+            ui,
+            base,
+            overlay,
+            radius,
+            effects,
+            selected_effect,
+            shader_previews,
+        ),
+        EditorLayer::Gif { path, effects } => {
+            show_gif_panel(ui, path, effects, selected_effect, shader_previews)
+        }
         EditorLayer::Parallax {
             path,
             strength,
             smoothing,
             effects,
-        } => show_parallax_panel(ui, path, strength, smoothing, effects, selected_effect),
+        } => show_parallax_panel(
+            ui,
+            path,
+            strength,
+            smoothing,
+            effects,
+            selected_effect,
+            shader_previews,
+        ),
         EditorLayer::Text {
             x,
             y,
@@ -2668,7 +2715,9 @@ fn show_layer_panel(
             source,
             font,
         } => show_text_panel(ui, x, y, font_size, color, source, font),
-        EditorLayer::Adjustment { effects } => show_adjustment_panel(ui, effects, selected_effect),
+        EditorLayer::Adjustment { effects } => {
+            show_adjustment_panel(ui, effects, selected_effect, shader_previews)
+        }
     }
 }
 
@@ -2677,9 +2726,10 @@ fn show_image_panel(
     path: &mut Option<PathBuf>,
     effects: &mut Vec<EditorEffect>,
     selected_effect: &mut Option<usize>,
+    shader_previews: &mut HashMap<PathBuf, Option<ShaderPreviewAnimation>>,
 ) {
     path_picker(ui, "Picture", path, &["png", "jpg", "jpeg", "webp"]);
-    show_effects_panel(ui, effects, selected_effect);
+    show_effects_panel(ui, effects, selected_effect, shader_previews);
 }
 
 /// No path/other fields to show -- an Adjustment layer is entirely its
@@ -2691,9 +2741,10 @@ fn show_adjustment_panel(
     ui: &mut eframe::egui::Ui,
     effects: &mut Vec<EditorEffect>,
     selected_effect: &mut Option<usize>,
+    shader_previews: &mut HashMap<PathBuf, Option<ShaderPreviewAnimation>>,
 ) {
     ui.label("Applies to everything below this layer in the list.");
-    show_effects_panel(ui, effects, selected_effect);
+    show_effects_panel(ui, effects, selected_effect, shader_previews);
 }
 
 fn show_xray_panel(
@@ -2703,6 +2754,7 @@ fn show_xray_panel(
     radius: &mut f32,
     effects: &mut Vec<EditorEffect>,
     selected_effect: &mut Option<usize>,
+    shader_previews: &mut HashMap<PathBuf, Option<ShaderPreviewAnimation>>,
 ) {
     path_picker(ui, "Base picture", base, &["png", "jpg", "jpeg", "webp"]);
     path_picker(
@@ -2712,7 +2764,7 @@ fn show_xray_panel(
         &["png", "jpg", "jpeg", "webp"],
     );
     labeled_slider(ui, "Radius (px):", radius, 20.0..=800.0);
-    show_effects_panel(ui, effects, selected_effect);
+    show_effects_panel(ui, effects, selected_effect, shader_previews);
 }
 
 fn show_gif_panel(
@@ -2720,9 +2772,10 @@ fn show_gif_panel(
     path: &mut Option<PathBuf>,
     effects: &mut Vec<EditorEffect>,
     selected_effect: &mut Option<usize>,
+    shader_previews: &mut HashMap<PathBuf, Option<ShaderPreviewAnimation>>,
 ) {
     path_picker(ui, "Gif file", path, &["gif"]);
-    show_effects_panel(ui, effects, selected_effect);
+    show_effects_panel(ui, effects, selected_effect, shader_previews);
 }
 
 fn show_parallax_panel(
@@ -2732,6 +2785,7 @@ fn show_parallax_panel(
     smoothing: &mut f32,
     effects: &mut Vec<EditorEffect>,
     selected_effect: &mut Option<usize>,
+    shader_previews: &mut HashMap<PathBuf, Option<ShaderPreviewAnimation>>,
 ) {
     path_picker(
         ui,
@@ -2741,10 +2795,9 @@ fn show_parallax_panel(
     );
     labeled_slider(ui, "Strength:", strength, -0.4..=0.4)
         .on_hover_text("How far the layer pans at the screen edge, as a fraction of its own size. Negative pans towards the cursor instead of away from it.");
-    labeled_slider(ui, "Smoothing (s):", smoothing, 0.0..=1.0).on_hover_text(
-        "How long the pan takes to ease towards the cursor. 0 = track instantly.",
-    );
-    show_effects_panel(ui, effects, selected_effect);
+    labeled_slider(ui, "Smoothing (s):", smoothing, 0.0..=1.0)
+        .on_hover_text("How long the pan takes to ease towards the cursor. 0 = track instantly.");
+    show_effects_panel(ui, effects, selected_effect, shader_previews);
 }
 
 /// Add/remove/reorder/configure a layer's post-processing stack --
@@ -2757,6 +2810,7 @@ fn show_effects_panel(
     ui: &mut eframe::egui::Ui,
     effects: &mut Vec<EditorEffect>,
     selected_effect: &mut Option<usize>,
+    shader_previews: &mut HashMap<PathBuf, Option<ShaderPreviewAnimation>>,
 ) {
     ui.add_space(2.0);
     ui.separator();
@@ -2822,41 +2876,52 @@ fn show_effects_panel(
 
     for (index, effect) in effects.iter_mut().enumerate() {
         ui.add_space(2.0);
-        ui.group(|ui| {
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut effect.enabled, "");
-                let label = format!("#{} {}", index + 1, effect_kind_label(&effect.kind));
-                // Selectable, not just a label -- clicking it is how
-                // `selected_effect` gets set, which drives the mask
-                // gizmo on the preview (Circle/Gradient only -- see
-                // `show_preview_content`), same pattern as the layer
-                // list's own selectable rows driving `selected`.
-                if ui
-                    .selectable_label(*selected_effect == Some(index), label)
-                    .on_hover_text("Select to edit this effect's mask on the preview")
-                    .clicked()
-                {
-                    *selected_effect = Some(index);
-                }
-                ui.with_layout(
-                    eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
-                    |ui| {
-                        if ui.small_button("remove").clicked() {
-                            remove = Some(index);
-                        }
-                        if ui.small_button("down").clicked() {
-                            move_down = Some(index);
-                        }
-                        if ui.small_button("up").clicked() {
-                            move_up = Some(index);
-                        }
-                    },
-                );
+        // Every widget inside this closure that egui gives persistent
+        // identity to (right now: the Shader effect's "Select" combo box
+        // -- see `show_shader_path_picker`) would otherwise collide
+        // between two effects of the same kind in the same list: both
+        // calls build their `Id` from the same literal salt string, so
+        // without this, opening one Shader effect's dropdown could open
+        // (or fail to open) another's instead. `push_id` folds `index`
+        // into every such `Id` computed inside, the standard egui fix
+        // for "this widget-producing code runs more than once per frame".
+        ui.push_id(index, |ui| {
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut effect.enabled, "");
+                    let label = format!("#{} {}", index + 1, effect_kind_label(&effect.kind));
+                    // Selectable, not just a label -- clicking it is how
+                    // `selected_effect` gets set, which drives the mask
+                    // gizmo on the preview (Circle/Gradient only -- see
+                    // `show_preview_content`), same pattern as the layer
+                    // list's own selectable rows driving `selected`.
+                    if ui
+                        .selectable_label(*selected_effect == Some(index), label)
+                        .on_hover_text("Select to edit this effect's mask on the preview")
+                        .clicked()
+                    {
+                        *selected_effect = Some(index);
+                    }
+                    ui.with_layout(
+                        eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
+                        |ui| {
+                            if ui.small_button("remove").clicked() {
+                                remove = Some(index);
+                            }
+                            if ui.small_button("down").clicked() {
+                                move_down = Some(index);
+                            }
+                            if ui.small_button("up").clicked() {
+                                move_up = Some(index);
+                            }
+                        },
+                    );
+                });
+                ui.add_space(2.0);
+                show_effect_kind_panel(ui, &mut effect.kind, shader_previews);
+                ui.add_space(2.0);
+                show_mask_panel(ui, &mut effect.mask, selected_effect, index);
             });
-            ui.add_space(2.0);
-            show_effect_kind_panel(ui, &mut effect.kind);
-            ui.add_space(2.0);
-            show_mask_panel(ui, &mut effect.mask, selected_effect, index);
         });
     }
 
@@ -2902,7 +2967,11 @@ fn effect_kind_label(kind: &EditorEffectKind) -> &'static str {
     }
 }
 
-fn show_effect_kind_panel(ui: &mut eframe::egui::Ui, kind: &mut EditorEffectKind) {
+fn show_effect_kind_panel(
+    ui: &mut eframe::egui::Ui,
+    kind: &mut EditorEffectKind,
+    shader_previews: &mut HashMap<PathBuf, Option<ShaderPreviewAnimation>>,
+) {
     match kind {
         EditorEffectKind::Vignette { strength, softness } => {
             labeled_slider(ui, "Strength:", strength, 0.0..=1.0);
@@ -2935,7 +3004,7 @@ fn show_effect_kind_panel(ui: &mut eframe::egui::Ui, kind: &mut EditorEffectKind
             labeled_slider(ui, "Splat radius:", radius, 0.0..=0.3);
         }
         EditorEffectKind::Shader { wgsl_path, params } => {
-            show_shader_effect_panel(ui, wgsl_path, params);
+            show_shader_effect_panel(ui, wgsl_path, params, shader_previews);
         }
     }
 }
@@ -2944,7 +3013,20 @@ fn show_effect_kind_panel(ui: &mut eframe::egui::Ui, kind: &mut EditorEffectKind
 /// for a `Shader` effect's `wgsl_path`. Both just assign into `wgsl_path`
 /// -- `show_shader_effect_panel` below can't tell, and doesn't need to,
 /// which one a given path came from.
-fn show_shader_path_picker(ui: &mut eframe::egui::Ui, wgsl_path: &mut Option<PathBuf>) {
+///
+/// Holding Shift while hovering a library entry shows an animated preview
+/// (that entry's `.gif`, generated by the `shader-preview` dev tool and
+/// expected to sit right next to the `.wgsl` file -- see that crate's
+/// module doc comment) instead of just its name. Shift-gated rather than
+/// always-on so briefly moving the mouse across the whole list while
+/// picking doesn't decode/upload a texture for every entry it passes
+/// over -- only the one the user deliberately holds still (and holds
+/// Shift) on.
+fn show_shader_path_picker(
+    ui: &mut eframe::egui::Ui,
+    wgsl_path: &mut Option<PathBuf>,
+    shader_previews: &mut HashMap<PathBuf, Option<ShaderPreviewAnimation>>,
+) {
     ui.horizontal(|ui| {
         ui.label("Shader:");
 
@@ -2970,9 +3052,11 @@ fn show_shader_path_picker(ui: &mut eframe::egui::Ui, wgsl_path: &mut Option<Pat
                 }
                 for entry in &entries {
                     let is_selected = Some(entry) == selected_entry;
-                    if ui.selectable_label(is_selected, &entry.name).clicked() {
+                    let response = ui.selectable_label(is_selected, &entry.name);
+                    if response.clicked() {
                         *wgsl_path = Some(entry.path.clone());
                     }
+                    show_shader_hover_preview(&response, &entry.path, shader_previews);
                 }
             });
         ui.label("or");
@@ -2995,6 +3079,47 @@ fn show_shader_path_picker(ui: &mut eframe::egui::Ui, wgsl_path: &mut Option<Pat
     if let Some(p) = wgsl_path {
         response.on_hover_text(p.display().to_string());
     }
+}
+
+/// Shift+hover tooltip for one shader-library row -- plain text hint
+/// while Shift is up (so the feature is discoverable at all), the
+/// decoded `.gif` looping next to `wgsl_path` once it's held down.
+/// `shader_previews` is looked up by the `.gif` path, not `wgsl_path`
+/// itself, purely so the map's key type matches what's actually decoded.
+fn show_shader_hover_preview(
+    response: &eframe::egui::Response,
+    wgsl_path: &Path,
+    shader_previews: &mut HashMap<PathBuf, Option<ShaderPreviewAnimation>>,
+) {
+    response.clone().on_hover_ui_at_pointer(|ui| {
+        if !ui.input(|i| i.modifiers.shift) {
+            ui.weak("Hold Shift to preview");
+            return;
+        }
+        let gif_path = wgsl_path.with_extension("gif");
+        let time = ui.input(|i| i.time);
+        let ctx = ui.ctx().clone();
+        let loaded = shader_previews
+            .entry(gif_path.clone())
+            .or_insert_with(|| ShaderPreviewAnimation::load(&ctx, &gif_path));
+        match loaded {
+            Some(anim) => {
+                let (texture_id, size) = anim.current_frame(time);
+                ui.image(eframe::egui::load::SizedTexture::new(
+                    texture_id,
+                    eframe::egui::vec2(size[0] as f32, size[1] as f32),
+                ));
+                // Keeps the animation advancing while the tooltip is open
+                // -- without this, egui would only repaint on input
+                // events and the preview would sit on whichever frame
+                // happened to be current when the mouse stopped moving.
+                ui.ctx().request_repaint();
+            }
+            None => {
+                ui.weak("No preview generated for this shader yet.");
+            }
+        }
+    });
 }
 
 /// `Shader` effect's own panel -- a picker for its `.wgsl` asset, plus one
@@ -3020,8 +3145,9 @@ fn show_shader_effect_panel(
     ui: &mut eframe::egui::Ui,
     wgsl_path: &mut Option<PathBuf>,
     params: &mut Vec<f32>,
+    shader_previews: &mut HashMap<PathBuf, Option<ShaderPreviewAnimation>>,
 ) {
-    show_shader_path_picker(ui, wgsl_path);
+    show_shader_path_picker(ui, wgsl_path, shader_previews);
 
     let Some(path) = wgsl_path.as_ref() else {
         ui.colored_label(
@@ -3152,11 +3278,7 @@ fn show_mask_panel(
             );
             ui.checkbox(invert, "Invert");
             ui.horizontal(|ui| {
-                let label = if *painting {
-                    "Stop painting"
-                } else {
-                    "Paint"
-                };
+                let label = if *painting { "Stop painting" } else { "Paint" };
                 if ui.button(label).clicked() {
                     if !*painting && paint.is_none() {
                         // First time entering paint mode on this mask --
@@ -3229,10 +3351,14 @@ fn load_paint_buffer_from_file(path: &Path) -> Result<Vec<u8>, String> {
 /// starts) and `stage_effect` (refreshing that file from the live buffer
 /// right before it gets staged into the saved project).
 fn save_paint_buffer_png(buffer: &[u8], path: &Path) -> Result<(), String> {
-    image::GrayImage::from_raw(PAINT_MASK_RESOLUTION, PAINT_MASK_RESOLUTION, buffer.to_vec())
-        .ok_or_else(|| "paint buffer size doesn't match PAINT_MASK_RESOLUTION".to_string())?
-        .save(path)
-        .map_err(|e| e.to_string())
+    image::GrayImage::from_raw(
+        PAINT_MASK_RESOLUTION,
+        PAINT_MASK_RESOLUTION,
+        buffer.to_vec(),
+    )
+    .ok_or_else(|| "paint buffer size doesn't match PAINT_MASK_RESOLUTION".to_string())?
+    .save(path)
+    .map_err(|e| e.to_string())
 }
 
 /// A fresh, never-before-used path under the system temp dir for a
@@ -3346,7 +3472,12 @@ fn show_transform_panel(ui: &mut eframe::egui::Ui, transform: &mut project_forma
     labeled_slider(ui, "X:", &mut transform.x, 0.0..=1.0);
     labeled_slider(ui, "Y:", &mut transform.y, 0.0..=1.0);
     labeled_slider(ui, "Scale:", &mut transform.scale, 0.05..=3.0);
-    labeled_slider(ui, "Rotation (\u{b0}):", &mut transform.rotation, 0.0..=360.0);
+    labeled_slider(
+        ui,
+        "Rotation (\u{b0}):",
+        &mut transform.rotation,
+        0.0..=360.0,
+    );
 }
 
 fn show_text_panel(
@@ -3598,6 +3729,103 @@ fn load_thumbnail_texture(ctx: &eframe::egui::Context, path: &Path) -> eframe::e
         color_image,
         eframe::egui::TextureOptions::default(),
     )
+}
+
+/// A fully-decoded shader-preview `.gif` (see `shaders_library`'s module
+/// doc comment and the `shader-preview` crate that generates these
+/// files), cached by `show_shader_hover_preview` for the lifetime of the
+/// `EditorApp`. Holds every decoded frame in CPU memory (a preview is
+/// small -- a couple hundred KB at most) but only ever uploads one GPU
+/// texture, reused frame to frame via `TextureHandle::set` -- the
+/// alternative (one texture per decoded frame) would multiply GPU memory
+/// by the frame count for no benefit, since only one frame is ever on
+/// screen at a time.
+struct ShaderPreviewAnimation {
+    /// Each decoded frame alongside its own delay in milliseconds, in
+    /// playback order.
+    frames: Vec<(eframe::egui::ColorImage, u64)>,
+    /// Sum of every frame's delay -- the loop period `current_frame`
+    /// wraps playback time against.
+    total_delay_ms: u64,
+    texture: eframe::egui::TextureHandle,
+}
+
+impl ShaderPreviewAnimation {
+    /// Decodes `gif_path` in full -- `None` if it doesn't exist yet (no
+    /// preview generated for this shader) or fails to decode, either of
+    /// which `show_shader_hover_preview` treats as "nothing to show",
+    /// not an error dialog: a missing preview is an expected, common
+    /// state (most shaders won't have one until `shader-preview` has been
+    /// run for them), not a broken one.
+    fn load(ctx: &eframe::egui::Context, gif_path: &Path) -> Option<Self> {
+        use image::AnimationDecoder;
+
+        let file = std::fs::File::open(gif_path).ok()?;
+        let decoder = image::codecs::gif::GifDecoder::new(std::io::BufReader::new(file)).ok()?;
+        let decoded_frames = decoder.into_frames().collect_frames().ok()?;
+        if decoded_frames.is_empty() {
+            return None;
+        }
+
+        // Same delay-in-ms extraction (and the same zero-denominator/
+        // too-small-delay guards) as `player`'s own `decode_gif` --
+        // kept in sync by inspection, not by sharing code, since this
+        // crate doesn't otherwise depend on `player`'s GIF handling.
+        let frames: Vec<(eframe::egui::ColorImage, u64)> = decoded_frames
+            .into_iter()
+            .map(|frame| {
+                let (numer, denom) = frame.delay().numer_denom_ms();
+                let delay_ms = if denom == 0 {
+                    100
+                } else {
+                    (numer / denom).max(20) as u64
+                };
+                let buffer = frame.into_buffer();
+                let size = [buffer.width() as usize, buffer.height() as usize];
+                let color_image =
+                    eframe::egui::ColorImage::from_rgba_unmultiplied(size, buffer.as_raw());
+                (color_image, delay_ms)
+            })
+            .collect();
+        let total_delay_ms = frames
+            .iter()
+            .map(|(_, delay_ms)| delay_ms)
+            .sum::<u64>()
+            .max(1);
+
+        let texture = ctx.load_texture(
+            gif_path.display().to_string(),
+            frames[0].0.clone(),
+            eframe::egui::TextureOptions::default(),
+        );
+        Some(Self {
+            frames,
+            total_delay_ms,
+            texture,
+        })
+    }
+
+    /// Picks whichever frame `time_seconds` (looped over the animation's
+    /// own duration, so any caller-chosen time origin works -- this uses
+    /// `ui.input(|i| i.time)`, egui's own animation clock) falls into,
+    /// uploads it into the one shared texture, and returns what to paint.
+    fn current_frame(&mut self, time_seconds: f64) -> (eframe::egui::TextureId, [usize; 2]) {
+        let elapsed_ms = ((time_seconds * 1000.0) as u64) % self.total_delay_ms;
+        let mut remaining = elapsed_ms;
+        let mut index = 0;
+        for (i, (_, delay_ms)) in self.frames.iter().enumerate() {
+            index = i;
+            if remaining < *delay_ms {
+                break;
+            }
+            remaining -= delay_ms;
+        }
+
+        let (frame, _) = &self.frames[index];
+        self.texture
+            .set(frame.clone(), eframe::egui::TextureOptions::default());
+        (self.texture.id(), frame.size)
+    }
 }
 
 /// A `Slider` that also responds to the mouse wheel while hovered, as a
@@ -4070,8 +4298,14 @@ mod tests {
         let center = buffer[(32 * resolution + 32) as usize];
         let corner = buffer[0];
 
-        assert_eq!(center, 255, "the stamp's own center should be full strength");
-        assert_eq!(corner, 0, "a far corner outside the brush radius should stay untouched");
+        assert_eq!(
+            center, 255,
+            "the stamp's own center should be full strength"
+        );
+        assert_eq!(
+            corner, 0,
+            "a far corner outside the brush radius should stay untouched"
+        );
     }
 
     /// Painting twice over the same spot must not push the value past
@@ -4151,9 +4385,8 @@ mod tests {
         let loaded = load_paint_buffer_from_file(&path).expect("load should succeed");
 
         assert_eq!(loaded.len(), buffer.len());
-        let center_index =
-            ((PAINT_MASK_RESOLUTION / 2) * PAINT_MASK_RESOLUTION + PAINT_MASK_RESOLUTION / 2)
-                as usize;
+        let center_index = ((PAINT_MASK_RESOLUTION / 2) * PAINT_MASK_RESOLUTION
+            + PAINT_MASK_RESOLUTION / 2) as usize;
         assert_eq!(loaded[center_index], 255);
     }
 
@@ -4267,7 +4500,10 @@ mod tests {
                     EditorEffectKind::Vignette { strength, .. } if strength == 0.5
                 ));
             }
-            other => panic!("expected EditorLayer::Adjustment, got a different variant: {}", other.label()),
+            other => panic!(
+                "expected EditorLayer::Adjustment, got a different variant: {}",
+                other.label()
+            ),
         }
 
         std::fs::remove_dir_all(&project_dir).ok();

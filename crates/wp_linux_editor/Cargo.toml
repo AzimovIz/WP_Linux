@@ -9,7 +9,7 @@ publish = false
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 dirs = "6"
 eframe = "0.35"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "gif"] }
 player = { path = "../player" }
 project-format = { path = "../project-format" }
 rfd = "0.17"
