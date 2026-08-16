@@ -14,7 +14,10 @@
 # touch any wallpaper projects you saved -- those are your data, wherever
 # you put them, and are left alone. This also includes the wallpaper
 # library install.sh populates with the example wallpapers
-# (~/.local/share/wp_linux/wallpapers/ by default).
+# (~/.local/share/wp_linux/wallpapers/ by default) and the shader library
+# (~/.local/share/wp_linux/shaders/ by default) -- the bundled shaders
+# install.sh puts there, plus anything you dropped in yourself, since
+# there's no way to tell those apart from here.
 
 set -uo pipefail
 
@@ -25,6 +28,8 @@ APPLICATIONS_DIR="${HOME}/.local/share/applications"
 ICON_THEME_DIR="${HOME}/.local/share/icons/hicolor"
 # Matches crates/wp_linux_editor/src/library.rs's LIBRARY_SUBDIR / dirs::data_dir().
 WALLPAPERS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/wp_linux/wallpapers"
+# Matches crates/wp_linux_editor/src/shaders_library.rs's SHADERS_SUBDIR / dirs::data_dir().
+SHADERS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/wp_linux/shaders"
 PLASMA_PLUGIN_ID="dev.wplinux.wallpaper"
 KWIN_SCRIPT_ID="dev.wplinux.cursorbridge"
 GNOME_EXT_UUID="wp-linux@wplinux.dev"
@@ -90,3 +95,4 @@ fi
 
 log "done. Your saved wallpaper projects were not touched."
 log "your wallpaper library (including any downloaded examples) is still at ${WALLPAPERS_DIR} -- remove it by hand if you don't want it anymore."
+log "your shader library (bundled + anything you added yourself) is still at ${SHADERS_DIR} -- remove it by hand if you don't want it anymore."

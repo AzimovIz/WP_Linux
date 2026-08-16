@@ -25,6 +25,8 @@ APPLICATIONS_DIR="${HOME}/.local/share/applications"
 ICON_THEME_DIR="${HOME}/.local/share/icons/hicolor"
 # Matches crates/wp_linux_editor/src/library.rs's LIBRARY_SUBDIR / dirs::data_dir().
 WALLPAPERS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/wp_linux/wallpapers"
+# Matches crates/wp_linux_editor/src/shaders_library.rs's SHADERS_SUBDIR / dirs::data_dir().
+SHADERS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/wp_linux/shaders"
 DESKTOP_FILE_ID="dev.wplinux.editor"
 
 log()  { echo "install.sh: $*"; }
@@ -65,6 +67,16 @@ pkgroot="$tmpdir/wp-linux"
 log "installing binaries to ${BIN_DIR}"
 mkdir -p "$BIN_DIR"
 install -m755 "$pkgroot/bin/render-server" "$pkgroot/bin/player" "$pkgroot/bin/wp_linux_editor" "$BIN_DIR/"
+
+# Created unconditionally, upfront -- regardless of whether the optional
+# content below (downloaded example wallpapers, bundled shaders from the
+# archive) actually ends up populating them. The editor's own pickers
+# (Wallpapers tab, Shader effect's "Select" dropdown -- see
+# shaders_library.rs) scan these paths on every launch; they should exist
+# and just be empty on a fresh install that hit a network hiccup, not be
+# altogether missing.
+log "creating wallpaper/shader library directories"
+mkdir -p "$WALLPAPERS_DIR" "$SHADERS_DIR"
 
 log "installing application menu entry for the editor"
 mkdir -p "$APPLICATIONS_DIR"
@@ -142,7 +154,6 @@ nohup "${BIN_DIR}/render-server" >/dev/null 2>&1 &
 if command -v unzip >/dev/null 2>&1; then
     log "downloading example wallpapers"
     if curl -fsSL "$EXAMPLES_URL" -o "$tmpdir/wallpaper-examples.zip"; then
-        mkdir -p "$WALLPAPERS_DIR"
         unzip -oq "$tmpdir/wallpaper-examples.zip" -d "$WALLPAPERS_DIR"
         log "installed example wallpapers to ${WALLPAPERS_DIR}"
     else
@@ -153,6 +164,18 @@ else
     warn "install unzip and rerun, or download them by hand from:"
     warn "  https://github.com/${REPO}/releases/tag/WallpaperExamples"
     warn "and unzip into ${WALLPAPERS_DIR}"
+fi
+
+# Bundled shader library (see shaders_library.rs) -- ships inside the main
+# release archive already extracted into $pkgroot, not a second download
+# like the wallpaper examples above, so this is unconditional; the
+# existence check only guards against a hand-built dev archive predating
+# this directory, not a normal release.
+if [ -d "$pkgroot/shaders" ]; then
+    log "installing bundled shaders to ${SHADERS_DIR}"
+    cp -r "$pkgroot/shaders/." "$SHADERS_DIR/"
+else
+    warn "no bundled shaders in this release archive -- skipping"
 fi
 
 if ! command -v wp_linux_editor >/dev/null 2>&1; then

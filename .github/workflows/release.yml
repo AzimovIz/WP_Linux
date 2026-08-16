@@ -41,11 +41,38 @@ jobs:
 
       # Everything Wayland/Vulkan/D-Bus-related is dlopen'd at runtime,
       # not linked at build time (see `ldd` on any built binary) -- no
-      # apt packages needed here, just the Rust toolchain.
+      # apt packages needed here, just the Rust toolchain. `--workspace`
+      # also builds `shader-preview`, used below.
       - name: Build release binaries
         run: cargo build --release --workspace
         env:
           WP_LINUX_RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+
+      # `shader-preview` (see that crate's module doc comment) needs a
+      # real wgpu adapter, and this runner has no GPU -- Mesa's software
+      # implementations stand in: lavapipe for Vulkan, llvmpipe for GL,
+      # either of which satisfies `player::pick_adapter`'s
+      # `wgpu::Backends::all()` request. Same approach wgpu's own CI uses
+      # for its GPU tests on `ubuntu-24.04` runners (see
+      # gfx-rs/wgpu/.github/workflows/ci.yml); unlike that workflow we
+      # don't need a pinned custom Mesa build, since rendering a handful
+      # of simple fullscreen post-process shaders is far less demanding
+      # than wgpu's own conformance suite -- the distro package is enough.
+      - name: Install Mesa software renderer (for shader preview generation)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers libgl1-mesa-dri
+
+      # One `.gif` per `shaders/*.wgsl`, written next to its source (see
+      # `shader-preview`'s own doc comment) -- picked up by the archive
+      # staging step below alongside the `.wgsl` files themselves.
+      - name: Generate shader previews
+        run: |
+          set -eu
+          for f in shaders/*.wgsl; do
+            echo "generating preview for $f"
+            target/release/shader-preview "$f"
+          done
 
       # Single archive, laid out the way install.sh expects:
       #   bin/{render-server,player,wp_linux_editor}
@@ -54,6 +81,9 @@ jobs:
       #   dev.wplinux.editor.desktop  (Exec= has an @EDITOR_BIN@ placeholder,
       #                                 filled in by install.sh)
       #   assets/{wp_linux_editor_128.png,wp_linux_editor_256.png,wp_linux_editor.svg}
+      #   shaders/{*.wgsl,*.gif}  (bundled shader library + previews,
+      #                             installed to ~/.local/share/wp_linux/shaders
+      #                             by install.sh)
       # No systemd unit -- render-server autostarts via an XDG autostart
       # .desktop file that install.sh writes directly (and wp_linux_editor's
       # own "Launch at login" checkbox manages afterwards), nothing to ship
@@ -71,6 +101,7 @@ jobs:
           cp -r adapters "$root/adapters"
           cp packaging/dev.wplinux.editor.desktop "$root/"
           cp -r assets "$root/assets"
+          cp -r shaders "$root/shaders"
           tar czf dist/wp-linux-linux-x86_64.tar.gz -C dist wp-linux
 
       - name: Create release
