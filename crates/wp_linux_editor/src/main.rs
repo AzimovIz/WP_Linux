@@ -850,6 +850,19 @@ impl Preview {
             player::OFFSCREEN_FORMAT,
         );
         let (width, height) = (PREVIEW_MAX_WIDTH, PREVIEW_MAX_WIDTH * 9 / 16);
+        // Primes glyphon's canvas_width/height to this preview's actual size
+        // before any project is ever loaded. Without this, the very first
+        // `load_scene` call on a fresh SceneRenderer reads glyphon's
+        // hardcoded 1920x1080 construction default instead (see the
+        // Adjustment-layer branch in `load_scene`) -- any effect chain built
+        // on an Adjustment layer during that first load ends up sized for
+        // 1920x1080 instead of this small preview, and the mismatched
+        // accumulator copy (clamped to the smaller of the two sizes) shows
+        // up as a miniature, cursor-tracking artifact confined to one
+        // corner, plus a frozen/non-animating effect. Every subsequent
+        // reload is unaffected since `set_text_viewport` has run for real by
+        // then.
+        renderer.set_text_viewport(&mut [], width, height);
         let (texture, view) = create_preview_texture(&renderer, width, height);
         let texture_id = render_state.renderer.write().register_native_texture(
             &renderer.device,
