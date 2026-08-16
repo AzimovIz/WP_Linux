@@ -44,6 +44,7 @@ use project_format::{
 };
 
 const IMAGE_SHADER: &str = include_str!("shader.wgsl");
+const IMAGE_COVER_SHADER: &str = include_str!("image_cover.wgsl");
 const XRAY_SHADER: &str = include_str!("xray.wgsl");
 const PARALLAX_SHADER: &str = include_str!("parallax.wgsl");
 const VIGNETTE_SHADER: &str = include_str!("vignette.wgsl");
@@ -77,6 +78,13 @@ pub struct GifFrame {
 pub struct ImageLayer {
     texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
+    // Written fresh every `record()` call from this layer's own
+    // `width`/`height` against whatever the current target canvas size
+    // is -- see `cover_uv_scale_offset`. Canvas size can change (editor
+    // preview resize, or a monitor whose real geometry wasn't known yet
+    // at load time -- see render-server's `load_project`), so this can't
+    // just be computed once at construction.
+    cover_uniform_buffer: wgpu::Buffer,
     pub width: u32,
     pub height: u32,
     effects: Option<EffectChain>,
@@ -1212,16 +1220,56 @@ impl RenderOp for ImageLayer {
         renderer: &SceneRenderer,
         target: &SceneAccumulator,
     ) {
+        let [scale_x, scale_y, offset_x, offset_y] =
+            cover_uv_scale_offset(self.width, self.height, target.width, target.height);
+        let mut bytes = [0u8; 16];
+        bytes[0..4].copy_from_slice(&scale_x.to_le_bytes());
+        bytes[4..8].copy_from_slice(&scale_y.to_le_bytes());
+        bytes[8..12].copy_from_slice(&offset_x.to_le_bytes());
+        bytes[12..16].copy_from_slice(&offset_y.to_le_bytes());
+        renderer
+            .queue
+            .write_buffer(&self.cover_uniform_buffer, 0, &bytes);
+
         let (pipeline, bind_group) = run_own_chain_if_any(
             encoder,
             renderer,
-            &renderer.image_pipeline_offscreen,
-            &renderer.image_pipeline_offscreen_blend,
+            &renderer.image_cover_pipeline_offscreen,
+            &renderer.image_cover_pipeline_offscreen_blend,
             &self.bind_group,
             &self.effects,
         );
         blend_onto(encoder, pipeline, bind_group, target);
     }
+}
+
+/// Computes the UV `scale`/`offset` that implement CSS `background-size:
+/// cover` for a `content_w x content_h` picture drawn onto a
+/// `canvas_w x canvas_h` target: `content` is scaled uniformly (aspect
+/// ratio preserved, never stretched) until it fully covers the canvas,
+/// and whatever overflows past each edge is cropped rather than shown.
+/// Returns identity (`[1, 1, 0, 0]`) when the aspect ratios already
+/// match -- the common case where the canvas size was itself derived
+/// from this same picture (editor preview, or render-server before a
+/// monitor's real geometry is known) -- and also as a safe fallback for
+/// a degenerate (zero-sized) input, which should never happen in
+/// practice but must never divide by zero.
+fn cover_uv_scale_offset(
+    content_w: u32,
+    content_h: u32,
+    canvas_w: u32,
+    canvas_h: u32,
+) -> [f32; 4] {
+    if content_w == 0 || content_h == 0 || canvas_w == 0 || canvas_h == 0 {
+        return [1.0, 1.0, 0.0, 0.0];
+    }
+    let canvas_aspect = canvas_w as f32 / canvas_h as f32;
+    let content_aspect = content_w as f32 / content_h as f32;
+    let scale_x = (canvas_aspect / content_aspect).min(1.0);
+    let scale_y = (content_aspect / canvas_aspect).min(1.0);
+    let offset_x = (1.0 - scale_x) * 0.5;
+    let offset_y = (1.0 - scale_y) * 0.5;
+    [scale_x, scale_y, offset_x, offset_y]
 }
 
 impl RenderOp for XrayLayer {
@@ -1564,14 +1612,17 @@ pub struct SceneRenderer {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     image_pipeline: wgpu::RenderPipeline,
-    // Same shader/bind-group-layout as `image_pipeline`, but always
-    // targets `OFFSCREEN_FORMAT` and never blends -- see its own
-    // creation site in `build` for why a second variant is needed.
-    image_pipeline_offscreen: wgpu::RenderPipeline,
     // M10: `OFFSCREEN_FORMAT` and blending both -- see its own creation
     // site in `build` for why neither existing variant covers this.
     image_pipeline_offscreen_blend: wgpu::RenderPipeline,
     image_bind_group_layout: wgpu::BindGroupLayout,
+    // Draws an `ImageLayer`'s own native content (never the generic
+    // accumulator/effect-chain composite blit, which keep using the
+    // plain `image_pipeline*` family above) -- see `image_cover.wgsl`
+    // and `cover_uv_scale_offset`.
+    image_cover_pipeline_offscreen: wgpu::RenderPipeline,
+    image_cover_pipeline_offscreen_blend: wgpu::RenderPipeline,
+    image_cover_bind_group_layout: wgpu::BindGroupLayout,
     xray_pipeline_offscreen: wgpu::RenderPipeline,
     xray_pipeline_offscreen_blend: wgpu::RenderPipeline,
     xray_bind_group_layout: wgpu::BindGroupLayout,
@@ -1744,34 +1795,90 @@ impl SceneRenderer {
             target_format,
             Some(wgpu::BlendState::ALPHA_BLENDING),
         );
-        // Same shader and bind group layout, but always targets
-        // `OFFSCREEN_FORMAT` and never blends -- used only to draw a
-        // layer's *base* content into its own effect chain's
-        // accumulator texture (see `EffectChain`), which is always that
-        // format regardless of what `target_format` this renderer was
-        // built for (on-screen `player` uses a swapchain format that
-        // can differ), and has nothing to blend against yet on a
-        // freshly cleared texture.
-        let image_pipeline_offscreen = build_fullscreen_pipeline(
-            &device,
-            "image-pipeline-offscreen",
-            &image_pipeline_layout,
-            &image_shader,
-            OFFSCREEN_FORMAT,
-            None,
-        );
-        // M10: same shader/layout again, `OFFSCREEN_FORMAT` like the
-        // no-blend variant above, but *with* blending -- used to draw a
-        // layer's own content (or its finished effect-chain composite)
-        // onto the shared scene accumulator (`record_draw`'s module doc
-        // comment), which already holds every layer drawn before it and
-        // so needs real blending, unlike the freshly-cleared-to-
-        // transparent target the no-blend variant above draws into.
+        // Same shader/layout as `image_pipeline` but always targets
+        // `OFFSCREEN_FORMAT` (on-screen `player` uses a swapchain format
+        // that can differ) -- used to composite a layer's finished
+        // effect-chain result onto the shared scene accumulator
+        // (`record_draw`'s module doc comment), which already holds
+        // every layer drawn before it and so needs real blending. A
+        // plain `ImageLayer`'s own content uses
+        // `image_cover_pipeline_offscreen_blend` instead (see its own
+        // doc comment) -- this variant is now only reached via
+        // `run_own_chain_if_any`'s effect-chain composite step.
         let image_pipeline_offscreen_blend = build_fullscreen_pipeline(
             &device,
             "image-pipeline-offscreen-blend",
             &image_pipeline_layout,
             &image_shader,
+            OFFSCREEN_FORMAT,
+            Some(wgpu::BlendState::ALPHA_BLENDING),
+        );
+
+        // Same shape as `image_bind_group_layout` plus one uniform buffer
+        // (the cover-crop scale/offset) -- see `image_cover.wgsl`.
+        let image_cover_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("image-cover-bind-group-layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let image_cover_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("image-cover-shader"),
+            source: wgpu::ShaderSource::Wgsl(IMAGE_COVER_SHADER.into()),
+        });
+
+        let image_cover_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("image-cover-pipeline-layout"),
+                bind_group_layouts: &[Some(&image_cover_bind_group_layout)],
+                immediate_size: 0,
+            });
+
+        // Same two-variant split as `image_pipeline_offscreen`/
+        // `image_pipeline_offscreen_blend` above (no-blend for an
+        // effect chain's freshly-cleared base pass, blend for drawing
+        // straight onto the shared accumulator) -- only ever used for an
+        // `ImageLayer`'s own content, never the generic composite blit.
+        let image_cover_pipeline_offscreen = build_fullscreen_pipeline(
+            &device,
+            "image-cover-pipeline-offscreen",
+            &image_cover_pipeline_layout,
+            &image_cover_shader,
+            OFFSCREEN_FORMAT,
+            None,
+        );
+        let image_cover_pipeline_offscreen_blend = build_fullscreen_pipeline(
+            &device,
+            "image-cover-pipeline-offscreen-blend",
+            &image_cover_pipeline_layout,
+            &image_cover_shader,
             OFFSCREEN_FORMAT,
             Some(wgpu::BlendState::ALPHA_BLENDING),
         );
@@ -2195,9 +2302,11 @@ impl SceneRenderer {
             device,
             queue,
             image_pipeline,
-            image_pipeline_offscreen,
             image_pipeline_offscreen_blend,
             image_bind_group_layout,
+            image_cover_pipeline_offscreen,
+            image_cover_pipeline_offscreen_blend,
+            image_cover_bind_group_layout,
             xray_pipeline_offscreen,
             xray_pipeline_offscreen_blend,
             xray_bind_group_layout,
@@ -2896,9 +3005,18 @@ impl SceneRenderer {
         let texture = self.create_texture(width, height);
         self.write_texture(&texture, rgba, width, height);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // Identity (no crop) until the first `record()` call computes
+        // this layer's real cover scale/offset against whatever canvas
+        // it ends up drawn onto -- see `ImageLayer::cover_uniform_buffer`.
+        let cover_uniform_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("image-cover-params"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("image-layer-bind-group"),
-            layout: &self.image_bind_group_layout,
+            layout: &self.image_cover_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -2908,11 +3026,16 @@ impl SceneRenderer {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: cover_uniform_buffer.as_entire_binding(),
+                },
             ],
         });
         ImageLayer {
             texture,
             bind_group,
+            cover_uniform_buffer,
             width,
             height,
             effects: None,
@@ -4030,6 +4153,49 @@ mod tests {
         // Out-of-range input clamps instead of wrapping/panicking.
         assert_eq!(srgb_u8_from_linear(-1.0), 0);
         assert_eq!(srgb_u8_from_linear(2.0), 255);
+    }
+
+    #[test]
+    fn cover_uv_is_identity_when_aspect_ratios_match() {
+        // 2560x1440 and 1920x1080 are both exactly 16:9 -- no crop
+        // needed, the GPU's own bilinear sampling across the full [0,1]
+        // UV range already scales the picture down to fit.
+        assert_eq!(
+            cover_uv_scale_offset(2560, 1440, 1920, 1080),
+            [1.0, 1.0, 0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn cover_uv_crops_a_narrower_picture_top_and_bottom() {
+        // A square picture inside a wide (16:9) canvas is width-limited:
+        // full width is kept, height is cropped evenly off top and
+        // bottom (matches a square photo used as a wide desktop
+        // wallpaper -- the case reported as "only the top-left corner
+        // shows").
+        let [scale_x, scale_y, offset_x, offset_y] = cover_uv_scale_offset(1000, 1000, 1920, 1080);
+        assert_eq!(scale_x, 1.0);
+        assert!(scale_y < 1.0);
+        assert_eq!(offset_x, 0.0);
+        assert!((offset_y - (1.0 - scale_y) / 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cover_uv_crops_a_wider_picture_left_and_right() {
+        // A wide (16:9) picture inside a portrait canvas is
+        // height-limited: full height is kept, width is cropped evenly
+        // off both sides.
+        let [scale_x, scale_y, offset_x, offset_y] = cover_uv_scale_offset(1920, 1080, 1080, 1920);
+        assert!(scale_x < 1.0);
+        assert_eq!(scale_y, 1.0);
+        assert!((offset_x - (1.0 - scale_x) / 2.0).abs() < 1e-6);
+        assert_eq!(offset_y, 0.0);
+    }
+
+    #[test]
+    fn cover_uv_falls_back_to_identity_on_degenerate_input() {
+        assert_eq!(cover_uv_scale_offset(0, 1080, 1920, 1080), [1.0, 1.0, 0.0, 0.0]);
+        assert_eq!(cover_uv_scale_offset(1920, 1080, 0, 1080), [1.0, 1.0, 0.0, 0.0]);
     }
 
     #[test]

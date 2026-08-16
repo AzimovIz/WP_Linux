@@ -93,6 +93,11 @@ struct LoadedProject {
     canvas: Canvas,
     canvas_width: u32,
     canvas_height: u32,
+    // Kept so `render_tick_loop` can reload this same project from disk
+    // once this monitor's real geometry becomes known (or changes) after
+    // this load already happened -- see the mismatch check at the top of
+    // its loop.
+    project_dir: PathBuf,
     dynamic: bool,
     needs_cursor: bool,
     fps: u32,
@@ -549,8 +554,33 @@ fn render_tick_loop(renderer: &SceneRenderer, state: &SharedState) {
         // to run.
         let cycle_start = Instant::now();
 
+        // Re-queue any already-loaded monitor whose canvas no longer
+        // matches its last-known real screen size. Covers two cases with
+        // the same mechanism: geometry arriving a moment after this
+        // monitor's project already loaded (the common one, right after
+        // startup -- see `load_project`'s own doc comment) and a genuine
+        // later resolution change (monitor swapped/reconfigured).
+        // `.or_insert_with` deliberately never overwrites an entry
+        // already pending here -- a fresh `/project` POST for this
+        // monitor always wins over reloading the old one.
+        {
+            let geometry = state.geometry.lock().unwrap();
+            let mut pending = state.pending_project.lock().unwrap();
+            for (monitor_id, project) in &monitors {
+                if let Some(size) = geometry_pixel_size(&geometry, monitor_id)
+                    && size != (project.canvas_width, project.canvas_height)
+                {
+                    pending
+                        .entry(monitor_id.clone())
+                        .or_insert_with(|| project.project_dir.clone());
+                }
+            }
+        }
+
         for (monitor_id, project_dir) in state.pending_project.lock().unwrap().drain() {
-            match load_project(renderer, &project_dir) {
+            let target_size =
+                geometry_pixel_size(&state.geometry.lock().unwrap(), &monitor_id);
+            match load_project(renderer, &project_dir, target_size) {
                 Ok(loaded) => {
                     eprintln!(
                         "render-server: loaded project {:?} for monitor {monitor_id:?} \
@@ -727,7 +757,11 @@ fn compose_and_encode(
     }
 }
 
-fn load_project(renderer: &SceneRenderer, project_dir: &Path) -> Result<LoadedProject, String> {
+fn load_project(
+    renderer: &SceneRenderer,
+    project_dir: &Path,
+    target_size: Option<(u32, u32)>,
+) -> Result<LoadedProject, String> {
     let (project, project_dir) = Project::load(project_dir).map_err(|e| e.to_string())?;
     if project.layers.is_empty() {
         return Err("project has no layers".to_string());
@@ -743,12 +777,24 @@ fn load_project(renderer: &SceneRenderer, project_dir: &Path) -> Result<LoadedPr
     let allow_commands = trust_store::is_trusted(project_id);
 
     let mut loaded_layers = renderer.load_scene(&project_dir, &project, allow_commands)?;
-    // Whichever layer happens to load first sets the canvas size, same as
-    // this always worked before `load_scene` moved into `player`.
-    let (canvas_width, canvas_height) = loaded_layers
-        .first()
-        .map(LoadedLayer::size)
-        .expect("checked non-empty above");
+    // Prefer this monitor's real screen size (its last `/geometry` push)
+    // so the canvas -- and thus the frame handed to the client -- is
+    // already sized for the actual display; each layer's own picture
+    // then gets cover-scaled/cropped to fit (see `player`'s
+    // `cover_uv_scale_offset`) instead of shown at 1:1 pixel scale and
+    // clipped to whatever corner happens to overlap. Falls back to
+    // whichever layer loads first (the old behavior) only while this
+    // monitor's geometry isn't known yet -- e.g. briefly at startup,
+    // before the desktop adapter's `Component.onCompleted` has had a
+    // chance to POST it. `render_tick_loop` notices the mismatch once it
+    // arrives and reloads with the real size, so this is self-correcting
+    // within a cycle or two.
+    let (canvas_width, canvas_height) = target_size.unwrap_or_else(|| {
+        loaded_layers
+            .first()
+            .map(LoadedLayer::size)
+            .expect("checked non-empty above")
+    });
     renderer.set_text_viewport(&mut loaded_layers, canvas_width, canvas_height);
 
     let dynamic = project.layers.iter().any(Layer::is_dynamic);
@@ -778,6 +824,7 @@ fn load_project(renderer: &SceneRenderer, project_dir: &Path) -> Result<LoadedPr
         canvas,
         canvas_width,
         canvas_height,
+        project_dir,
         dynamic,
         needs_cursor,
         fps,
@@ -787,6 +834,19 @@ fn load_project(renderer: &SceneRenderer, project_dir: &Path) -> Result<LoadedPr
         needs_render: true,
         last_rendered_cursor_uv: None,
     })
+}
+
+/// This monitor's last-pushed `/geometry` size, in whole pixels -- what
+/// `load_project` should render the canvas at, when known. `.max(1.0)`
+/// guards against a `(0, 0)` canvas (which `renderer::create_canvas`
+/// can't handle) from a not-yet-realized wallpaper item briefly reporting
+/// zero size.
+fn geometry_pixel_size(
+    geometry: &HashMap<String, (f64, f64, f64, f64)>,
+    monitor_id: &str,
+) -> Option<(u32, u32)> {
+    let &(_, _, w, h) = geometry.get(monitor_id)?;
+    Some((w.round().max(1.0) as u32, h.round().max(1.0) as u32))
 }
 
 /// Parses "virtualX,virtualY,width,height" as pushed by the QML side.
@@ -879,9 +939,25 @@ fn text_response(code: u16, body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
 
 #[cfg(test)]
 mod tests {
-    use super::encode_bmp;
+    use super::{encode_bmp, geometry_pixel_size};
     use crate::renderer;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn geometry_pixel_size_rounds_and_looks_up_by_monitor() {
+        let mut geometry = HashMap::new();
+        geometry.insert("DP-1".to_string(), (0.0, 0.0, 2560.4, 1440.6));
+        assert_eq!(geometry_pixel_size(&geometry, "DP-1"), Some((2560, 1441)));
+        assert_eq!(geometry_pixel_size(&geometry, "HDMI-A-1"), None);
+    }
+
+    #[test]
+    fn geometry_pixel_size_never_reports_zero() {
+        let mut geometry = HashMap::new();
+        geometry.insert("DP-1".to_string(), (0.0, 0.0, 0.0, 0.0));
+        assert_eq!(geometry_pixel_size(&geometry, "DP-1"), Some((1, 1)));
+    }
 
     fn unique_temp_dir() -> std::path::PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
