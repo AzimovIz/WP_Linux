@@ -4,6 +4,7 @@ members = [
     "crates/player",
     "crates/project-format",
     "crates/render-server",
+    "crates/shader-preview",
     "crates/wp_linux_editor",
 ]
 
