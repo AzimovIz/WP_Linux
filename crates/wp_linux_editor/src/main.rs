@@ -34,7 +34,7 @@ use push::{ProjectPusher, TcpPusher};
 /// still be as large as the user likes -- see `show_preview`, which
 /// stretches this texture to fill the available space rather than
 /// showing it at native size.
-const PREVIEW_MAX_WIDTH: u32 = 480;
+const PREVIEW_MAX_WIDTH: u32 = 720;
 
 /// Release tag this binary was built from, e.g. `2026.08.10` -- `"dev"`
 /// for local/dev builds (see `build.rs`). Shown in the About window.
