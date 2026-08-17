@@ -10,6 +10,7 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 import {CursorForwarder} from './cursorForwarder.js';
 import {MonitorLayer} from './monitorLayer.js';
+import {OcclusionWatcher} from './occlusionWatcher.js';
 import {OverviewBackgroundPatcher} from './overviewBackground.js';
 import {RenderServerClient} from './renderServerClient.js';
 
@@ -41,8 +42,14 @@ export default class WpLinuxExtension extends Extension {
         this._cursorForwarder = new CursorForwarder();
         this._cursorForwarder.start();
 
+        this._occlusionWatcher = new OcclusionWatcher(connectorForMonitorIndex);
+        this._occlusionWatcher.start();
+
         this._monitorsChangedId = Main.layoutManager.connect(
-            'monitors-changed', () => this._syncMonitors());
+            'monitors-changed', () => {
+                this._syncMonitors();
+                this._occlusionWatcher.recompute();
+            });
         this._syncMonitors();
 
         // Cosmetic-only, best-effort (see overviewBackground.js's own
@@ -68,6 +75,9 @@ export default class WpLinuxExtension extends Extension {
 
         this._cursorForwarder.stop();
         this._cursorForwarder = null;
+
+        this._occlusionWatcher.stop();
+        this._occlusionWatcher = null;
 
         this._client.destroy();
         this._client = null;

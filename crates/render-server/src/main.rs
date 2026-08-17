@@ -117,13 +117,6 @@ struct LoadedProject {
     // can finish loading mid-cycle while others are already rendering, so
     // it has to travel with its own `LoadedProject`.
     needs_render: bool,
-    // Cursor UV this monitor's own last emitted frame was actually
-    // rendered with -- lets the render loop skip a monitor's tick
-    // entirely (no GPU work, no encode) when nothing that could change
-    // its picture changed, e.g. an xray layer with a stationary cursor.
-    // Same reasoning as `needs_render` for why this moved from a
-    // loop-local into per-monitor state.
-    last_rendered_cursor_uv: Option<(f32, f32)>,
 }
 
 #[derive(Default)]
@@ -169,12 +162,22 @@ struct SharedState {
     /// keeps serving the last frame it already produced -- see
     /// `render_tick_loop`.
     power_saver: AtomicBool,
+    /// Per-monitor: whether some other window currently covers that
+    /// monitor's whole visible desktop area (true fullscreen, or just
+    /// maximized to fill the screen) -- last reported by the desktop
+    /// adapter's `SetMonitorOccluded` D-Bus call. A monitor with no entry
+    /// here is treated as not occluded, same "absence means false"
+    /// convention `global_cursor` uses before the first report arrives.
+    /// See `OcclusionGate`.
+    occluded: Mutex<HashMap<String, bool>>,
 }
 
 /// D-Bus object backing `dev.wplinux.CursorBridge` -- on KDE, the KWin
 /// script (adapters/kde/kwin-script/package) calls `SetCursorPosition` on
-/// this every time `workspace.cursorPosChanged` fires. Any other
-/// desktop's adapter is free to call the same method the same way.
+/// this every time `workspace.cursorPosChanged` fires, and
+/// `SetMonitorOccluded` every time some window starts or stops covering a
+/// monitor's whole visible desktop. Any other desktop's adapter is free to
+/// call the same methods the same way (see adapters/gnome).
 struct CursorDbusService {
     state: Arc<SharedState>,
 }
@@ -184,6 +187,23 @@ impl CursorDbusService {
     #[zbus(name = "SetCursorPosition")]
     fn set_cursor_position(&mut self, x: i32, y: i32) {
         *self.state.global_cursor.lock().unwrap() = Some((x, y));
+    }
+
+    #[zbus(name = "SetMonitorOccluded")]
+    fn set_monitor_occluded(&mut self, monitor: String, occluded: bool) {
+        let mut occluded_monitors = self.state.occluded.lock().unwrap();
+        let was_occluded = occluded_monitors.insert(monitor.clone(), occluded).unwrap_or(false);
+        drop(occluded_monitors);
+        if occluded != was_occluded {
+            eprintln!(
+                "render-server: monitor {monitor:?} is now {}",
+                if occluded {
+                    "fully covered -- pausing its rendering"
+                } else {
+                    "visible again -- resuming its rendering"
+                }
+            );
+        }
     }
 }
 
@@ -312,6 +332,43 @@ fn compute_cursor_uv(state: &SharedState, monitor_id: &str) -> Option<(f32, f32)
         return None;
     }
     Some(((local_x / w) as f32, (local_y / h) as f32))
+}
+
+/// A reason `render_tick_loop` might skip a monitor's tick entirely -- no
+/// GPU work, no encode, the last frame it already produced just stays on
+/// screen. Each implementation answers "should monitor `monitor_id` be
+/// skipped right now?"; the loop ORs every gate together (see
+/// `render_tick_loop`'s `skip_gates`), so a new skip condition later is a
+/// new one-line impl plus one array entry, not a change to the loop itself.
+trait SkipGate {
+    fn should_skip(&self, state: &SharedState, monitor_id: &str) -> bool;
+}
+
+/// System-wide: power-profiles-daemon currently reports the "power-saver"
+/// profile. See `run_power_profile_watcher`.
+struct PowerSaverGate;
+
+impl SkipGate for PowerSaverGate {
+    fn should_skip(&self, state: &SharedState, _monitor_id: &str) -> bool {
+        state.power_saver.load(Ordering::Relaxed)
+    }
+}
+
+/// Per-monitor: some window currently covers this monitor's whole visible
+/// desktop, so nothing rendered here could be seen anyway. See
+/// `CursorDbusService::set_monitor_occluded`.
+struct OcclusionGate;
+
+impl SkipGate for OcclusionGate {
+    fn should_skip(&self, state: &SharedState, monitor_id: &str) -> bool {
+        state
+            .occluded
+            .lock()
+            .unwrap()
+            .get(monitor_id)
+            .copied()
+            .unwrap_or(false)
+    }
 }
 
 fn main() {
@@ -601,32 +658,46 @@ fn render_tick_loop(renderer: &SceneRenderer, state: &SharedState) {
             }
         }
 
-        // While the system is in the power-saver profile, treat every
-        // monitor exactly like a static project: don't advance gifs,
-        // don't react to the cursor, don't push anything to the GPU.
-        // `needs_render` (set on load) still gets one frame out below,
-        // so a freshly loaded monitor isn't left blank -- it just
-        // freezes on that frame instead of animating, same as a plain
-        // `Image` layer always has. See `run_power_profile_watcher`.
+        // Every reason a monitor's tick might be skipped entirely this
+        // cycle -- no advancing gifs/text/parallax, no GPU work, no
+        // encode, the last frame it already produced just stays on
+        // screen. `needs_render` (set on load) still gets one frame out
+        // below regardless, so a freshly loaded monitor isn't left blank
+        // -- it just freezes on that frame instead of animating, same as
+        // a plain `Image` layer always has. See `SkipGate`.
+        let skip_gates: [&dyn SkipGate; 2] = [&PowerSaverGate, &OcclusionGate];
+
+        // Only used for the sleep-interval choice below -- deliberately a
+        // global read, not per-monitor, since there's no point waking up
+        // at the fastest loaded monitor's animation fps just to find
+        // power-saver still set and do nothing. Occlusion is per-monitor
+        // and doesn't get the same treatment: other, unoccluded monitors
+        // still need their normal tick rate.
         let power_saving = state.power_saver.load(Ordering::Relaxed);
 
         // Recomputed every cycle from whichever monitors are currently
-        // loaded and dynamic -- e.g. a 60fps gif on one monitor must not
-        // get throttled to a 5fps xray monitor's rate or vice versa.
-        // Every monitor is still visited every cycle regardless (see the
-        // loop below); this only controls how eagerly the *next* cycle
-        // starts, and `advance_gifs`/`update_parallax` are cheap no-ops
-        // when called more often than a given monitor actually needs, so
+        // loaded, dynamic, and not skipped -- e.g. a 60fps gif on one
+        // monitor must not get throttled to a 5fps xray monitor's rate or
+        // vice versa, and an occluded monitor shouldn't force a faster
+        // wake-up than the monitors actually being rendered need. Every
+        // monitor is still visited every cycle regardless (see the loop
+        // below); this only controls how eagerly the *next* cycle starts,
+        // and `advance_gifs`/`update_parallax` are cheap no-ops when
+        // called more often than a given monitor actually needs, so
         // visiting a slow monitor at a fast monitor's rate costs a little
         // extra bookkeeping, not extra GPU work or over-fast animation.
         let mut next_tick_interval = IDLE_TICK_INTERVAL;
 
         for (monitor_id, project) in monitors.iter_mut() {
-            if project.dynamic && !power_saving {
+            let skip = skip_gates
+                .iter()
+                .any(|gate| gate.should_skip(state, monitor_id));
+
+            if project.dynamic && !skip {
                 next_tick_interval = next_tick_interval.min(project.tick_interval);
             }
 
-            let gif_changed = if project.dynamic && !power_saving {
+            let gif_changed = if project.dynamic && !skip {
                 let elapsed_ms = project.loaded_at.elapsed().as_millis() as u64;
                 renderer.advance_gifs(&mut project.layers, elapsed_ms)
             } else {
@@ -640,46 +711,41 @@ fn render_tick_loop(renderer: &SceneRenderer, state: &SharedState) {
             // throttling gif/xray/parallax above), so a 1fps project with
             // a seconds-resolution clock will visibly stutter -- not a
             // bug, just a consequence of sharing that knob.
-            let text_changed = if project.dynamic && !power_saving {
+            let text_changed = if project.dynamic && !skip {
                 renderer.advance_text_sources(&mut project.layers, chrono::Local::now())
             } else {
                 false
             };
 
-            let cursor_uv = if project.needs_cursor && !power_saving {
+            let cursor_uv = if project.needs_cursor && !skip {
                 compute_cursor_uv(state, monitor_id)
             } else {
                 None
             };
-            let cursor_changed = project.needs_cursor
-                && !power_saving
-                && cursor_uv != project.last_rendered_cursor_uv;
 
-            // Unlike xray, parallax has state that eases towards a
-            // target over several ticks -- it can still be moving after
-            // the cursor itself has stopped, so `cursor_changed` alone
-            // can't tell us whether a redraw is warranted. Advance it
-            // unconditionally (like `advance_gifs` above) and trust its
-            // own answer instead.
-            let parallax_changed = if project.needs_cursor && !power_saving {
+            // Xray/Parallax/Shader/Smoke layers all redraw every tick
+            // while visible, same as gif/text -- there's no cheap way to
+            // tell "the cursor didn't move so the picture can't have
+            // changed" apart from just rendering (a Shader effect can be
+            // purely time-driven and never read the cursor at all, yet
+            // still gets `needs_cursor` set -- see `load_project`). The
+            // actual cost-saving gate is `skip` above, not this. Parallax
+            // still needs its own easing state advanced unconditionally,
+            // same as before, just no longer to decide whether to redraw.
+            if project.needs_cursor && !skip {
                 let elapsed_ms = project.loaded_at.elapsed().as_millis() as u64;
                 let dt_ms = elapsed_ms.saturating_sub(project.last_parallax_update_ms);
                 project.last_parallax_update_ms = elapsed_ms;
                 let cursor_px =
                     cursor_px_from_uv(cursor_uv, project.canvas_width, project.canvas_height);
-                renderer.update_parallax(&mut project.layers, cursor_px, dt_ms)
-            } else {
-                false
-            };
+                renderer.update_parallax(&mut project.layers, cursor_px, dt_ms);
+            }
 
             if project.needs_render
                 || gif_changed
-                || cursor_changed
-                || parallax_changed
                 || text_changed
+                || (project.needs_cursor && !skip)
             {
-                project.last_rendered_cursor_uv = cursor_uv;
-
                 let (frame_bytes, content_type) = compose_and_encode(renderer, project, cursor_uv);
 
                 let mut output = state.output.lock().unwrap();
@@ -832,7 +898,6 @@ fn load_project(
         loaded_at: Instant::now(),
         last_parallax_update_ms: 0,
         needs_render: true,
-        last_rendered_cursor_uv: None,
     })
 }
 
