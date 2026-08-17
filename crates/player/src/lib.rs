@@ -794,12 +794,35 @@ impl LoadedLayer {
     /// preview); render-server instead asks the schema-level question up
     /// front, before anything is ever loaded (see `Layer::is_dynamic`,
     /// which `LoadedProject::dynamic` is computed from).
+    ///
+    /// Also true for an otherwise-static layer (`Image`/`Adjustment`)
+    /// carrying an enabled `Smoke` or `Shader` effect, same as
+    /// `project_format::Layer::is_dynamic` -- `Smoke` has its own
+    /// persistent GPU state that evolves every frame regardless of what's
+    /// underneath it, and `Shader` gets a live cursor/time uniform every
+    /// frame whether or not its particular WGSL happens to read them.
+    /// Without this, the editor preview's `has_dynamic` (see `Preview::
+    /// redraw`) came back false for a plain `Image` layer with a
+    /// time-driven Shader effect, so the preview stopped scheduling its
+    /// own repaint and froze the instant the cursor stopped moving --
+    /// egui only kept redrawing at all because hovering the preview
+    /// itself is, incidentally, input.
     pub fn is_dynamic(&self) -> bool {
-        match self {
+        let dynamic_regardless_of_effects = match self {
             LoadedLayer::Image(_) | LoadedLayer::Adjustment(_) => false,
             LoadedLayer::Gif { .. } | LoadedLayer::Xray(_) | LoadedLayer::Parallax(_) => true,
             LoadedLayer::Text(text) => text.source.is_dynamic(),
-        }
+        };
+        dynamic_regardless_of_effects
+            || self.effects().is_some_and(|chain| {
+                chain.effects.iter().any(|effect| {
+                    effect.enabled
+                        && matches!(
+                            effect.kind,
+                            LoadedEffectKind::Smoke(_) | LoadedEffectKind::Shader(_)
+                        )
+                })
+            })
     }
 
     /// Changes an already-loaded Xray layer's mask radius in place -- no
