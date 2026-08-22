@@ -90,9 +90,16 @@ function windowOnCurrentDesktop(window) {
     return !desktops || desktops.length === 0 || desktops.includes(workspace.currentDesktop);
 }
 
-function windowCoversOutput(window, output, maximizeArea) {
+// Compares by `.name`, not `===` -- there's no documented guarantee that
+// `window.output` and an entry from `workspace.screens` referring to the
+// very same physical output are ever the *same* JS wrapper object (KWin's
+// QJSEngine binding gives no reason to assume it interns them), and a
+// reference comparison failing silently would mean every window looks
+// like it's on no output at all, i.e. occlusion never detected for
+// anyone. `.name` is a plain string, so this can't have that failure mode.
+function windowCoversOutput(window, outputName, maximizeArea) {
     return !window.minimized
-        && window.output === output
+        && window.output && window.output.name === outputName
         && windowOnCurrentDesktop(window)
         && rectCovers(window.frameGeometry, maximizeArea);
 }
@@ -118,7 +125,7 @@ function recomputeOcclusion() {
         const windows = workspace.windowList();
         for (const output of workspace.screens) {
             const maximizeArea = workspace.clientArea(KWin.MaximizeArea, output);
-            const covered = windows.some(w => windowCoversOutput(w, output, maximizeArea));
+            const covered = windows.some(w => windowCoversOutput(w, output.name, maximizeArea));
             if (lastSentOcclusion.get(output.name) !== covered) {
                 lastSentOcclusion.set(output.name, covered);
                 print("wplinux occlusion: " + output.name + " -> " + covered);
