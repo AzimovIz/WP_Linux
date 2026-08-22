@@ -117,6 +117,21 @@ struct LoadedProject {
     // can finish loading mid-cycle while others are already rendering, so
     // it has to travel with its own `LoadedProject`.
     needs_render: bool,
+    // Whether it's safe to skip re-rendering this project when the cursor
+    // hasn't moved since the last frame we actually produced. Only true
+    // when the sole reason `needs_cursor` is set is a plain Xray layer --
+    // Parallax keeps easing its offset toward the cursor for a while even
+    // after it stops moving (see `SceneRenderer::update_parallax`), and a
+    // Smoke/Shader effect can be driven by elapsed time alone, so neither
+    // is provably unchanged just because the cursor position is. See
+    // `load_project`.
+    cursor_gate_eligible: bool,
+    // Canvas-pixel cursor position used for the last frame this project
+    // actually rendered -- `None` until the first render. Compared each
+    // tick (when `cursor_gate_eligible`) against the current position to
+    // tell whether an Xray-only project's picture could possibly have
+    // changed at all.
+    last_rendered_cursor_px: Option<(f32, f32)>,
 }
 
 #[derive(Default)]
@@ -722,30 +737,40 @@ fn render_tick_loop(renderer: &SceneRenderer, state: &SharedState) {
             } else {
                 None
             };
+            let cursor_px =
+                cursor_px_from_uv(cursor_uv, project.canvas_width, project.canvas_height);
 
-            // Xray/Parallax/Shader/Smoke layers all redraw every tick
-            // while visible, same as gif/text -- there's no cheap way to
-            // tell "the cursor didn't move so the picture can't have
-            // changed" apart from just rendering (a Shader effect can be
-            // purely time-driven and never read the cursor at all, yet
-            // still gets `needs_cursor` set -- see `load_project`). The
-            // actual cost-saving gate is `skip` above, not this. Parallax
-            // still needs its own easing state advanced unconditionally,
-            // same as before, just no longer to decide whether to redraw.
+            // Parallax still needs its own easing state advanced
+            // unconditionally every tick it's live, regardless of whether
+            // the cursor position itself just changed -- it keeps easing
+            // toward a target for a while after the cursor stops, so
+            // "cursor unchanged" does NOT mean "parallax offset unchanged"
+            // (see `cursor_gate_eligible`, which excludes any project with
+            // a Parallax layer from the skip below for exactly this
+            // reason).
             if project.needs_cursor && !skip {
                 let elapsed_ms = project.loaded_at.elapsed().as_millis() as u64;
                 let dt_ms = elapsed_ms.saturating_sub(project.last_parallax_update_ms);
                 project.last_parallax_update_ms = elapsed_ms;
-                let cursor_px =
-                    cursor_px_from_uv(cursor_uv, project.canvas_width, project.canvas_height);
                 renderer.update_parallax(&mut project.layers, cursor_px, dt_ms);
             }
 
-            if project.needs_render
-                || gif_changed
-                || text_changed
-                || (project.needs_cursor && !skip)
-            {
+            // An Xray-only project (see `cursor_gate_eligible`) reacts to
+            // nothing but the cursor's position -- if it's sitting exactly
+            // where it was on the last frame we actually rendered, the
+            // picture is provably identical, so skip the GPU work entirely
+            // and just keep serving that last frame, same idea as
+            // `PowerSaverGate`/`OcclusionGate` above. Any project that
+            // isn't eligible (Parallax easing, or a Smoke/Shader effect
+            // that can be purely time-driven) keeps the old always-redraw
+            // behavior -- there's no cheap way to prove those unchanged
+            // from cursor position alone.
+            let cursor_redraw_needed = project.needs_cursor
+                && !skip
+                && (!project.cursor_gate_eligible
+                    || project.last_rendered_cursor_px != Some(cursor_px));
+
+            if project.needs_render || gif_changed || text_changed || cursor_redraw_needed {
                 let (frame_bytes, content_type) = compose_and_encode(renderer, project, cursor_uv);
 
                 let mut output = state.output.lock().unwrap();
@@ -759,6 +784,9 @@ fn render_tick_loop(renderer: &SceneRenderer, state: &SharedState) {
                 drop(output);
 
                 project.needs_render = false;
+                if project.needs_cursor && !skip {
+                    project.last_rendered_cursor_px = Some(cursor_px);
+                }
             }
         }
 
@@ -881,6 +909,23 @@ fn load_project(
                     )
             })
     });
+    // Same reasoning as `needs_cursor` above, narrowed down: eligible for
+    // the cursor-unchanged render skip (see `LoadedProject::
+    // cursor_gate_eligible`) only when nothing in this project needs a
+    // redraw for a reason other than "the cursor is somewhere new" --
+    // i.e. `needs_cursor` is set, but not because of Parallax or an
+    // enabled Smoke/Shader effect anywhere in the layer stack.
+    let has_parallax = project.layers.iter().any(|l| matches!(l, Layer::Parallax { .. }));
+    let has_time_driven_effect = project.layers.iter().any(|l| {
+        l.effects().iter().any(|effect| {
+            effect.enabled
+                && matches!(
+                    effect.kind,
+                    EffectKind::Smoke { .. } | EffectKind::Shader { .. }
+                )
+        })
+    });
+    let cursor_gate_eligible = needs_cursor && !has_parallax && !has_time_driven_effect;
     let canvas = renderer::create_canvas(renderer, canvas_width, canvas_height);
     let fps = project.fps.clamp(1, 60);
     let tick_interval = Duration::from_millis(1000 / u64::from(fps));
@@ -898,6 +943,8 @@ fn load_project(
         loaded_at: Instant::now(),
         last_parallax_update_ms: 0,
         needs_render: true,
+        cursor_gate_eligible,
+        last_rendered_cursor_px: None,
     })
 }
 
