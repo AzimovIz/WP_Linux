@@ -12,6 +12,7 @@
 //! out of sync with what actually ships.
 
 mod autostart;
+mod discover;
 mod library;
 mod monitors_config;
 mod push;
@@ -1314,6 +1315,9 @@ struct EditorApp {
     /// Project dir of the wallpaper pending delete confirmation, if any.
     delete_overlay: Option<PathBuf>,
 
+    // -- "Discover" tab state --
+    discover: discover::DiscoverState,
+
     // -- "Editor" tab state --
     layers: Vec<EditorLayer>,
     /// Index into `layers` of whichever one is currently selected in the
@@ -1363,6 +1367,7 @@ impl Default for EditorApp {
             pusher: Box::new(TcpPusher),
             apply_overlay: None,
             delete_overlay: None,
+            discover: discover::DiscoverState::new(),
             layers: Vec::new(),
             selected: None,
             selected_effect: None,
@@ -1443,6 +1448,21 @@ impl eframe::App for EditorApp {
         if self.previous_tab != Tab::Wallpapers && self.tab == Tab::Wallpapers {
             self.rescan_library();
         }
+        // Unlike the Wallpapers tab's rescan above (a cheap local disk
+        // scan, safe to redo on every visit), a store fetch is a real
+        // network round trip -- `reload` only actually fires the first
+        // time (while `items` is still empty from `DiscoverState::new`),
+        // so revisiting the tab later doesn't refetch on its own; use the
+        // "Refresh" button for that. `refresh_downloaded_state` re-checks
+        // the filesystem every visit regardless, since it's cheap and is
+        // what notices a download getting deleted from the Wallpapers tab
+        // in the meantime.
+        if self.previous_tab != Tab::Discover && self.tab == Tab::Discover {
+            self.discover.refresh_downloaded_state();
+            if self.discover.items.is_empty() && !self.discover.loading {
+                self.discover.reload(ui.ctx());
+            }
+        }
         self.previous_tab = self.tab;
 
         match self.tab {
@@ -1515,9 +1535,210 @@ impl EditorApp {
     }
 
     fn show_discover_tab(&mut self, ui: &mut eframe::egui::Ui) {
-        ui.centered_and_justified(|ui| {
-            ui.heading("Discover — coming soon");
+        for outcome in self.discover.drain(ui.ctx()) {
+            match outcome.result {
+                Ok(()) => {
+                    self.status = format!("Downloaded {}", outcome.id);
+                    self.rescan_library();
+                }
+                Err(e) => self.status = format!("Download of {} failed: {e}", outcome.id),
+            }
+        }
+
+        ui.horizontal(|ui| {
+            ui.heading("Discover");
+            if ui.button("Refresh").clicked() {
+                self.discover.reload(ui.ctx());
+            }
+            if self.discover.loading {
+                ui.spinner();
+            }
         });
+        ui.horizontal(|ui| {
+            ui.label("Tags:");
+            let field = ui.text_edit_singleline(&mut self.discover.tags_input);
+            let enter_pressed =
+                field.lost_focus() && ui.input(|i| i.key_pressed(eframe::egui::Key::Enter));
+            if ui.button("Search").clicked() || enter_pressed {
+                self.discover.search(ui.ctx());
+            }
+        });
+        if !self.discover.status.is_empty() {
+            ui.label(&self.discover.status);
+        }
+        ui.add_space(8.0);
+
+        if self.discover.items.is_empty() && !self.discover.loading {
+            ui.label("No wallpapers found on the store yet.");
+        }
+
+        eframe::egui::ScrollArea::vertical().show(ui, |ui| {
+            // Same per-frame tile-sizing math as the Wallpapers tab's grid.
+            let columns = WALLPAPER_GRID_COLUMNS as f32;
+            let spacing = ui.spacing().item_spacing.x;
+            let tile_width = (ui.available_width() - spacing * (columns - 1.0)) / columns;
+            let tile_size = eframe::egui::vec2(
+                tile_width,
+                tile_width * (WALLPAPER_TILE_SIZE.y / WALLPAPER_TILE_SIZE.x),
+            );
+
+            let items = self.discover.items.clone();
+            for row in items.chunks(WALLPAPER_GRID_COLUMNS) {
+                ui.horizontal(|ui| {
+                    for item in row {
+                        self.show_discover_tile(ui, item, tile_size);
+                    }
+                });
+                ui.add_space(12.0);
+            }
+        });
+
+        self.show_discover_overlay(ui.ctx());
+    }
+
+    /// One tile in the "Discover" grid: a `tile_size`-sized preview
+    /// (fetched from the store lazily, the first time this tile is drawn
+    /// -- see `DiscoverState::ensure_preview_requested`) and the title.
+    /// The whole tile is a button: clicking it opens `show_discover_overlay`
+    /// with the details and the actual Download button, rather than
+    /// downloading straight from the grid.
+    fn show_discover_tile(
+        &mut self,
+        ui: &mut eframe::egui::Ui,
+        item: &store_client::WallpaperOut,
+        tile_size: eframe::egui::Vec2,
+    ) {
+        let ctx = ui.ctx().clone();
+
+        ui.vertical(|ui| {
+            ui.set_width(tile_size.x);
+            let (rect, response) = ui.allocate_exact_size(tile_size, eframe::egui::Sense::click());
+
+            match self.discover.preview_texture(&item.id) {
+                Some(texture_id) => {
+                    ui.put(
+                        rect,
+                        eframe::egui::Image::from_texture((texture_id, tile_size)),
+                    );
+                }
+                None => {
+                    ui.painter()
+                        .rect_filled(rect, 4.0, ui.visuals().faint_bg_color);
+                    self.discover.ensure_preview_requested(&ctx, &item.id);
+                }
+            }
+            let response = response
+                .on_hover_text(format!(
+                    "{} by {} -- {:?}, {} download(s)",
+                    item.title, item.author_username, item.rating, item.downloads
+                ))
+                .on_hover_cursor(eframe::egui::CursorIcon::PointingHand);
+            if response.clicked() {
+                self.discover.overlay = Some(item.id.clone());
+            }
+
+            // See `show_wallpaper_tile`'s identical call for why this is
+            // needed: `ui.put()` above leaves the cursor sitting inside
+            // the tile rect instead of below it.
+            ui.advance_cursor_after_rect(rect);
+
+            ui.label(&item.title);
+        });
+    }
+
+    /// The "Discover" detail overlay: title/tags/description plus the
+    /// actual Download button for whichever item `self.discover.overlay`
+    /// names. Closes on Close, on a backdrop click, or on Escape (the
+    /// latter two via `Modal`'s own `should_close`) -- same pattern as
+    /// `show_apply_overlay`/`show_delete_overlay`.
+    fn show_discover_overlay(&mut self, ctx: &eframe::egui::Context) {
+        let Some(id) = self.discover.overlay.clone() else {
+            return;
+        };
+        // The item can only have come from `self.discover.items` (that's
+        // the sole place a tile click sets `overlay` from), but a reload
+        // finishing while this overlay is still open could replace that
+        // list out from under it -- closing rather than showing a stale
+        // or blank overlay in that case.
+        let Some(item) = self.discover.items.iter().find(|i| i.id == id).cloned() else {
+            self.discover.overlay = None;
+            return;
+        };
+
+        let modal_response = eframe::egui::Modal::new(eframe::egui::Id::new("discover_overlay"))
+            .show(ctx, |ui| {
+                ui.set_max_width(560.0);
+
+                if let Some((texture_id, native_size)) = self.discover.preview_image(&id) {
+                    // `Image::max_size` only ever shrinks (it clamps the
+                    // *source* size, so a preview smaller than the box --
+                    // like this one, decoded at whatever resolution the
+                    // server generated it at -- shows at native size
+                    // instead of filling the box). Scaling up here
+                    // ourselves and handing `from_texture` the already-
+                    // scaled size is the same trick the grid tile uses
+                    // (`Image::from_texture((texture.id(), tile_size))`)
+                    // to make an image fill a target box regardless of
+                    // its native resolution.
+                    let bounds = eframe::egui::vec2(540.0, 340.0);
+                    let scale = (bounds.x / native_size.x).min(bounds.y / native_size.y);
+                    let display_size = native_size * scale;
+                    ui.vertical_centered(|ui| {
+                        ui.add(
+                            eframe::egui::Image::from_texture((texture_id, display_size))
+                                .corner_radius(4.0),
+                        );
+                    });
+                    ui.add_space(8.0);
+                }
+
+                ui.horizontal(|ui| {
+                    ui.heading(&item.title);
+                    ui.with_layout(
+                        eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
+                        |ui| {
+                            ui.label(format!("⬇️{}", item.downloads));
+                            ui.label(format!("❤️{}", item.likes));
+                        },
+                    );
+                });
+                ui.label(format!("by {}", item.author_username));
+                ui.add_space(8.0);
+
+                if !item.tags.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        for tag in &item.tags {
+                            ui.label(format!("#{tag}"));
+                        }
+                    });
+                    ui.add_space(8.0);
+                }
+
+                if item.description.is_empty() {
+                    ui.label("No description.");
+                } else {
+                    ui.label(&item.description);
+                }
+                ui.add_space(12.0);
+
+                ui.horizontal(|ui| {
+                    if self.discover.is_downloaded(&id) {
+                        ui.label("Downloaded ✓");
+                    } else if self.discover.is_downloading(&id) {
+                        ui.spinner();
+                        ui.label("Downloading…");
+                    } else if ui.button("Download").clicked() {
+                        self.discover.download(ctx, id.clone());
+                    }
+                    if ui.button("Close").clicked() {
+                        self.discover.overlay = None;
+                    }
+                });
+            });
+
+        if modal_response.should_close() {
+            self.discover.overlay = None;
+        }
     }
 
     fn rescan_library(&mut self) {

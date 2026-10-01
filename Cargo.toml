@@ -5,6 +5,7 @@ members = [
     "crates/project-format",
     "crates/render-server",
     "crates/shader-preview",
+    "crates/store-client",
     "crates/wp_linux_editor",
 ]
 
