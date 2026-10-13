@@ -140,8 +140,14 @@ jobs:
         uses: actions/checkout@v5
 
       # --enrich all: syft fills in Go/Java/JS/Python licenses from package registries.
+      # syft reads Rust dependencies only from Cargo.lock; applications and libraries
+      # often keep it out of git, so it is generated for the scan when missing.
       - name: SBOM
         run: |
+          if [ -f Cargo.toml ] && [ ! -f Cargo.lock ]; then
+            echo "No Cargo.lock in the repository: generating it for the scan"
+            cargo generate-lockfile
+          fi
           mkdir -p "$RUNNER_TEMP/sbom"
           docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
             -v "$GITHUB_WORKSPACE:/src:ro" -v "$RUNNER_TEMP/sbom:/out" -w /src \
@@ -282,6 +288,10 @@ jobs:
               ok = allow.get(f"{name}@{ver}", allow.get(name))
               rows.append((level, name, ver, lic or "—", eco.group(1) if eco else c.get("type", ""), ok))
           rows.sort(key=lambda r: (-r[0], r[1].lower()))
+          if not rows:
+              # An empty SBOM usually means no lock files (package-lock.json, poetry.lock,
+              # go.sum…): nothing was really checked, so say it instead of a silent pass.
+              print("::warning::SBOM is empty: no dependencies found (no lock files?)")
 
           counts = {k: sum(1 for r in rows if NAME[r[0]] == k) for k in ("CRITICAL", "HIGH", "MEDIUM", "UNKNOWN", "LOW")}
           blocking = [r for r in rows if r[0] >= LEVEL["HIGH"] and r[5] is None]
