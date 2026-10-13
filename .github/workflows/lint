@@ -1,0 +1,381 @@
+name: Lint
+
+# Static analysis, SBOM and dependency vulnerabilities for GitHub Actions.
+# The file is generic: drop it into any repository without changes.
+#
+# Job megalinter (MegaLinter detects the languages and runs the matching linters):
+# - push: only files changed by this push are checked (against the commit before
+#   the push; for a new branch, against the default branch). Project-level
+#   linters (secrets, clippy, IaC) look at the whole repository.
+# - manual run (Run workflow): the whole repository is checked.
+# - Errors turn the commit red; the overview is in the run summary, details are in
+#   the MegaLinter step log and in the megalinter-reports artifact (one log per
+#   linter). Merging is not blocked until the check is made a required status check.
+# - Style findings (formatting, Markdown/YAML/CSS layout) are reported as warnings
+#   and do not turn the commit red.
+#
+# Breaking a rule on purpose:
+# - in code, with the linter's own comment (# shellcheck disable=SC2086, # noqa,
+#   // eslint-disable-next-line, # yamllint disable-line, etc.);
+# - for a whole commit, with [skip ci] in the commit message (skips all CI).
+#
+# Per-repository settings: a .mega-linter.yml in the root replaces the built-in
+# settings (step Default config) entirely (https://megalinter.io/latest/configuration/).
+# Native linter configs (.shellcheckrc, .markdownlint.json, .yamllint,
+# pyproject.toml…) are picked up without it.
+#
+# Job sbom builds an SBOM, ranks dependency licenses and looks for known
+# vulnerabilities in them; the SBOM (CycloneDX) and the trivy report are in the
+# sbom artifact.
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  megalinter:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # What to check. MegaLinter diffs HEAD against origin/<DEFAULT_BRANCH>, so the
+      # base commit is stored in the ref origin/megalinter-base and its name is passed.
+      - name: Select changed files
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          REF_NAME: ${{ github.ref_name }}
+          DEFAULT: ${{ github.event.repository.default_branch }}
+        run: |
+          base=""
+          if [ "$EVENT" != workflow_dispatch ]; then
+            if [ -n "$BEFORE" ] && ! echo "$BEFORE" | grep -qE '^0+$' && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+              base="$BEFORE"
+            elif [ -n "$DEFAULT" ] && [ "$REF_NAME" != "$DEFAULT" ] && git rev-parse -q --verify "origin/$DEFAULT" >/dev/null; then
+              base="origin/$DEFAULT"
+            elif git rev-parse -q --verify HEAD~1 >/dev/null; then
+              base="HEAD~1"
+            fi
+          fi
+          if [ -z "$base" ]; then
+            echo "Checking the whole repository"
+            echo "VALIDATE_ALL_CODEBASE=true" >> "$GITHUB_ENV"
+          else
+            git update-ref refs/remotes/origin/megalinter-base "$(git rev-parse "$base")"
+            echo "Checking files changed since $base:"
+            git diff --name-only origin/megalinter-base...HEAD | sed 's/^/  /'
+            echo "VALIDATE_ALL_CODEBASE=false" >> "$GITHUB_ENV"
+            echo "DEFAULT_BRANCH=megalinter-base" >> "$GITHUB_ENV"
+            # By default gitleaks scans the history of all branches (git log --all), so a
+            # secret in another branch would fail every push. Only this push's commits.
+            echo "REPOSITORY_GITLEAKS_ARGUMENTS=--log-opts=origin/megalinter-base..HEAD" >> "$GITHUB_ENV"
+          fi
+
+      # Built-in settings, used only when the repository has no .mega-linter.yml.
+      # Passed as environment variables (MegaLinter runs as a docker action).
+      #   Disabled: cspell (English dictionary: every non-English word is an error),
+      #   lychee (checks links over the internet), grype/trivy/syft (vulnerabilities and
+      #   SBOM are handled by job sbom), checkov (slow, overlaps with kics), htmlhint
+      #   (does not understand templates {{ }}, {% %}), jscpd (scans the whole project:
+      #   the same old duplicates in every run).
+      #   Warnings only: formatters and layout.
+      #   shellcheck: only warning and error severities count as errors.
+      - name: Default config
+        run: |
+          for f in .mega-linter.yml .megalinter.yml .mega-linter.yaml .megalinter.yaml; do
+            if [ -f "$f" ]; then echo "Using the repository config: $f"; exit 0; fi
+          done
+          echo "Using the built-in config"
+          {
+            echo "APPLY_FIXES=none"
+            echo "DISABLE_LINTERS=SPELL_CSPELL,SPELL_LYCHEE,REPOSITORY_GRYPE,REPOSITORY_TRIVY,REPOSITORY_TRIVY_SBOM,REPOSITORY_SYFT,REPOSITORY_CHECKOV,HTML_HTMLHINT,COPYPASTE_JSCPD"
+            echo "DISABLE_ERRORS_LINTERS=BASH_SHFMT,CSS_STYLELINT,HTML_DJLINT,JSON_PRETTIER,JAVASCRIPT_PRETTIER,TYPESCRIPT_PRETTIER,MARKDOWN_MARKDOWNLINT,MARKDOWN_MARKDOWN_TABLE_FORMATTER,PYTHON_BLACK,PYTHON_ISORT,YAML_PRETTIER,YAML_YAMLLINT"
+            echo "BASH_SHELLCHECK_ARGUMENTS=--severity=warning"
+          } >> "$GITHUB_ENV"
+
+      - name: MegaLinter
+        uses: oxsecurity/megalinter/flavors/cupcake@v9.4.0
+        env:
+          # No PR comments or API statuses: results go to the summary and the log.
+          GITHUB_COMMENT_REPORTER: "false"
+          GITHUB_STATUS_REPORTER: "false"
+          FLAVOR_SUGGESTIONS: "false"
+          PRINT_ALPACA: "false"
+          SHOW_ELAPSED_TIME: "true"
+
+      - name: Upload reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: megalinter-reports
+          path: megalinter-reports/
+          if-no-files-found: ignore
+
+  # SBOM and dependency licenses: a separate job, independent of MegaLinter.
+  # syft builds the SBOM (CycloneDX) from manifests and lock files of any language;
+  # Rust licenses come from cargo metadata. Each dependency gets a level:
+  #   CRITICAL - not allowed in a closed-source product (AGPL, SSPL, BUSL, NC…);
+  #   HIGH     - copyleft, requires opening the product's source (GPL, LGPL…);
+  #   MEDIUM   - weak copyleft (MPL, EPL, CDDL);
+  #   UNKNOWN  - license not detected, review manually;
+  #   LOW      - permissive (MIT, Apache, BSD…).
+  # In SPDX expressions the most permissive OR alternative and the strictest AND
+  # term win. The job fails on CRITICAL/HIGH. To allow a dependency on purpose, add
+  # a line to .sbom-allow in the repository root: <package>[@version]  # reason
+  # Then the same SBOM is checked for known vulnerabilities (step Vulnerabilities).
+  # syft and trivy run from their official images at pinned versions.
+  sbom:
+    runs-on: ubuntu-latest
+    env:
+      SYFT_IMAGE: anchore/syft:v1.42.1
+      TRIVY_IMAGE: aquasec/trivy:0.69.1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # --enrich all: syft fills in Go/Java/JS/Python licenses from package registries.
+      - name: SBOM
+        run: |
+          mkdir -p "$RUNNER_TEMP/sbom"
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
+            -v "$GITHUB_WORKSPACE:/src:ro" -v "$RUNNER_TEMP/sbom:/out" -w /src \
+            "$SYFT_IMAGE" scan dir:. -q --enrich all -o cyclonedx-json=/out/sbom.cdx.json
+          python3 - "$RUNNER_TEMP/sbom/sbom.cdx.json" <<'PY'
+          """SBOM: dependency licenses ranked by risk for a closed-source product.
+
+          Input: CycloneDX JSON from syft. Rust licenses come from cargo metadata
+          (Cargo.lock has none). Output: a table in the log, Markdown in the job
+          summary, exit code 1 on CRITICAL/HIGH not allowed in .sbom-allow.
+          """
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+
+          SBOM, ALLOW = sys.argv[1], ".sbom-allow"
+
+          # Levels: a higher number means a higher risk. UNKNOWN sits between LOW and
+          # MEDIUM: in "A OR B" a known permissive license wins, in "A AND B" the unknown.
+          LEVEL = {"LOW": 1, "UNKNOWN": 1.5, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+          NAME = {v: k for k, v in LEVEL.items()}
+          # Categories (by SPDX id, case-insensitive regexes).
+          RULES = [
+              ("CRITICAL", "forbidden", r"\b(AGPL|SSPL|BUSL|Commons-Clause|CC-BY-NC|Elastic-2)|"
+               r"affero|server side public|business source"),
+              ("HIGH", "copyleft", r"\b(L?GPL(v\d)?|EUPL|OSL|CC-BY-SA|Sleepycat|QPL)\b|"
+               r"general public|lesser general"),
+              ("MEDIUM", "weak copyleft", r"\b(MPL|EPL|CDDL|CPL|APSL|Ms-RL)\b|mozilla public|eclipse public"),
+              ("LOW", "unencumbered", r"\b(Unlicense|CC0|WTFPL|0BSD)\b|public domain"),
+              ("LOW", "permissive", r"\b(MIT|MIT-0|Apache|BSD|ISC|Zlib|Unicode|BSL-1\.0|PSF|Python-2\.0|"
+               r"OpenSSL|X11|PostgreSQL|NCSA|CC-BY-[34]|Artistic-2|OFL|Ruby|bzip2|libpng)\b"),
+          ]
+
+
+          def classify(lic):
+              for level, cat, rx in RULES:
+                  if re.search(rx, lic, re.I):
+                      return LEVEL[level], cat
+              return LEVEL["UNKNOWN"], "unknown"
+
+
+          def evaluate(expr):
+              """Level of an SPDX expression: OR takes the minimum, AND the maximum, WITH the base."""
+              expr = re.sub(r"\s*/\s*", " OR ", expr)  # legacy cargo syntax: MIT/Apache-2.0
+              toks = re.findall(r"\(|\)|[^\s()]+", expr)
+              pos = 0
+
+              def peek():
+                  return toks[pos].upper() if pos < len(toks) else None
+
+              def factor():
+                  nonlocal pos
+                  if peek() == "(":
+                      pos += 1
+                      v = disj()
+                      pos += 1  # ")"
+                      return v
+                  name = []
+                  while peek() not in (None, "(", ")", "AND", "OR", "WITH"):
+                      name.append(toks[pos])
+                      pos += 1
+                  v = classify(" ".join(name))[0]
+                  if peek() == "WITH":
+                      pos += 2  # an exception (LLVM-exception, Classpath…) never makes it stricter
+                  return v
+
+              def conj():
+                  nonlocal pos
+                  v = factor()
+                  while peek() == "AND":
+                      pos += 1
+                      v = max(v, factor())
+                  return v
+
+              def disj():
+                  nonlocal pos
+                  v = conj()
+                  while peek() == "OR":
+                      pos += 1
+                      v = min(v, conj())
+                  return v
+
+              return disj() if toks else LEVEL["UNKNOWN"]
+
+
+          def license_of(c):
+              parts = []
+              for entry in c.get("licenses") or []:
+                  if "expression" in entry:
+                      parts.append(entry["expression"])
+                  else:
+                      l = entry.get("license", {})
+                      parts.append(l.get("id") or l.get("name") or "")
+              parts = [p for p in parts if p]
+              # Several detected licenses are treated as applying together.
+              return " AND ".join(f"({p})" if " " in p else p for p in parts)
+
+
+          sbom = json.load(open(SBOM))
+          comps = sbom.get("components", [])
+
+          # Rust: licenses and "own crate" marks from cargo metadata.
+          cargo, own = {}, set()
+          if os.path.isfile("Cargo.toml"):
+              try:
+                  meta = json.loads(subprocess.check_output(
+                      ["cargo", "metadata", "--format-version", "1", "--locked"],
+                      stderr=subprocess.DEVNULL))
+                  for p in meta["packages"]:
+                      cargo[(p["name"], p["version"])] = p.get("license") or ""
+                      if p.get("source") is None:
+                          own.add((p["name"], p["version"]))
+              except Exception as e:  # no cargo or no access to the crate registry
+                  print(f"cargo metadata unavailable ({e}): crate licenses are unknown")
+          for c in comps:
+              key = (c.get("name"), c.get("version"))
+              if c.get("purl", "").startswith("pkg:cargo/") and not c.get("licenses") and cargo.get(key):
+                  c["licenses"] = [{"expression": cargo[key]}]
+          json.dump(sbom, open(SBOM, "w"), indent=1)
+
+          allow = {}
+          if os.path.isfile(ALLOW):
+              for line in open(ALLOW, encoding="utf-8"):
+                  item, _, why = line.partition("#")
+                  if item.strip():
+                      allow[item.strip()] = why.strip()
+
+          rows = []
+          for c in comps:
+              name, ver = c.get("name", "?"), c.get("version", "")
+              if (name, ver) in own or c.get("type") == "file":
+                  continue
+              lic = license_of(c)
+              level = evaluate(lic) if lic else LEVEL["UNKNOWN"]
+              eco = re.match(r"pkg:([^/]+)/", c.get("purl", ""))
+              ok = allow.get(f"{name}@{ver}", allow.get(name))
+              rows.append((level, name, ver, lic or "—", eco.group(1) if eco else c.get("type", ""), ok))
+          rows.sort(key=lambda r: (-r[0], r[1].lower()))
+
+          counts = {k: sum(1 for r in rows if NAME[r[0]] == k) for k in ("CRITICAL", "HIGH", "MEDIUM", "UNKNOWN", "LOW")}
+          blocking = [r for r in rows if r[0] >= LEVEL["HIGH"] and r[5] is None]
+          total = " · ".join(f"{k}: {v}" for k, v in counts.items())
+
+          HINT = {"CRITICAL": "not allowed in a closed-source product (AGPL, SSPL, BUSL, NC…)",
+                  "HIGH": "copyleft: requires opening the product's source (GPL, LGPL when linked statically…)",
+                  "MEDIUM": "weak copyleft: changes to the library itself must be opened (MPL, EPL, CDDL)",
+                  "UNKNOWN": "license not detected, review manually",
+                  "LOW": "permissive, keep the copyright notice (MIT, Apache, BSD…)"}
+
+          print(f"Components: {len(rows)} · {total}\n")
+          for k in ("CRITICAL", "HIGH", "MEDIUM", "UNKNOWN", "LOW"):
+              print(f"  {k:8} {HINT[k]}")
+          print()
+          w = max([len(r[1]) for r in rows] + [7])
+          print(f"{'Level':9} {'Package':{w}} {'Version':12} {'Type':6} License")
+          for level, name, ver, lic, eco, ok in rows:
+              mark = f"  [allowed: {ok or 'in ' + ALLOW}]" if ok is not None and level >= LEVEL["MEDIUM"] else ""
+              print(f"{NAME[level]:9} {name:{w}} {ver:12} {eco:6} {lic}{mark}")
+
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as f:
+                  f.write(f"## {'❌' if blocking else '✅'} SBOM: dependency licenses\n\n{total}\n\n")
+                  f.write("| Level | Package | Version | License |\n|---|---|---|---|\n")
+                  for level, name, ver, lic, eco, ok in rows:
+                      if level > LEVEL["LOW"]:
+                          f.write(f"| {NAME[level]} | {name} | {ver} | {lic} |\n")
+
+          if blocking:
+              print(f"\nError: {len(blocking)} CRITICAL/HIGH dependenc(ies). Replace the dependency"
+                    f" or allow it on purpose with a line in {ALLOW}: <package>[@version]  # reason")
+              sys.exit(1)
+          PY
+
+      # Vulnerabilities: trivy matches SBOM versions against its vulnerability
+      # database (downloaded on every run). If the database is unavailable, the check
+      # is skipped with a warning and the commit is not turned red.
+      # The job fails on CRITICAL/HIGH that have a fixed version. To accept a
+      # vulnerability on purpose, add its ID as a line to .trivyignore in the
+      # repository root (a comment is allowed: # reason).
+      - name: Vulnerabilities
+        if: ${{ !cancelled() }}
+        run: |
+          [ -f "$RUNNER_TEMP/sbom/sbom.cdx.json" ] || { echo "SBOM was not built"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/trivy-cache"
+          if ! docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
+              -v "$GITHUB_WORKSPACE:/src:ro" -v "$RUNNER_TEMP/sbom:/out" -v "$RUNNER_TEMP/trivy-cache:/cache" -w /src \
+              "$TRIVY_IMAGE" sbom --cache-dir /cache --scanners vuln --quiet --format json \
+              -o /out/vuln.json /out/sbom.cdx.json; then
+            echo "::warning::trivy vulnerability database unavailable, check skipped"
+            exit 0
+          fi
+          python3 - "$RUNNER_TEMP/sbom/vuln.json" <<'PY'
+          import json
+          import os
+          import sys
+
+          SEV = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"]
+          report = json.load(open(sys.argv[1]))
+          vulns = [v for r in report.get("Results") or [] for v in r.get("Vulnerabilities") or []]
+          vulns.sort(key=lambda v: (SEV.index(v.get("Severity", "UNKNOWN")), v["PkgName"], v["VulnerabilityID"]))
+          blocking = [v for v in vulns if v.get("Severity") in ("CRITICAL", "HIGH") and v.get("FixedVersion")]
+          total = " · ".join(f"{k}: {sum(1 for v in vulns if v.get('Severity') == k)}" for k in SEV)
+
+          print(f"Vulnerabilities: {len(vulns)} · {total}\n")
+          if vulns:
+              w = max(len(v["PkgName"]) for v in vulns)
+              print(f"{'Level':9} {'Package':{w}} {'Version':12} {'Fixed in':16} {'ID':20} Title")
+              for v in vulns:
+                  print(f"{v.get('Severity', ''):9} {v['PkgName']:{w}} {v.get('InstalledVersion', ''):12} "
+                        f"{v.get('FixedVersion') or '—':16} {v['VulnerabilityID']:20} {v.get('Title', '')}")
+
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as f:
+                  f.write(f"## {'❌' if blocking else '✅'} Dependency vulnerabilities\n\n{total}\n\n")
+                  if vulns:
+                      f.write("| Level | Package | Version | Fixed in | ID |\n|---|---|---|---|---|\n")
+                      for v in vulns:
+                          f.write(f"| {v.get('Severity')} | {v['PkgName']} | {v.get('InstalledVersion')} | "
+                                  f"{v.get('FixedVersion') or '—'} | {v['VulnerabilityID']} |\n")
+
+          if blocking:
+              print(f"\nError: {len(blocking)} CRITICAL/HIGH vulnerabilit(ies) with a fixed version."
+                    " Update the dependency or accept it on purpose: its ID as a line in .trivyignore")
+              sys.exit(1)
+          PY
+
+      - name: Upload SBOM
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: ${{ runner.temp }}/sbom/
+          if-no-files-found: ignore
